@@ -85,6 +85,16 @@ impl Connection {
 		// the connection closes below.
 		let _session_stats = stats.session(&token.root);
 
+		// SurveillX measured-viewing (Phase C): on disconnect, report this
+		// subscriber's viewer-seconds when MOQ_USAGE_REPORT_URL is set. No-op for
+		// publishers, internal/cluster peers, usid-less tokens, or unset env.
+		let _svx_usage = crate::usage::ViewGuard::new(
+			token.usid.clone(),
+			token.jwt.clone(),
+			token.internal,
+			subscribe.is_some(),
+		);
+
 		// Accept the connection.
 		// NOTE: subscribe and publish seem backwards because of how relays work.
 		// We publish the tracks the client is allowed to subscribe to.

@@ -20,6 +20,7 @@ fn main() -> anyhow::Result<()> {
 		root: "rooms/meeting-123".to_string(),
 		publish: vec!["alice".to_string()],
 		subscribe: vec!["".to_string()],
+		usid: None,
 		expires: Some(SystemTime::now() + Duration::from_secs(3600)),
 		issued: Some(SystemTime::now()),
 	};

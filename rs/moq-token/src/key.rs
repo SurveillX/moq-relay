@@ -534,6 +534,7 @@ mod tests {
 			root: "test-path".to_string(),
 			publish: vec!["test-pub".into()],
 			subscribe: vec!["test-sub".into()],
+			usid: None,
 			expires: Some(SystemTime::now() + Duration::from_secs(3600)),
 			issued: Some(SystemTime::now()),
 		}
@@ -632,6 +633,7 @@ mod tests {
 			root: "test-path".to_string(),
 			publish: vec![],
 			subscribe: vec![],
+			usid: None,
 			expires: None,
 			issued: None,
 		};
@@ -709,6 +711,7 @@ mod tests {
 			root: "test-path".to_string(),
 			publish: vec!["".to_string()],
 			subscribe: vec!["".to_string()],
+			usid: None,
 			expires: None,
 			issued: None,
 		};
@@ -728,6 +731,7 @@ mod tests {
 			root: "test-path".to_string(),
 			publish: vec!["test-pub".into()],
 			subscribe: vec!["test-sub".into()],
+			usid: None,
 			expires: Some(SystemTime::now() + Duration::from_secs(3600)),
 			issued: Some(SystemTime::now()),
 		};

@@ -14,6 +14,7 @@ mod connection;
 mod health;
 mod http_client;
 mod stats;
+mod usage;
 mod watch;
 mod web;
 #[cfg(feature = "websocket")]

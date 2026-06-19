@@ -559,6 +559,13 @@ pub struct AuthToken {
 	/// a JWT. Used to record stats on the internal tier so cluster peers can
 	/// be billed separately from end-user traffic.
 	pub internal: bool,
+
+	/// SurveillX measured-viewing (Phase C): usage-session id from the token's
+	/// `usid` claim. None for mTLS / public / legacy (non-metered) tokens.
+	pub usid: Option<String>,
+	/// SurveillX measured-viewing (Phase C): the raw verified JWT, echoed to the
+	/// usage reporter as lease-proof. None for mTLS/public tokens.
+	pub jwt: Option<String>,
 }
 
 impl AuthToken {
@@ -579,6 +586,8 @@ impl AuthToken {
 			subscribe: PathPrefixes::from(vec![Path::new("").to_owned()]),
 			publish: PathPrefixes::from(vec![Path::new("").to_owned()]),
 			internal: true,
+			usid: None,
+			jwt: None,
 		}
 	}
 }
@@ -914,6 +923,7 @@ impl Auth {
 		// Non-mTLS connections default to external; the API may promote specific
 		// ones (e.g. a first-party dashboard token) to internal.
 		token.internal = resp.internal.unwrap_or(false);
+		token.jwt = params.jwt.clone();
 		Ok(token)
 	}
 
@@ -976,7 +986,9 @@ impl Auth {
 			return Err(AuthError::ExpectedToken);
 		};
 
-		Self::finalize(&params.path, claims)
+		let mut token = Self::finalize(&params.path, claims)?;
+		token.jwt = params.jwt.clone();
+		Ok(token)
 	}
 
 	/// Reduce verified `claims` against the connection `root_str` into an
@@ -985,6 +997,7 @@ impl Auth {
 	/// fall outside it are dropped. Shared by the standalone and `--auth-api`
 	/// paths.
 	fn finalize(root_str: &str, claims: moq_token::Claims) -> Result<AuthToken, AuthError> {
+		let usid = claims.usid.clone();
 		let root = Path::new(root_str);
 		let claims_root = Path::new(&claims.root);
 
@@ -1031,6 +1044,8 @@ impl Auth {
 			subscribe,
 			publish,
 			internal: false,
+			usid,
+			jwt: None,
 		})
 	}
 

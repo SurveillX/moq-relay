@@ -24,6 +24,13 @@ pub struct Claims {
 	#[serde_as(as = "OneOrMany<_, PreferMany>")]
 	pub subscribe: Vec<String>,
 
+	/// SurveillX measured-viewing (Phase C): usage-session id. Opaque to the
+	/// relay's auth logic; carried so fan-out can be attributed to a billing
+	/// session. Absent on non-metered tokens. Stock relay ignores it (serde
+	/// default, no deny_unknown_fields) — this just makes it readable.
+	#[serde(default, rename = "usid", skip_serializing_if = "Option::is_none")]
+	pub usid: Option<String>,
+
 	/// The expiration time of the token as a unix timestamp.
 	#[serde(rename = "exp")]
 	#[serde_as(as = "Option<TimestampSeconds<i64>>")]
@@ -56,6 +63,7 @@ mod tests {
 			root: "test-path".to_string(),
 			publish: vec!["test-pub".into()],
 			subscribe: vec!["test-sub".into()],
+			usid: None,
 			expires: Some(SystemTime::now() + Duration::from_secs(3600)),
 			issued: Some(SystemTime::now()),
 		}
@@ -73,6 +81,7 @@ mod tests {
 			root: "test-path".to_string(),
 			publish: vec![],
 			subscribe: vec![],
+			usid: None,
 			expires: None,
 			issued: None,
 		};
@@ -93,6 +102,7 @@ mod tests {
 			root: "test-path".to_string(),
 			publish: vec!["test-pub".into()],
 			subscribe: vec![],
+			usid: None,
 			expires: None,
 			issued: None,
 		};
@@ -106,6 +116,7 @@ mod tests {
 			root: "test-path".to_string(),
 			publish: vec![],
 			subscribe: vec!["test-sub".into()],
+			usid: None,
 			expires: None,
 			issued: None,
 		};
@@ -119,6 +130,7 @@ mod tests {
 			root: "test-path".to_string(),        // no trailing slash
 			publish: vec!["relative-pub".into()], // relative path without leading slash
 			subscribe: vec![],
+			usid: None,
 			expires: None,
 			issued: None,
 		};
@@ -133,6 +145,7 @@ mod tests {
 			root: "test-path".to_string(), // no trailing slash
 			publish: vec![],
 			subscribe: vec!["relative-sub".into()], // relative path without leading slash
+			usid: None,
 			expires: None,
 			issued: None,
 		};
@@ -147,6 +160,7 @@ mod tests {
 			root: "test-path".to_string(),         // no trailing slash
 			publish: vec!["/absolute-pub".into()], // absolute path with leading slash
 			subscribe: vec![],
+			usid: None,
 			expires: None,
 			issued: None,
 		};
@@ -160,6 +174,7 @@ mod tests {
 			root: "test-path".to_string(), // no trailing slash
 			publish: vec![],
 			subscribe: vec!["/absolute-sub".into()], // absolute path with leading slash
+			usid: None,
 			expires: None,
 			issued: None,
 		};
@@ -173,6 +188,7 @@ mod tests {
 			root: "test-path".to_string(), // no trailing slash
 			publish: vec!["".into()],      // empty string
 			subscribe: vec![],
+			usid: None,
 			expires: None,
 			issued: None,
 		};
@@ -186,6 +202,7 @@ mod tests {
 			root: "test-path".to_string(), // no trailing slash
 			publish: vec![],
 			subscribe: vec!["".into()], // empty string
+			usid: None,
 			expires: None,
 			issued: None,
 		};
@@ -199,6 +216,7 @@ mod tests {
 			root: "test-path".to_string(),          // with trailing slash
 			publish: vec!["relative-pub".into()],   // relative path is ok when path is prefix
 			subscribe: vec!["relative-sub".into()], // relative path is ok when path is prefix
+			usid: None,
 			expires: None,
 			issued: None,
 		};
@@ -212,6 +230,7 @@ mod tests {
 			root: "".to_string(), // empty path
 			publish: vec!["test-pub".into()],
 			subscribe: vec![],
+			usid: None,
 			expires: None,
 			issued: None,
 		};
