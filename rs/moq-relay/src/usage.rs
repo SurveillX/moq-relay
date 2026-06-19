@@ -40,6 +40,7 @@ struct Inner {
     jwt: Option<String>,
     start: SystemTime,
     conn_id: u64,
+    bytes: Option<u64>,
 }
 
 impl ViewGuard {
@@ -52,9 +53,17 @@ impl ViewGuard {
             .unwrap_or(false);
         match usid {
             Some(usid) if enabled && !internal && is_subscriber => Self {
-                inner: Some(Inner { usid, jwt, start: SystemTime::now(), conn_id }),
+                inner: Some(Inner { usid, jwt, start: SystemTime::now(), conn_id, bytes: None }),
             },
             _ => Self { inner: None },
+        }
+    }
+
+    /// Record per-subscriber egress bytes (read at session close). Reported as
+    /// `live_fanout_byte` alongside viewer-seconds on drop.
+    pub fn set_bytes(&mut self, bytes: Option<u64>) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.bytes = bytes;
         }
     }
 }
@@ -62,31 +71,67 @@ impl ViewGuard {
 impl Drop for ViewGuard {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
-            report_view(inner.usid, inner.jwt, inner.conn_id, inner.start, SystemTime::now());
+            report_view(inner.usid, inner.jwt, inner.conn_id, inner.bytes, inner.start, SystemTime::now());
         }
     }
 }
 
-/// Fire-and-forget POST of one subscriber session's viewer-seconds.
-fn report_view(usid: String, jwt: Option<String>, conn_id: u64, start: SystemTime, end: SystemTime) {
+/// Fire-and-forget POST(s) of one subscriber session's usage: viewer-seconds
+/// always, plus fan-out egress bytes when the transport exposed a byte count.
+fn report_view(usid: String, jwt: Option<String>, conn_id: u64, bytes: Option<u64>, start: SystemTime, end: SystemTime) {
     let url = match std::env::var("MOQ_USAGE_REPORT_URL") {
         Ok(u) if !u.is_empty() => u,
         _ => return,
     };
     let secret = std::env::var("MOQ_USAGE_REPORT_SECRET").unwrap_or_default();
-    let secs = end.duration_since(start).map(|d| d.as_secs()).unwrap_or(0);
-    if secs == 0 {
-        return; // sub-second / failed-negotiation sessions: nothing to bill.
-    }
     let start_ms = start.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
-    let idem = format!("moq:{usid}:{conn_id}:{start_ms}");
-    // transport intentionally omitted -> cloud uses the anchored session's transport
-    // (moq vs moq_tiles), which the relay can't know.
+    let secs = end.duration_since(start).map(|d| d.as_secs()).unwrap_or(0);
+
+    // Viewer-seconds. Skip sub-second / failed-negotiation sessions.
+    if secs > 0 {
+        post_meter(
+            &url, &secret, &usid, jwt.as_deref(),
+            "live_viewer_second", secs.to_string(), "second",
+            format!("moq:{usid}:{conn_id}:{start_ms}"),
+            start, end,
+        );
+    }
+
+    // Fan-out egress bytes. moq_tiles: each per-camera connection reports its own
+    // byte count; the cloud SUMS them (egress scales with cameras -> no union).
+    if let Some(b) = bytes {
+        if b > 0 {
+            post_meter(
+                &url, &secret, &usid, jwt.as_deref(),
+                "live_fanout_byte", b.to_string(), "byte",
+                format!("moqb:{usid}:{conn_id}:{start_ms}"),
+                start, end,
+            );
+        }
+    }
+}
+
+/// Build + fire one fire-and-forget metered POST (2-try retry on 5xx/transport).
+/// transport intentionally omitted -> cloud uses the anchored session's transport
+/// (moq vs moq_tiles), which the relay can't know.
+#[allow(clippy::too_many_arguments)]
+fn post_meter(
+    url: &str,
+    secret: &str,
+    usid: &str,
+    jwt: Option<&str>,
+    meter: &str,
+    quantity: String,
+    unit: &str,
+    idem: String,
+    start: SystemTime,
+    end: SystemTime,
+) {
     let body = serde_json::json!({
         "usage_session_id": usid,
-        "meter": "live_viewer_second",
-        "quantity": secs.to_string(),
-        "unit": "second",
+        "meter": meter,
+        "quantity": quantity,
+        "unit": unit,
         "observed_at": epoch_secs_f64(end),
         "window_start": epoch_secs_f64(start),
         "window_end": epoch_secs_f64(end),
@@ -96,36 +141,40 @@ fn report_view(usid: String, jwt: Option<String>, conn_id: u64, start: SystemTim
     let payload = match serde_json::to_vec(&body) {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!(%usid, error = %e, "svx usage report serialize failed");
+            tracing::warn!(%usid, meter, error = %e, "svx usage report serialize failed");
             return;
         }
     };
+    let url = url.to_string();
+    let secret = secret.to_string();
+    let usid = usid.to_string();
+    let meter = meter.to_string();
     tokio::spawn(async move {
-		for attempt in 0u8..2 {
-			let mut req = report_client()
-				.post(&url)
-				.header(reqwest::header::CONTENT_TYPE, "application/json")
-				.body(payload.clone());
-			if !secret.is_empty() {
-				req = req.bearer_auth(&secret);
-			}
-			match req.send().await {
-				Ok(r) if r.status().is_success() => {
-					tracing::debug!(%usid, secs, "svx usage report ok");
-					return;
-				}
-				Ok(r) => {
-					let retryable = r.status().is_server_error();
-					tracing::warn!(%usid, status = %r.status(), attempt, "svx usage report rejected");
-					if !retryable {
-						return;
-					}
-				}
-				Err(e) => tracing::warn!(%usid, error = %e, attempt, "svx usage report failed"),
-			}
-			if attempt == 0 {
-				tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-			}
-		}
-	});
+        for attempt in 0u8..2 {
+            let mut req = report_client()
+                .post(&url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(payload.clone());
+            if !secret.is_empty() {
+                req = req.bearer_auth(&secret);
+            }
+            match req.send().await {
+                Ok(r) if r.status().is_success() => {
+                    tracing::debug!(%usid, meter, "svx usage report ok");
+                    return;
+                }
+                Ok(r) => {
+                    let retryable = r.status().is_server_error();
+                    tracing::warn!(%usid, meter, status = %r.status(), attempt, "svx usage report rejected");
+                    if !retryable {
+                        return;
+                    }
+                }
+                Err(e) => tracing::warn!(%usid, meter, error = %e, attempt, "svx usage report failed"),
+            }
+            if attempt == 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    });
 }

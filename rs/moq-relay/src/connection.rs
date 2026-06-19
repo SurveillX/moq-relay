@@ -88,7 +88,7 @@ impl Connection {
 		// SurveillX measured-viewing (Phase C): on disconnect, report this
 		// subscriber's viewer-seconds when MOQ_USAGE_REPORT_URL is set. No-op for
 		// publishers, internal/cluster peers, usid-less tokens, or unset env.
-		let _svx_usage = crate::usage::ViewGuard::new(
+		let mut _svx_usage = crate::usage::ViewGuard::new(
 			token.usid.clone(),
 			token.jwt.clone(),
 			self.id,
@@ -110,8 +110,11 @@ impl Connection {
 
 		tracing::info!(version = %session.version(), transport, "negotiated");
 
-		// Wait until the session is closed.
-		session.closed().await?;
+		// Wait until the session is closed, then capture this subscriber's egress
+		// bytes (udp_tx.bytes) for measured-viewing before the session drops.
+		let closed = session.closed().await;
+		_svx_usage.set_bytes(session.bytes_sent());
+		closed?;
 		Ok(())
 	}
 

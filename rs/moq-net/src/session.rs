@@ -67,6 +67,12 @@ impl Session {
 		self.recv_bandwidth.clone()
 	}
 
+	/// Total bytes sent on the underlying QUIC connection (udp_tx.bytes), if the
+	/// backend exposes it. SurveillX measured-viewing: per-subscriber egress.
+	pub fn bytes_sent(&self) -> Option<u64> {
+		self.session.bytes_sent()
+	}
+
 	/// Close the underlying transport session.
 	pub fn close(&mut self, err: Error) {
 		if self.closed {
@@ -139,6 +145,7 @@ async fn run_send_bandwidth_inner<S: web_transport_trait::Session>(session: &S, 
 trait SessionInner: Send + Sync {
 	fn close(&self, code: u32, reason: &str);
 	fn closed(&self) -> Pin<Box<dyn Future<Output = String> + Send + '_>>;
+	fn bytes_sent(&self) -> Option<u64>;
 }
 
 impl<S: web_transport_trait::Session> SessionInner for S {
@@ -148,5 +155,9 @@ impl<S: web_transport_trait::Session> SessionInner for S {
 
 	fn closed(&self) -> Pin<Box<dyn Future<Output = String> + Send + '_>> {
 		Box::pin(async move { S::closed(self).await.to_string() })
+	}
+
+	fn bytes_sent(&self) -> Option<u64> {
+		self.stats().bytes_sent()
 	}
 }
