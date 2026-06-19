@@ -11,6 +11,19 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use std::sync::OnceLock;
+
+static REPORT_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn report_client() -> &'static reqwest::Client {
+	REPORT_CLIENT.get_or_init(|| {
+		reqwest::Client::builder()
+			.timeout(std::time::Duration::from_secs(5))
+			.build()
+			.unwrap_or_else(|_| reqwest::Client::new())
+	})
+}
+
 fn epoch_secs_f64(t: SystemTime) -> f64 {
     t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64()
 }
@@ -26,19 +39,20 @@ struct Inner {
     usid: String,
     jwt: Option<String>,
     start: SystemTime,
+    conn_id: u64,
 }
 
 impl ViewGuard {
-    /// `is_subscriber` = the connection was granted subscribe (a downlink viewer).
-    /// Reports only external subscribers that carry a usid, and only when the
-    /// report URL env is set.
-    pub fn new(usid: Option<String>, jwt: Option<String>, internal: bool, is_subscriber: bool) -> Self {
+    /// `is_subscriber` = the connection is a *pure subscriber* (subscribe-only,
+    /// no publish grant) — a downlink viewer. Reports only external pure
+    /// subscribers that carry a usid, and only when the report URL env is set.
+    pub fn new(usid: Option<String>, jwt: Option<String>, conn_id: u64, internal: bool, is_subscriber: bool) -> Self {
         let enabled = std::env::var("MOQ_USAGE_REPORT_URL")
             .map(|u| !u.is_empty())
             .unwrap_or(false);
         match usid {
             Some(usid) if enabled && !internal && is_subscriber => Self {
-                inner: Some(Inner { usid, jwt, start: SystemTime::now() }),
+                inner: Some(Inner { usid, jwt, start: SystemTime::now(), conn_id }),
             },
             _ => Self { inner: None },
         }
@@ -48,13 +62,13 @@ impl ViewGuard {
 impl Drop for ViewGuard {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
-            report_view(inner.usid, inner.jwt, inner.start, SystemTime::now());
+            report_view(inner.usid, inner.jwt, inner.conn_id, inner.start, SystemTime::now());
         }
     }
 }
 
 /// Fire-and-forget POST of one subscriber session's viewer-seconds.
-fn report_view(usid: String, jwt: Option<String>, start: SystemTime, end: SystemTime) {
+fn report_view(usid: String, jwt: Option<String>, conn_id: u64, start: SystemTime, end: SystemTime) {
     let url = match std::env::var("MOQ_USAGE_REPORT_URL") {
         Ok(u) if !u.is_empty() => u,
         _ => return,
@@ -65,7 +79,7 @@ fn report_view(usid: String, jwt: Option<String>, start: SystemTime, end: System
         return; // sub-second / failed-negotiation sessions: nothing to bill.
     }
     let start_ms = start.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
-    let idem = format!("moq:{usid}:{start_ms}");
+    let idem = format!("moq:{usid}:{conn_id}:{start_ms}");
     // transport intentionally omitted -> cloud uses the anchored session's transport
     // (moq vs moq_tiles), which the relay can't know.
     let body = serde_json::json!({
@@ -87,20 +101,31 @@ fn report_view(usid: String, jwt: Option<String>, start: SystemTime, end: System
         }
     };
     tokio::spawn(async move {
-        let client = reqwest::Client::new();
-        let mut req = client
-            .post(&url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(payload);
-        if !secret.is_empty() {
-            req = req.bearer_auth(secret);
-        }
-        match req.send().await {
-            Ok(r) if r.status().is_success() => {
-                tracing::debug!(%usid, secs, "svx usage report ok")
-            }
-            Ok(r) => tracing::warn!(%usid, status = %r.status(), "svx usage report rejected"),
-            Err(e) => tracing::warn!(%usid, error = %e, "svx usage report failed"),
-        }
-    });
+		for attempt in 0u8..2 {
+			let mut req = report_client()
+				.post(&url)
+				.header(reqwest::header::CONTENT_TYPE, "application/json")
+				.body(payload.clone());
+			if !secret.is_empty() {
+				req = req.bearer_auth(&secret);
+			}
+			match req.send().await {
+				Ok(r) if r.status().is_success() => {
+					tracing::debug!(%usid, secs, "svx usage report ok");
+					return;
+				}
+				Ok(r) => {
+					let retryable = r.status().is_server_error();
+					tracing::warn!(%usid, status = %r.status(), attempt, "svx usage report rejected");
+					if !retryable {
+						return;
+					}
+				}
+				Err(e) => tracing::warn!(%usid, error = %e, attempt, "svx usage report failed"),
+			}
+			if attempt == 0 {
+				tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+			}
+		}
+	});
 }

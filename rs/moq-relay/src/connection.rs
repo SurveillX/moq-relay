@@ -91,8 +91,9 @@ impl Connection {
 		let _svx_usage = crate::usage::ViewGuard::new(
 			token.usid.clone(),
 			token.jwt.clone(),
+			self.id,
 			token.internal,
-			subscribe.is_some(),
+			subscribe.is_some() && publish.is_none(),
 		);
 
 		// Accept the connection.

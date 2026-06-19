@@ -546,7 +546,6 @@ impl AuthConfig {
 /// rate-limit info, etc.) can be added without bumping the major version.
 /// External consumers must build tokens through library APIs (e.g. via
 /// [`Auth::verify`]) rather than by struct literal.
-#[derive(Debug)]
 #[non_exhaustive]
 pub struct AuthToken {
 	/// The root path this token is scoped to.
@@ -589,6 +588,19 @@ impl AuthToken {
 			usid: None,
 			jwt: None,
 		}
+	}
+}
+
+impl std::fmt::Debug for AuthToken {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("AuthToken")
+			.field("root", &self.root)
+			.field("subscribe", &self.subscribe)
+			.field("publish", &self.publish)
+			.field("internal", &self.internal)
+			.field("usid", &self.usid)
+			.field("jwt", &self.jwt.as_ref().map(|_| "<redacted>"))
+			.finish()
 	}
 }
 
