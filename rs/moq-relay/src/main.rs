@@ -16,8 +16,8 @@ async fn main() -> anyhow::Result<()> {
 
 	let mut config = Config::load()?;
 
-	config.client.max_streams.get_or_insert(DEFAULT_MAX_STREAMS);
-	config.server.max_streams.get_or_insert(DEFAULT_MAX_STREAMS);
+	config.client.quic.max_streams.get_or_insert(DEFAULT_MAX_STREAMS);
+	config.server.quic.max_streams.get_or_insert(DEFAULT_MAX_STREAMS);
 
 	let mtls_enabled = !config.server.tls.root.is_empty();
 
@@ -25,12 +25,17 @@ async fn main() -> anyhow::Result<()> {
 	let mut server = config.server.init()?;
 	let client = config.client.clone().init()?;
 
-	let addr = server.local_addr()?;
+	// `None` for a stream-only server (no QUIC); any other error is real.
+	let addr = match server.local_addr() {
+		Ok(addr) => Some(addr),
+		Err(moq_native::Error::NoBackend(_)) => None,
+		Err(err) => return Err(err).context("failed to resolve the QUIC bind address"),
+	};
 
 	#[cfg(feature = "iroh")]
-	let (server, client) = {
-		let iroh = config.iroh.bind().await?;
-		(server.with_iroh(iroh.clone()), client.with_iroh(iroh))
+	let (server, client) = match config.iroh.bind(&config.client.quic).await? {
+		Some(iroh) => (server.with_iroh(iroh.clone()), client.with_iroh(iroh)),
+		None => (server, client),
 	};
 
 	// Reject configs where neither JWT nor mTLS can authenticate anyone.
@@ -44,33 +49,34 @@ async fn main() -> anyhow::Result<()> {
 	}
 
 	let auth = if config.auth.is_empty() {
-		Auth::default()
+		// mTLS-only: no JWT/public source, but `--auth-mtls-tier` still applies.
+		Auth::default().with_mtls_tier(config.auth.mtls_tier.clone())
 	} else {
-		config.auth.init().await?
+		config.auth.init(&config.client.tls).await?
 	};
 
-	let cluster = Cluster::new(config.cluster)
+	let cache = config.cache.init()?;
+	let cluster = Cluster::new(config.cluster)?
+		.with_cache(cache)
 		.with_client(client)
 		.with_client_tls(config.client.tls.build()?);
+	// Keep the producer alive for the whole run: its publish task stops when
+	// the last clone drops. The cluster only needs the counter registry.
 	let stats = config.stats.build(cluster.origin.clone());
-	let cluster = cluster.with_stats(stats);
+	let cluster = cluster.with_stats(stats.registry().clone());
 
-	// Spawn the health monitor before `config.web` is moved into the server.
-	let health = config.web.health.build();
+	// Internal (ops) listener (plain HTTP, opt-in via `--internal-listen`) for
+	// /metrics + /health, separate from the customer-facing web server. No-op
+	// when unconfigured.
+	let internal = Internal::new(config.internal, cluster.stats.clone());
 
 	// Create a web server too. mTLS for HTTPS is opt-in via `--web-https-root`.
-	let web = Web::new(
-		WebState {
-			auth: auth.clone(),
-			cluster: cluster.clone(),
-			tls_info: server.tls_info(),
-			conn_id: Default::default(),
-			health,
-		},
-		config.web,
-	);
+	let web = Web::new(auth.clone(), cluster.clone(), server.certificates(), config.web);
 
-	tracing::info!(%addr, "listening");
+	match addr {
+		Some(addr) => tracing::info!(%addr, "listening"),
+		None => tracing::info!("listening (stream transports only)"),
+	}
 
 	#[cfg(unix)]
 	// Notify systemd that we're ready after all initialization is complete
@@ -84,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
 	tokio::select! {
 		Err(err) = cluster.clone().run() => return Err(err).context("cluster failed"),
 		Err(err) = web.run() => return Err(err).context("web server failed"),
+		Err(err) = internal.run() => return Err(err).context("internal server failed"),
 		Err(err) = serve(server, cluster, auth) => return Err(err).context("server failed"),
 		Err(err) = jemalloc => return Err(err).context("jemalloc profiler failed"),
 		else => Ok(()),

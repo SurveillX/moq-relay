@@ -35,7 +35,7 @@ library, and the generated header. Supported targets:
 - `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`
 - `x86_64-apple-darwin`, `aarch64-apple-darwin`
 
-Download and extract a bundle (here `0.2.0` on Linux x86_64):
+Download and extract a bundle (here `0.2.0` on Linux x86\_64):
 
 ```bash
 ver=0.2.0
@@ -49,18 +49,21 @@ and `lib/` (`libmoq.a` plus the dynamic library).
 
 ### Compile against it
 
-Point your compiler at the extracted `include/` and `lib/` directories and link
-`-lmoq`, plus the platform system libraries `libmoq` needs:
+`libmoq.a` is a static library, so your linker also needs the system libraries it
+depends on (media frameworks, the C++ runtime, and so on). The bundle ships a
+pkg-config file that lists them, which saves you tracking the set by hand:
 
 ```bash
 root=moq-$ver-$target
+export PKG_CONFIG_PATH="$root/lib/pkgconfig"
 
-# Linux
-cc subscribe.c -I"$root/include" -L"$root/lib" -lmoq -lpthread -ldl -lm -o subscribe
+cc subscribe.c $(pkg-config --cflags --libs --static moq) -o subscribe
+```
 
-# macOS
-cc subscribe.c -I"$root/include" -L"$root/lib" -lmoq \
-  -framework CoreFoundation -framework Security -o subscribe
+Without pkg-config, pass the same flags yourself:
+
+```bash
+pkg-config --libs --static moq   # prints exactly what to add
 ```
 
 The static library (`libmoq.a`) links the whole Rust runtime in, so the result
@@ -86,11 +89,13 @@ generated header at `../../target/release/moq.h`.
 
 ## Callback lifetime
 
-Any function that registers a callback (`moq_session_connect`, `moq_origin_announced`, `moq_consume_catalog`, `moq_consume_video_ordered`, `moq_consume_audio_ordered`, `moq_consume_track`, `moq_consume_audio_raw`) takes a `void *user_data` pointer that libmoq passes back to every callback invocation. The status code carries the lifecycle:
+Any function that registers a callback (`moq_session_connect`, `moq_origin_announced`, `moq_origin_consume_announced`, `moq_origin_request`, `moq_consume_catalog`, `moq_consume_video`, `moq_consume_audio`, `moq_consume_track`, `moq_consume_datagrams`, `moq_consume_video_raw`, `moq_consume_audio_raw`, `moq_consume_json_snapshot`, `moq_consume_json_stream`) takes a `void *user_data` pointer that libmoq passes back to every callback invocation. The status code carries the lifecycle:
 
-- **`> 0`** — a live result you can use: a frame, catalog, or announce ID (or `1` to mean "session connected"). May fire any number of times.
-- **`0`** — closed cleanly. **Terminal.**
-- **`< 0`** — closed with an error. **Terminal.**
+- **`> 0`**: a live result you can use: a frame, catalog, or announce ID (or `1` to mean "session connected"). May fire any number of times.
+- **`0`**: closed cleanly. **Terminal.**
+- **`< 0`**: closed with an error. **Terminal.**
+
+A positive result that is itself a handle must be freed once you're done with it (e.g. a broadcast from `moq_origin_request` via `moq_consume_close`). `moq_origin_announced` is the notable repeat case: it delivers a fresh announce ID for *every* announce / unannounce event, so free each one with `moq_origin_announced_free` after reading it with `moq_origin_announced_info`, or they accumulate for the life of the listener.
 
 Once a callback fires with any non-positive (`<= 0`) code, libmoq will never invoke it again and never touch `user_data` again. Release `user_data` in response to that final callback.
 
@@ -111,7 +116,96 @@ if (rc < 0) {
 
 `moq_error()` returns the reason for the most recent failed call **on the calling thread**, including detail the numeric code can't carry (which URL failed to parse, why a decode failed, etc.). The returned pointer is valid until the next libmoq call on that thread, so copy it if you need to keep it. It is only meaningful after a call returned a negative code; check the code first. Errors delivered through status callbacks carry their code directly, so read `moq_error()` from inside the callback if you want the matching reason.
 
+A server can reject the connection on auth grounds: unauthorized (HTTP 401) or forbidden (HTTP 403). Each returns its own distinct negative code (with `moq_error()` reporting `"unauthorized"` / `"forbidden"`). These are terminal, so distinguish them from a transient transport failure and stop rather than reconnecting.
+
 Failed calls are reported only through the return code and `moq_error()`, not logged. To surface libmoq's internal logs (moq-net / QUIC activity), call `moq_log_level("debug")` (or `"trace"`, `"info"`, etc.) to install a tracing subscriber.
+
+## Raw Tracks
+
+Raw tracks carry arbitrary byte payloads without catalog or codec parsing. Use
+`moq_publish_track_frame` / `moq_publish_group_frame` to provide presentation
+timestamps in microseconds.
+libmoq creates raw tracks with a microsecond timescale by default (used when
+`moq_track_info.timescale_valid` is false or no info is given), matching the C
+ABI's timestamp units.
+
+Use `moq_publish_track_group_at` to create sparse or replayed groups at an
+explicit sequence. `moq_publish_track_finish_at` declares the exclusive end
+while still permitting lower groups. `moq_publish_track_abort` and
+`moq_publish_group_abort` terminate a producer with an application error. Call
+`moq_publish_track_finish` after filling the groups below a declared end.
+
+Subscribers receive raw frame handles from `moq_consume_track`; read each one
+with `moq_consume_track_frame`. The returned `moq_frame.timestamp_us` carries
+the timestamp, and `keyframe` is always false because raw tracks do not parse
+codec metadata.
+
+## Raw Track Options
+
+`moq_publish_track` accepts optional publisher-side track properties:
+`ordered` controls prioritization only. When true, groups are prioritized in
+sequence order. Groups may always arrive out-of-order (or not at all) over the
+network.
+
+```c
+struct moq_track_info info = {0};
+info.priority = 3;
+info.ordered = true;
+info.latency_max_ms = 1000;
+info.latency_max_valid = true;
+info.timescale = 1000000;
+info.timescale_valid = true;
+
+int track = moq_publish_track(
+    broadcast,
+    name,
+    name_len,
+    &info);
+```
+
+`moq_consume_track` accepts optional subscriber delivery preferences.
+`moq_consume_track_update` changes them while the callback task is running.
+Fields ending in `_valid` decide whether the matching optional value is present:
+
+```c
+struct moq_subscription sub = {0};
+sub.priority = 5;
+sub.ordered = true;
+sub.latency_max_ms = 25;
+sub.group_start = 10;
+sub.group_start_valid = true;
+
+int consumer = moq_consume_track(
+    broadcast,
+    name,
+    name_len,
+    &sub,
+    on_frame,
+    user_data);
+
+sub.group_end = 20;
+sub.group_end_valid = true;
+moq_consume_track_update(consumer, &sub);
+```
+
+Pass `NULL` for either options pointer to use the moq-net defaults.
+
+## JSON tracks
+
+For JSON payloads, libmoq frames the values for you. You opt into one of two modes. Snapshot (lossy) carries one value updated over time; a subscriber only sees the latest, via `moq_publish_json_snapshot` / `moq_consume_json_snapshot`. Stream (lossless) is an ordered append-log where every record is preserved, via `moq_publish_json_stream` / `moq_consume_json_stream`. Values are UTF-8 JSON documents.
+
+```c
+struct moq_json_snapshot_config config = { .delta_ratio = 8, .compression = true };
+int32_t json = moq_publish_json_snapshot(broadcast, "status", strlen("status"), &config);
+const char *value = "{\"state\":\"live\"}";
+moq_publish_json_snapshot_update(json, value, strlen(value));
+
+// Subscribe: on_value fires with a value ID for each update; read it, then release it.
+int32_t task = moq_consume_json_snapshot(consume, "status", strlen("status"), &config, on_value, user_data);
+// In on_value: struct moq_json_value v; moq_consume_json_value(id, &v); ... moq_consume_json_value_close(id);
+```
+
+`compression` must match on the producer and subscriber. The consumer callback follows the same lifetime contract as every other (see above): release `user_data` on the terminal `<= 0` call.
 
 ## Use cases
 

@@ -10,7 +10,6 @@ use super::{Message, Version};
 /// Sent by the subscriber to fetch a specific group from a track.
 ///
 /// Lite03+ only.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct Fetch<'a> {
 	pub broadcast: Path<'a>,
@@ -54,5 +53,43 @@ impl Message for Fetch<'_> {
 		self.priority.encode(w, version)?;
 		self.group.encode(w, version)?;
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	fn fetch_sample() -> Fetch<'static> {
+		Fetch {
+			broadcast: Path::new("room").to_owned(),
+			track: Cow::Borrowed("video"),
+			priority: 3,
+			group: 7,
+		}
+	}
+
+	fn fetch_roundtrip(version: Version, msg: &Fetch<'_>) -> Fetch<'static> {
+		let mut buf = Vec::new();
+		msg.encode_msg(&mut buf, version).unwrap();
+		let mut slice = buf.as_slice();
+		Fetch::decode_msg(&mut slice, version).unwrap()
+	}
+
+	#[test]
+	fn fetch_roundtrips() {
+		for version in [Version::Lite03, Version::Lite04, Version::Lite05] {
+			let got = fetch_roundtrip(version, &fetch_sample());
+			assert_eq!(got.broadcast, Path::new("room"));
+			assert_eq!(got.track, "video");
+			assert_eq!(got.priority, 3);
+			assert_eq!(got.group, 7);
+		}
+	}
+
+	#[test]
+	fn fetch_rejected_before_lite03() {
+		let mut buf = Vec::new();
+		assert!(fetch_sample().encode_msg(&mut buf, Version::Lite02).is_err());
 	}
 }

@@ -1,15 +1,24 @@
 import * as z from "zod/mini";
 import { ContainerSchema } from "./container";
 import { u53Schema } from "./integers";
+import { RelativeBroadcastSchema } from "./path";
+import { TimelineSchema } from "./timeline";
 
 // Backwards compatibility: old track schema
 const TrackSchema = z.object({
 	name: z.string(),
 });
 
-// Mirrors AudioDecoderConfig
-// https://w3c.github.io/webcodecs/#audio-decoder-config
+/**
+ * Schema for a single audio rendition's decoder config.
+ * Mirrors WebCodecs AudioDecoderConfig (https://w3c.github.io/webcodecs/#audio-decoder-config).
+ */
 export const AudioConfigSchema = z.object({
+	// Optional reference to another broadcast that publishes this track, expressed
+	// relative to the broadcast that served this catalog (e.g. "../source").
+	// If unset, the track lives in the same broadcast as the catalog.
+	broadcast: z.optional(RelativeBroadcastSchema),
+
 	// See: https://w3c.github.io/webcodecs/codec_registry.html
 	codec: z.string(),
 
@@ -38,8 +47,12 @@ export const AudioConfigSchema = z.object({
 	// NOTE: The audio "frame" duration depends on the codec, sample rate, etc.
 	// ex: AAC often uses 1024 samples per frame, so at 44100Hz, this would be 1024/44100 = 23ms
 	jitter: z.optional(u53Schema),
+
+	// The companion timeline track indexing this rendition's groups, if the publisher offers one.
+	timeline: z.optional(TimelineSchema),
 });
 
+/** Schema for the catalog audio section: a map of track name to rendition config. */
 export const AudioSchema = z.union([
 	z.object({
 		// A map of track name to rendition configuration.
@@ -58,5 +71,7 @@ export const AudioSchema = z.union([
 	),
 ]);
 
+/** The catalog audio section: renditions keyed by track name. */
 export type Audio = z.infer<typeof AudioSchema>;
+/** Decoder config for a single audio rendition. */
 export type AudioConfig = z.infer<typeof AudioConfigSchema>;

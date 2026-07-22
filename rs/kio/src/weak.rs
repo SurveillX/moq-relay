@@ -4,24 +4,24 @@ use std::{
 };
 
 use crate::{
-	Counts, State,
+	Closed, Counts, State,
 	consumer::Consumer,
 	lock::*,
-	producer::{Mut, Producer, Ref},
+	producer::{Producer, Ref},
 	waiter::*,
 };
 
-/// A weak reference to a Producer/Consumer state.
+/// A weak handle from the producing side ([`Producer::weak`](crate::Producer::weak)).
 ///
-/// Does not affect ref counts, so it won't prevent auto-close when all Producers are dropped.
-/// Can be upgraded to a full Producer or Consumer.
+/// Holds no ref count, so it never keeps the channel open. Upgrade it back to a [`Producer`]
+/// (write access) or a [`Consumer`] (read access) while the channel is still live.
 #[derive(Debug)]
-pub struct Weak<T> {
+pub struct ProducerWeak<T> {
 	pub(crate) state: Lock<State<T>>,
 	pub(crate) counts: Arc<Counts>,
 }
 
-impl<T> Weak<T> {
+impl<T> ProducerWeak<T> {
 	/// Upgrade to a [`Producer`], returning `None` if the channel is already closed.
 	pub fn produce(&self) -> Option<Producer<T>> {
 		// Increment first to prevent the last Producer::drop from
@@ -46,28 +46,15 @@ impl<T> Weak<T> {
 	pub fn consume(&self) -> Consumer<T> {
 		let prev = self.counts.consumers.fetch_add(1, Ordering::AcqRel);
 
-		// Wake waiters (e.g. `used()`) when the first consumer appears.
+		// Wake `used()` waiters when the first consumer appears.
 		if prev == 0 {
-			let mut waiters = self.state.lock().waiters.take();
+			let mut waiters = self.state.lock().waiters_consumer.take();
 			waiters.wake();
 		}
 
 		Consumer {
 			state: self.state.clone(),
 			counts: self.counts.clone(),
-		}
-	}
-
-	/// Acquire mutable access to the shared state without upgrading to a full [`Producer`].
-	///
-	/// Returns `Ok(Mut)` if the channel is open, or `Err(Ref)` with
-	/// read-only access if closed. Only locks once.
-	pub fn write(&self) -> Result<Mut<'_, T>, Ref<'_, T>> {
-		let state = self.state.lock();
-		if state.closed {
-			Err(Ref { state })
-		} else {
-			Ok(Mut::new(state))
 		}
 	}
 
@@ -78,72 +65,52 @@ impl<T> Weak<T> {
 		}
 	}
 
-	/// Poll-based mutable access with waker registration.
-	///
-	/// Calls `f` with a [`Mut`] guard. If `f` returns [`Poll::Pending`],
-	/// registers the waiter for notification when the state next changes.
-	/// Returns `None` if the channel is closed.
-	pub fn poll_write<F, R>(&self, waiter: &Waiter, mut f: F) -> Poll<Option<R>>
-	where
-		F: FnMut(&mut Mut<'_, T>) -> Poll<R>,
-	{
-		let Ok(mut state) = self.write() else {
-			return Poll::Ready(None);
-		};
-
-		if let Poll::Ready(res) = f(&mut state) {
-			return Poll::Ready(Some(res));
-		}
-
-		// Reset modified so the drop doesn't immediately wake the waiter we're about to register.
-		state.modified = false;
-
-		let state = state.state.as_mut().unwrap();
-		waiter.register(&mut state.waiters);
-		Poll::Pending
-	}
-
-	/// Wait for the closure to return [`Poll::Ready`], re-polling on each state change.
-	///
-	/// Returns `Ok(R)` when the closure returns [`Poll::Ready`], or `Err(Ref)` with
-	/// read-only access to the final state if the channel closes first.
-	pub async fn wait<F, R>(&self, mut f: F) -> Result<R, Ref<'_, T>>
-	where
-		F: FnMut(&mut Mut<'_, T>) -> Poll<R> + Unpin,
-		R: Unpin,
-	{
-		match crate::wait(move |waiter| self.poll_write(waiter, &mut f)).await {
-			Some(r) => Ok(r),
-			None => Err(self.read()),
-		}
-	}
-
 	/// Returns `true` if the channel has been closed.
 	pub fn is_closed(&self) -> bool {
 		self.state.lock().closed
 	}
 
+	/// Wait until the channel is closed.
+	pub async fn closed(&self) {
+		crate::wait(move |waiter| self.poll_closed(waiter)).await
+	}
+
+	/// Poll for channel closure, registering the waiter if still open.
+	pub fn poll_closed(&self, waiter: &Waiter) -> Poll<()> {
+		let mut state = self.state.lock();
+		if state.closed {
+			return Poll::Ready(());
+		}
+
+		waiter.register(&mut state.waiters_closed);
+		Poll::Pending
+	}
+
 	/// Wait until all consumers have been dropped.
 	///
-	/// Returns `Ok(())` when no consumers remain, or `Err(Ref)` if the channel closes first.
-	pub async fn unused(&self) -> Result<(), Ref<'_, T>> {
+	/// Returns `Ok(())` when no consumers remain, or [`Closed`] if the channel closes first.
+	pub async fn unused(&self) -> Result<(), Closed> {
 		match crate::wait(move |waiter| self.poll_unused(waiter)).await {
 			Some(()) => Ok(()),
-			None => Err(self.read()),
+			None => Err(Closed),
 		}
 	}
 
-	fn poll_unused(&self, waiter: &Waiter) -> Poll<Option<()>> {
-		if self.counts.consumers.load(Ordering::Relaxed) == 0 {
-			return Poll::Ready(Some(()));
-		}
-
+	/// Poll-based variant of [`Self::unused`]: `Ready(Some(()))` when no consumers
+	/// remain, `Ready(None)` if the channel closed first, else `Pending`.
+	pub fn poll_unused(&self, waiter: &Waiter) -> Poll<Option<()>> {
+		// Closure is checked first, matching `Producer::poll_unused`: a closed channel
+		// with no consumers resolves `None` from either handle.
 		let mut state = self.state.lock();
 		if state.closed {
 			return Poll::Ready(None);
 		}
 
-		waiter.register(&mut state.waiters);
+		if self.counts.consumers.load(Ordering::Relaxed) == 0 {
+			return Poll::Ready(Some(()));
+		}
+
+		waiter.register(&mut state.waiters_consumer);
 
 		// Re-check after registration to avoid TOCTOU race where the last
 		// consumer drops between the initial check and waiter registration.
@@ -156,25 +123,28 @@ impl<T> Weak<T> {
 
 	/// Wait until at least one consumer exists.
 	///
-	/// Returns `Ok(())` when a consumer is created, or `Err(Ref)` if the channel closes first.
-	pub async fn used(&self) -> Result<(), Ref<'_, T>> {
+	/// Returns `Ok(())` when a consumer is created, or [`Closed`] if the channel closes first.
+	pub async fn used(&self) -> Result<(), Closed> {
 		match crate::wait(move |waiter| self.poll_used(waiter)).await {
 			Some(()) => Ok(()),
-			None => Err(self.read()),
+			None => Err(Closed),
 		}
 	}
 
-	fn poll_used(&self, waiter: &Waiter) -> Poll<Option<()>> {
-		if self.counts.consumers.load(Ordering::Relaxed) > 0 {
-			return Poll::Ready(Some(()));
-		}
-
+	/// Poll-based variant of [`Self::used`]: `Ready(Some(()))` once a consumer
+	/// exists, `Ready(None)` if the channel closed first, else `Pending`.
+	pub fn poll_used(&self, waiter: &Waiter) -> Poll<Option<()>> {
+		// Closure is checked first, matching `Producer::poll_used`.
 		let mut state = self.state.lock();
 		if state.closed {
 			return Poll::Ready(None);
 		}
 
-		waiter.register(&mut state.waiters);
+		if self.counts.consumers.load(Ordering::Relaxed) > 0 {
+			return Poll::Ready(Some(()));
+		}
+
+		waiter.register(&mut state.waiters_consumer);
 
 		// Re-check after registration to avoid TOCTOU race.
 		if self.counts.consumers.load(Ordering::Relaxed) > 0 {
@@ -184,17 +154,143 @@ impl<T> Weak<T> {
 		Poll::Pending
 	}
 
-	/// Returns `true` if both weak references share the same underlying state.
+	/// Returns `true` if both handles share the same underlying state.
 	pub fn same_channel(&self, other: &Self) -> bool {
 		self.state.is_clone(&other.state)
 	}
 }
 
-impl<T> Clone for Weak<T> {
+impl<T> Clone for ProducerWeak<T> {
 	fn clone(&self) -> Self {
 		Self {
 			state: self.state.clone(),
 			counts: self.counts.clone(),
 		}
+	}
+}
+
+/// A weak handle from the consuming side ([`Consumer::weak`](crate::Consumer::weak)).
+///
+/// Holds no ref count, so it never keeps the channel open. Unlike [`ProducerWeak`] it can
+/// only mint more [`Consumer`]s, so a read-only handle can never grow write access.
+#[derive(Debug)]
+pub struct ConsumerWeak<T> {
+	pub(crate) state: Lock<State<T>>,
+	pub(crate) counts: Arc<Counts>,
+}
+
+impl<T> ConsumerWeak<T> {
+	/// Create a new [`Consumer`] that shares this state.
+	pub fn consume(&self) -> Consumer<T> {
+		let prev = self.counts.consumers.fetch_add(1, Ordering::AcqRel);
+
+		// Wake `used()` waiters when the first consumer appears.
+		if prev == 0 {
+			let mut waiters = self.state.lock().waiters_consumer.take();
+			waiters.wake();
+		}
+
+		Consumer {
+			state: self.state.clone(),
+			counts: self.counts.clone(),
+		}
+	}
+
+	/// Get read-only access to the shared state.
+	pub fn read(&self) -> Ref<'_, T> {
+		Ref {
+			state: self.state.lock(),
+		}
+	}
+
+	/// Returns `true` if the channel has been closed.
+	pub fn is_closed(&self) -> bool {
+		self.state.lock().closed
+	}
+
+	/// Wait until the channel is closed.
+	pub async fn closed(&self) {
+		crate::wait(move |waiter| self.poll_closed(waiter)).await
+	}
+
+	/// Poll for channel closure, registering the waiter if still open.
+	pub fn poll_closed(&self, waiter: &Waiter) -> Poll<()> {
+		let mut state = self.state.lock();
+		if state.closed {
+			return Poll::Ready(());
+		}
+
+		waiter.register(&mut state.waiters_closed);
+		Poll::Pending
+	}
+
+	/// Returns `true` if both handles share the same underlying state.
+	pub fn same_channel(&self, other: &Self) -> bool {
+		self.state.is_clone(&other.state)
+	}
+}
+
+impl<T> Clone for ConsumerWeak<T> {
+	fn clone(&self) -> Self {
+		Self {
+			state: self.state.clone(),
+			counts: self.counts.clone(),
+		}
+	}
+}
+
+#[cfg(test)]
+mod test {
+	use super::*;
+
+	/// A closed, consumer-free channel reports the same thing through either handle.
+	/// Both check closure before the consumer count, so neither reports `Ok(())` for a
+	/// channel that is merely out of consumers because it's dead.
+	#[tokio::test]
+	async fn weak_and_producer_agree_once_closed() {
+		let producer = Producer::new(0u32);
+		let weak = producer.weak();
+
+		// No consumers were ever created, and the channel is now closed.
+		producer.close().ok().expect("open");
+
+		assert_eq!(producer.unused().await, Err(Closed));
+		assert_eq!(weak.unused().await, Err(Closed));
+
+		assert_eq!(producer.used().await, Err(Closed));
+		assert_eq!(weak.used().await, Err(Closed));
+	}
+
+	/// While the channel is open the two handles still agree on the consumer count.
+	#[tokio::test]
+	async fn weak_and_producer_agree_while_open() {
+		let producer = Producer::new(0u32);
+		let weak = producer.weak();
+
+		assert_eq!(producer.unused().await, Ok(()));
+		assert_eq!(weak.unused().await, Ok(()));
+
+		let consumer = producer.consume();
+		assert_eq!(producer.used().await, Ok(()));
+		assert_eq!(weak.used().await, Ok(()));
+
+		drop(consumer);
+		assert_eq!(weak.unused().await, Ok(()));
+	}
+
+	#[tokio::test]
+	async fn consumer_weak_reads_and_observes_close() {
+		let producer = Producer::new(7u32);
+		let consumer = producer.consume();
+		let weak = consumer.weak();
+
+		assert_eq!(*weak.read(), 7);
+		assert!(!weak.is_closed());
+
+		// Dropping the last producer closes the channel, resolving `closed()`.
+		drop(producer);
+		weak.closed().await;
+		assert!(weak.is_closed());
+		assert!(weak.read().is_closed());
 	}
 }

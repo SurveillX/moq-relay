@@ -5,12 +5,10 @@ description: TOML configuration reference for moq-relay
 
 # Configuration
 
-moq-relay is configured via a TOML file. Pass the path as the only argument:
+moq-relay is configured via a TOML file. Pass the path as the only positional argument:
 
 ```bash
 moq-relay relay.toml
-# or
-moq-relay --config relay.toml
 ```
 
 ## Minimal Example
@@ -39,13 +37,38 @@ level = "info"
 
 ### \[server]
 
-QUIC/WebTransport server settings.
+QUIC/WebTransport server settings. Optionally add plaintext qmux stream
+listeners for trusted local workers. Every connection authenticates through the
+same JWT / public-access path; QUIC additionally accepts an mTLS client
+certificate, and Unix sockets add optional peer-credential gating.
 
 ```toml
 [server]
-# Listen address for QUIC (UDP)
-listen = "0.0.0.0:4443"
+# QUIC (UDP) bind. Omit to run stream-only (no QUIC) when a tcp/unix listener
+# is configured below.
+bind = "[::]:443"
+
+# Plaintext qmux over TCP (no TLS, carries no peer identity). Trusted networks
+# only; a non-loopback bind logs a warning. Requires the `tcp` build feature.
+[server.tcp]
+bind = "127.0.0.1:4444"
+
+# Plaintext qmux over a Unix socket, for local workers (e.g. the protocol
+# gateways or a stats publisher). Requires the `uds` build feature. Restrict
+# callers by peer credentials (each list AND across, OR within; empty = no
+# constraint).
+[server.unix]
+bind = "/run/moq/internal.sock"
+
+[server.unix.allow]
+uid = [1001]
+# gid = [2000]
+# pid = [12345]
 ```
+
+No-JWT connections on the stream transports resolve through the same
+public-access rules as tokenless QUIC clients (see [`[auth]`](#auth) `public`).
+See [Stream Listeners](/bin/relay/auth#stream-listeners) for details.
 
 ### \[server.tls]
 
@@ -63,7 +86,7 @@ generate = ["localhost", "127.0.0.1"]
 # Optional: root CAs to accept for mTLS peer authentication.
 # Clients that present a cert signed by one of these CAs are granted
 # full access (publish/subscribe/cluster). Intended for relay clustering.
-# Quinn backend only.
+# Supported by the quinn and noq backends.
 root = ["/path/to/peer-ca.pem"]
 ```
 
@@ -96,22 +119,6 @@ cert = "cert.pem"
 key = "key.pem"
 ```
 
-### \[web.health]
-
-Thresholds for the `/health` load-shedding probe (CPU, RAM, network, load
-average), or an external `api` to defer the decision to. All keys are optional;
-an unset threshold is not enforced, and with none set `/health` is a pure
-liveness probe. See [HTTP Endpoints](/bin/relay/http) for the full reference and
-value syntax.
-
-```toml
-[web.health]
-cpu = 75       # percent; `75` or `75%`
-ram = "80%"    # percent of total, or absolute (`32GB`)
-tx = "500MB"   # bytes/s; `b` = bits, `B` = bytes (`4Gb`)
-load5 = "80%"  # load average; raw (`6.0`) or percent of cores; Unix only
-```
-
 ### \[auth]
 
 Authentication configuration.
@@ -136,8 +143,10 @@ Clustering configuration for multi-relay deployments.
 
 ```toml
 [cluster]
-# Peers this relay dials. The topology is whatever you draw with these links.
-connect = ["us-east.example.com:4443"]
+# Peers this relay dials, as full URLs. The topology is whatever you draw with
+# these links. A JWT may be supplied inline as a ?jwt= query parameter. A bare
+# host or "host:port" is deprecated but still accepted (wrapped in https://.../).
+connect = ["https://us-east.example.com/?jwt=..."]
 
 # Optional. This relay's own externally-reachable URL (identity). Advertised to
 # peers when gossip is on, and sent to connect_api as ?node=.
@@ -151,7 +160,9 @@ mesh = true
 # array of hostnames) and reconcile it at runtime, no restart needed.
 connect_api = "https://api.example.com/cluster/connect"
 
-# JWT used for outbound cluster dials (alternative to mTLS).
+# JWT for outbound cluster dials (alternative to mTLS), applied to any peer
+# whose URL has no inline ?jwt=. Required to authenticate gossip / connect_api
+# discovered peers; for static `connect` peers, prefer an inline ?jwt=.
 token = "cluster.jwt"
 ```
 
@@ -166,16 +177,24 @@ Client settings used when connecting to other relays (clustering).
 # Disable TLS verification (development only!)
 tls.disable_verify = true
 
-# Or provide trusted root certificates
+# Or provide trusted root certificates. By default these replace the system
+# roots, so the relay trusts only these CAs.
 # tls.root = ["/path/to/root.pem"]
+
+# Set this to also trust the platform's system roots alongside any custom root,
+# e.g. to dial a local relay with a private CA and a remote one with a public CA.
+# Defaults to true only when no custom root is set.
+# tls.system_roots = true
 ```
 
 ### \[stats]
 
-Per-node stats publishing. When enabled, the relay publishes a single
-`<prefix>/node/<node>` broadcast (or `<prefix>/node` when `node` is unset)
+Per-node stats publishing. When enabled, the relay publishes stats broadcasts
 carrying JSON snapshots of the broadcasts it's currently serving and of the
-sessions currently connected to it.
+sessions currently connected to it. By default, it publishes a single
+`<prefix>/node/<node>` broadcast (or `<prefix>/node` when `node` is unset).
+Set `depth` to bucket stats by the first N broadcast path segments and publish
+one broadcast per bucket at `<prefix>/<bucket>/node/<node>`.
 
 ```toml
 [stats]
@@ -193,19 +212,45 @@ interval = 1
 # "sjc/1" / "sjc/2" for two hosts nested under a shared region key.
 # Single-relay deployments can omit this.
 node = "sjc/1"
+
+# Number of leading broadcast path segments to bucket stats by (defaults to 0).
+# Set to 1 for one stats broadcast per first path segment, e.g. per tenant.
+depth = 1
 ```
 
-Each stats broadcast carries four per-broadcast tracks, one per
-`(tier, role)` pair, plus two session tracks (one per tier):
+Each stats broadcast splits traffic by **tier**, an arbitrary label chosen by
+business logic (see the auth API's [`tier`](/bin/relay/auth#unified-auth-api-auth-api)
+field). The default tier is unprefixed; a named tier prefixes its track names
+with its label. So per tier the broadcast carries a publisher, a subscriber, and
+a session track:
 
 | Track                       | What it covers                              |
 |-----------------------------|---------------------------------------------|
-| `publisher.json`            | external (e.g. customer) egress             |
-| `subscriber.json`           | external ingress                            |
-| `internal/publisher.json`   | internal (e.g. mTLS cluster peer) egress    |
-| `internal/subscriber.json`  | internal ingress                            |
-| `sessions.json`             | external connected sessions, keyed by root  |
-| `internal/sessions.json`    | internal connected sessions, keyed by root  |
+| `publisher.json`            | default-tier egress                         |
+| `subscriber.json`           | default-tier ingress                        |
+| `<tier>/publisher.json`    | named-tier egress (e.g. `internal/publisher.json`) |
+| `<tier>/subscriber.json`   | named-tier ingress                          |
+| `sessions.json`             | default-tier connected sessions, keyed by root |
+| `<tier>/sessions.json`     | named-tier connected sessions, keyed by root |
+
+Each track also has a compressed sibling with a `.z` suffix (e.g.
+`publisher.json.z`) carrying the same data for a fraction of the bytes. It's
+encoded by [moq-json](https://docs.rs/moq-json): each group starts with a full
+snapshot and continues with RFC 7396 merge-patch deltas, all DEFLATE-compressed
+in one shared window. Read it with the
+[moq-stats](https://docs.rs/moq-stats) consumer (or `moq-json` directly), not
+as raw JSON frames; the plain `.json` tracks remain one full JSON object per
+frame.
+
+The default-tier tracks always exist (emitting `{}` while idle). A named tier's
+tracks are created the first time traffic routes to that label, so cluster
+fan-out shows up under `internal/*` (the default trusted-peer label) and never in
+the default-tier numbers.
+
+Trusted (non-JWT/public) traffic defaults to the `internal` tier, configurable
+per source: `--cluster-tier` (relay-to-relay dials) and `--auth-mtls-tier`
+(mTLS peers, when the auth API doesn't return a `tier`). Set either to a
+different label, or to `""` to record on the default unprefixed tier.
 
 Each per-broadcast frame is a JSON object mapping broadcast path to a
 cumulative counter snapshot. An entry surfaces on any tick where the
@@ -217,13 +262,13 @@ counterpart no traffic can flow, so the entry is dropped:
 ```json
 {
   "demo/bbb": {
-    "announced": 1, "announced_closed": 0,
+    "announced": 1, "announced_closed": 0, "announced_bytes": 8,
     "broadcasts": 1, "broadcasts_closed": 0,
     "subscriptions": 5, "subscriptions_closed": 2,
     "bytes": 12345, "frames": 678, "groups": 9
   },
   "anon/foo": {
-    "announced": 1, "announced_closed": 0,
+    "announced": 1, "announced_closed": 0, "announced_bytes": 8,
     "broadcasts": 1, "broadcasts_closed": 0,
     "subscriptions": 2, "subscriptions_closed": 0,
     "bytes": 234, "frames": 12, "groups": 1
@@ -236,6 +281,11 @@ Field semantics:
 - `announced` / `announced_closed`: cumulative count of every broadcast
   announce/unannounce event on this `(tier, role)` slot, regardless of
   whether any subscription happened. Use this for "all known broadcasts".
+- `announced_bytes`: cumulative broadcast-name length summed over each
+  announce and unannounce of this broadcast. It counts the name, not the
+  encoded message size, so a broadcast isn't charged for hop chains or
+  framing overhead (and the count is the same across protocol versions).
+  Separate from `bytes`, which is media payload.
 - `broadcasts` / `broadcasts_closed`: per-(broadcast, session)
   subscription sentinel. The first active subscription a peer session
   opens for a broadcast bumps `broadcasts`; the last one it closes bumps
@@ -248,7 +298,7 @@ Field semantics:
 - `bytes` / `frames` / `groups`: cumulative payload counters from the
   session loops (both the `moq-lite` and IETF `moq-transport` paths).
 
-The session tracks (`sessions.json`, `internal/sessions.json`) instead map
+The session tracks (`sessions.json` and any `<tier>/sessions.json`) instead map
 each auth root to a `{ sessions, sessions_closed }` snapshot. `sessions`
 bumps when a session authenticated under that root connects and
 `sessions_closed` when it disconnects, so `sessions - sessions_closed` is
@@ -277,14 +327,44 @@ which guarantees the emitted snapshot never shows `closed > open` even
 under concurrent bumps (it can momentarily show an inflated *open* count,
 which is logically valid).
 
-Frames for any one `(tier, role)` are skipped when the JSON is
-byte-identical to the last emitted frame; new subscribers still pick up
-a baseline immediately via track-latest semantics.
+Frames for any one `(tier, role)` are skipped when nothing changed since
+the last emitted frame; new subscribers still pick up a baseline
+immediately via track-latest semantics.
 
 Every flag also accepts an equivalent CLI argument (`--stats-enabled`,
-`--stats-prefix`, `--stats-interval`, `--stats-node`) and environment
-variable (`MOQ_STATS_ENABLED`, `MOQ_STATS_PREFIX`, `MOQ_STATS_INTERVAL`,
-`MOQ_STATS_NODE`).
+`--stats-prefix`, `--stats-interval`, `--stats-node`, `--stats-depth`) and
+environment variable (`MOQ_STATS_ENABLED`, `MOQ_STATS_PREFIX`,
+`MOQ_STATS_INTERVAL`, `MOQ_STATS_NODE`, `MOQ_STATS_DEPTH`).
+
+### \[cache]
+
+Memory budget for cached groups. Old (non-latest) groups stay cached until their
+track's TTL expires or the pool runs out of room, whichever comes first; under
+memory pressure the least-recently-read groups are evicted first. The latest
+group of every track is always retained. With neither knob set the cache is
+unbounded and only the per-track TTL limits memory.
+
+```toml
+[cache]
+# Maximum bytes of cached group payload. Accepts absolute sizes ("8GiB",
+# "512MB") or a percentage of memory ("75%", respecting the cgroup limit
+# inside containers). Unbounded when unset.
+capacity = "8GiB"
+
+# Keep at least this much system memory available ("2GiB" or "10%"). Enables a
+# background governor that re-sizes the cache every few seconds: it grows into
+# idle memory and shrinks (evicting) when the rest of the system needs it, so
+# the cache is effectively the lowest-priority user of RAM. Combine with
+# `capacity` to also cap the absolute size.
+headroom = "2GiB"
+```
+
+The `capacity` budget counts group payload bytes, not process RSS, so leave
+slack below physical memory (or just use `headroom`, which measures actual
+available memory).
+
+Both flags also accept CLI arguments (`--cache-capacity`, `--cache-headroom`)
+and environment variables (`MOQ_CACHE_CAPACITY`, `MOQ_CACHE_HEADROOM`).
 
 ### \[iroh]
 

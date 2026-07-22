@@ -633,3 +633,85 @@ describe("resize", () => {
 		}
 	});
 });
+
+describe("decoded rate must match the ring (#2352)", () => {
+	// The ring maps a frame's timestamp to a sample index using its own rate, so the ring must run at
+	// the rate the decoder actually output. A 20ms Opus frame decodes to 960 samples (48kHz); if the
+	// ring runs at that rate they land contiguously, but if it runs at a mismatched rate (e.g. 44100,
+	// the machine default a file publish leaked into the catalog) each frame overruns its slot and
+	// every frame after the first is misplaced, which is the noise reported in #2352.
+	function writeOpusFrames(rate: number): AudioRingBuffer {
+		// 1s floor so nothing overflows while we fill 10 frames.
+		const buffer = new AudioRingBuffer({ rate, channels: 1, latency: 1000 as Time.Milli });
+		for (let i = 0; i < 10; i++) {
+			write(buffer, (i * 20) as Time.Milli, 960, { channels: 1, value: (i + 1) / 10 });
+		}
+		return buffer;
+	}
+
+	it("places 20ms/960-sample frames contiguously at 48kHz", () => {
+		// 20ms at 48kHz is exactly 960 samples, so 10 frames pack into 9600 with no gaps or overlap.
+		expect(writeOpusFrames(48000).length).toBe(9600);
+	});
+
+	it("misplaces the frames when the ring rate disagrees", () => {
+		// 20ms at 44100 is 882 samples, so each 960-sample frame overlaps the next and the buffer never
+		// reaches the contiguous 9600 it would at the matching rate.
+		expect(writeOpusFrames(44100).length).toBeLessThan(9600);
+	});
+});
+
+describe("buffered mode", () => {
+	function createBuffered(latency: number) {
+		return new AudioRingBuffer({ rate: 1000, channels: 1, latency: latency as Time.Milli, buffered: true });
+	}
+
+	it("anchors to the first frame and un-stalls at the latency target", () => {
+		const buffer = createBuffered(50);
+		expect(buffer.stalled).toBe(true);
+		write(buffer, 2000 as Time.Milli, 100, { channels: 1, value: 0.1 });
+		expect(buffer.stalled).toBe(false);
+		expect(Time.Milli.fromMicro(buffer.timestamp)).toBe(2000 as Time.Milli);
+	});
+
+	it("plays frames in order within the floor-sized ring without skipping ahead", () => {
+		// 600ms floor at 1000Hz -> 1200-sample ring, comfortably holding the 1000-sample utterance
+		// the backpressure loop would feed it. A non-buffered ring would have skipped to write-latency.
+		const buffer = createBuffered(600);
+		for (let i = 0; i < 10; i++) {
+			write(buffer, (2000 + i * 100) as Time.Milli, 100, { channels: 1, value: (i + 1) / 10 });
+		}
+		expect(buffer.length).toBe(1000);
+
+		const first = read(buffer, 100, 1);
+		expect(first[0][0]).toBeCloseTo(0.1, 5);
+		const second = read(buffer, 100, 1);
+		expect(second[0][0]).toBeCloseTo(0.2, 5);
+	});
+
+	it("reset re-stalls and re-anchors to the next utterance", () => {
+		const buffer = createBuffered(50);
+		write(buffer, 2000 as Time.Milli, 100, { channels: 1, value: 0.1 });
+		read(buffer, 50, 1);
+
+		buffer.reset();
+		expect(buffer.stalled).toBe(true);
+
+		write(buffer, 500 as Time.Milli, 100, { channels: 1, value: 0.9 });
+		expect(Time.Milli.fromMicro(buffer.timestamp)).toBe(500 as Time.Milli);
+		const out = read(buffer, 100, 1);
+		expect(out[0][0]).toBeCloseTo(0.9, 5);
+	});
+
+	it("drops the oldest samples once the ring fills beyond the floor", () => {
+		// 50ms floor at 1000Hz -> 50-sample floor, 100-sample ring. Backpressure normally keeps the
+		// decode loop from running this far ahead; if it slips, the ring drops its oldest as a backstop.
+		const buffer = createBuffered(50);
+
+		write(buffer, 0 as Time.Milli, 100, { channels: 1, value: 0.1 }); // [0, 100)
+		write(buffer, 100 as Time.Milli, 100, { channels: 1, value: 0.2 }); // exceeds 100-sample ring; drops [0, 100)
+
+		expect(Time.Milli.fromMicro(buffer.timestamp)).toBe(100 as Time.Milli);
+		expect(read(buffer, 100, 1)[0][0]).toBeCloseTo(0.2, 5);
+	});
+});

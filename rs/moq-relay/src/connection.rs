@@ -2,7 +2,6 @@ use crate::{Auth, AuthError, AuthParams, AuthToken, Cluster};
 
 use axum::http;
 use moq_native::Request;
-use moq_net::Path;
 
 /// An error carrying the HTTP status to send when closing the request.
 ///
@@ -53,31 +52,41 @@ impl Connection {
 		let subscribe = self.cluster.subscriber(&token);
 		let transport = self.request.transport();
 
-		match (&publish, &subscribe) {
-			(Some(publish), Some(subscribe)) => {
-				tracing::info!(transport, internal = token.internal, root = %token.root, publish = %publish.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), subscribe = %subscribe.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), "session accepted");
-			}
-			(Some(publish), None) => {
-				tracing::info!(transport, internal = token.internal, root = %token.root, publish = %publish.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), "publisher accepted");
-			}
-			(None, Some(subscribe)) => {
-				tracing::info!(transport, internal = token.internal, root = %token.root, subscribe = %subscribe.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), "subscriber accepted")
-			}
-			_ => {
-				let _ = self.request.close(http::StatusCode::FORBIDDEN.as_u16()).await;
-				anyhow::bail!("invalid session; no allowed paths");
-			}
+		// The client advertises which direction it intends to use (moq-lite-05 SETUP).
+		// A bidirectional connection (e.g. a cluster peer) advertises nothing, so the
+		// only requirement is that the token grants *something*. But a gateway that only
+		// publishes or only subscribes says so, and a token missing that direction's
+		// scope is rejected here during the handshake, instead of being accepted and
+		// then silently carrying no media (the bug that motivated the role hint).
+		let role = self.request.role();
+		let authorized = match role {
+			Some(moq_net::Role::Publisher) => publish.is_some(),
+			Some(moq_net::Role::Subscriber) => subscribe.is_some(),
+			None => publish.is_some() || subscribe.is_some(),
+		};
+		if !authorized {
+			let _ = self.request.close(http::StatusCode::FORBIDDEN.as_u16()).await;
+			let wanted = role.map(|role| role.as_str()).unwrap_or("any");
+			anyhow::bail!("token does not grant {wanted} access to {}", token.root);
 		}
 
-		// mTLS-authenticated peers (including other cluster nodes) report through
-		// the internal tier so a billing service can rate-differentiate from
-		// external traffic. The aggregator is shared; the tier picks which counter
-		// set within each level the bumps land in.
-		let tier = match token.internal {
-			true => moq_net::Tier::Internal,
-			false => moq_net::Tier::External,
-		};
-		let stats = self.cluster.stats.tier(tier);
+		match (&publish, &subscribe) {
+			(Some(publish), Some(subscribe)) => {
+				tracing::info!(%transport, ?role, tier = %token.tier, root = %token.root, publish = %publish.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), subscribe = %subscribe.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), "session accepted");
+			}
+			(Some(publish), None) => {
+				tracing::info!(%transport, ?role, tier = %token.tier, root = %token.root, publish = %publish.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), "publisher accepted");
+			}
+			(None, Some(subscribe)) => {
+				tracing::info!(%transport, ?role, tier = %token.tier, root = %token.root, subscribe = %subscribe.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), "subscriber accepted")
+			}
+			_ => unreachable!("authorized above guarantees at least one origin"),
+		}
+
+		// Record this session's stats under its billing tier (chosen by the auth
+		// API; mTLS peers and cluster nodes default to `internal`). The aggregator
+		// is shared; the tier picks which counter set the bumps land in.
+		let stats = self.cluster.stats.tier(token.tier.clone());
 
 		// Count this session against its auth root for the whole connection,
 		// independent of any data flow, so presence-based billing sees a client
@@ -85,63 +94,94 @@ impl Connection {
 		// the connection closes below.
 		let _session_stats = stats.session(&token.root);
 
-		// SurveillX measured-viewing (Phase C): on disconnect, report this
-		// subscriber's viewer-seconds when MOQ_USAGE_REPORT_URL is set. No-op for
-		// publishers, internal/cluster peers, usid-less tokens, or unset env.
-		let mut _svx_usage = crate::usage::ViewGuard::new(
-			token.usid.clone(),
-			token.jwt.clone(),
-			self.id,
-			token.internal,
-			subscribe.is_some() && publish.is_none(),
-		);
+		// Wire only the direction(s) the client will actually use. The token scope
+		// (enforced above) caps what it *may* do; the role caps what it *will* do.
+		// Pruning the unused half means moq-net feeds that side a no-op origin, so a
+		// publish-only ingest isn't announced every cluster broadcast it would ignore,
+		// and a subscribe-only egress issues no announce-interest. A bidirectional
+		// client (and any transport that carries no role) keeps whatever the token grants.
+		let (publish, subscribe) = match role {
+			Some(moq_net::Role::Publisher) => (publish, None),
+			Some(moq_net::Role::Subscriber) => (None, subscribe),
+			None => (publish, subscribe),
+		};
 
 		// Accept the connection.
 		// NOTE: subscribe and publish seem backwards because of how relays work.
 		// We publish the tracks the client is allowed to subscribe to.
 		// We subscribe to the tracks the client is allowed to publish.
-		let session = self
-			.request
-			.with_publish(subscribe)
-			.with_consume(publish)
-			.with_stats(stats)
-			.ok()
-			.await?;
+		//
+		// moq-net defaults the unset side to a fresh no-op origin, which is fine for a
+		// publish-only or subscribe-only session.
+		let mut request = self.request.with_stats(stats);
+		if let Some(subscribe) = subscribe {
+			request = request.with_publisher(&subscribe);
+		}
+		if let Some(publish) = publish {
+			request = request.with_subscriber(publish);
+		}
+		let session = request.ok().await?;
 
-		tracing::info!(version = %session.version(), transport, "negotiated");
+		tracing::info!(version = %session.version(), %transport, "negotiated");
 
-		// Wait until the session is closed, then capture this subscriber's egress
-		// bytes (udp_tx.bytes) for measured-viewing before the session drops.
-		let closed = session.closed().await;
-		_svx_usage.set_bytes(session.bytes_sent());
-		closed?;
-		Ok(())
-	}
-
-	/// Resolve an [`AuthToken`] from the request's URL and (optional) mTLS peer
-	/// identity. Any failure is returned as a [`StatusError`] so [`run`] can
-	/// close the request with the mapped HTTP status exactly once.
-	///
-	/// If the client presented a valid mTLS client certificate, JWT is skipped
-	/// and full access is granted within the URL path's root. The cert's chain
-	/// to the configured CA is the only credential we require.
-	async fn authenticate(&self) -> Result<AuthToken, StatusError> {
-		let params = match self.request.url() {
-			Some(url) => self.auth.params_from_url(url),
-			None => AuthParams::default(),
+		// The credential (JWT `exp` or client cert `notAfter`) is only checked at
+		// connect time, so hold the session open no longer than the credential is
+		// valid. Without an expiry, just wait for the session to close.
+		let Some(expires) = token.expires else {
+			return Err(session.closed().await.into());
 		};
 
-		if self.request.has_peer_certificate() {
-			tracing::debug!("mTLS peer authenticated");
-			// Scope the grant to the canonical root. An mTLS publisher dialing a
-			// vanity alias lands on the same tree a JWT would; cluster peers dial
-			// "/", which the API resolves (typically to an unscoped root). The API
-			// also returns the billing tier (defaulting to internal for trusted peers).
-			let (root, internal) = self.auth.resolve_mtls(&params.path).await?;
-			let mut token = AuthToken::unrestricted(Path::new(&root).to_owned());
-			token.internal = internal;
-			return Ok(token);
+		let remaining = expires.duration_since(std::time::SystemTime::now()).unwrap_or_default();
+		match tokio::time::timeout(remaining, session.closed()).await {
+			Ok(err) => Err(err.into()),
+			Err(_) => {
+				tracing::info!("credential expired, closing session");
+				session.abort(moq_net::Error::Unauthorized);
+				Ok(())
+			}
 		}
+	}
+
+	/// Resolve an [`AuthToken`] for this connection. Any failure is returned as a
+	/// [`StatusError`] so [`run`] can close the request with the mapped HTTP
+	/// status exactly once.
+	///
+	/// Every transport goes through the same authenticator; only the source of
+	/// the path + JWT differs:
+	/// - URL-bearing transports (QUIC, WebSocket) take it from the request URL,
+	///   and a valid mTLS client certificate (QUIC only) stands in for a JWT,
+	///   granting full access within the URL path's root.
+	/// - Stream transports (`tcp`/`unix`) take the path + `?jwt=` from the
+	///   moq-lite-05 SETUP. A no-JWT connection resolves anonymous/public access
+	///   for its path exactly like a tokenless QUIC client (`--auth-public`).
+	///   Unix peer-credential gating happens earlier, in the listener.
+	async fn authenticate(&self) -> Result<AuthToken, StatusError> {
+		// Forwarded to the auth API so it can bucket by connection type (e.g. tier
+		// the internal Unix-socket gateways separately). "quic"/"websocket"/"tcp"/
+		// "unix"/"iroh".
+		let transport = self.request.transport();
+		let mut params = match self.request.url() {
+			// URL-bearing transports: mTLS (QUIC only) can stand in for a JWT.
+			Some(url) => {
+				let params = self.auth.params_from_url(url);
+				if let Some(identity) = self.request.peer_identity() {
+					tracing::debug!("mTLS peer authenticated");
+					// Scope the grant to the canonical root. An mTLS publisher dialing a
+					// vanity alias lands on the same tree a JWT would; cluster peers dial
+					// "/", which the API resolves (typically to an unscoped root). The API
+					// also returns the billing tier (defaulting to internal for trusted peers).
+					let mut token = self.auth.verify_mtls(&params.path, Some(transport)).await?;
+					// Close the session when the client certificate expires, mirroring
+					// the JWT `exp` handling. Validated once at the TLS handshake otherwise.
+					token.expires = identity.expiry();
+					return Ok(token);
+				}
+				params
+			}
+			// URL-less stream transports: path + `?jwt=` ride the SETUP.
+			None => AuthParams::from_path(self.request.path().unwrap_or("")),
+		};
+		params.transport = Some(transport);
 
 		Ok(self.auth.verify(&params).await?)
 	}

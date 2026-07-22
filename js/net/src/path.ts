@@ -30,10 +30,47 @@
  */
 export type Valid = string & { __brand: "Name" };
 
+/**
+ * Maximum number of slash-separated parts in a path.
+ *
+ * Matches the IETF moq-transport limit of 32 fields in a namespace tuple.
+ * moq-lite enforces the same bound when decoding paths off the wire.
+ */
+export const MAX_PARTS = 32;
+
+/** Build a path from one or more components, joining with "/" and trimming redundant slashes. */
 export function from(...paths: string[]): Valid {
 	// Join paths with "/" and then remove leading and trailing slashes, and collapse multiple slashes into one.
 	const joined = paths.join("/");
 	return joined.replace(/\/+/g, "/").replace(/^\/+/, "").replace(/\/+$/, "") as Valid;
+}
+
+/** Split a path into its slash-separated parts. The empty path has no parts. */
+export function parts(path: Valid): string[] {
+	return path === "" ? [] : path.split("/");
+}
+
+/**
+ * Validate an untrusted wire string as a path, enforcing {@link MAX_PARTS}.
+ *
+ * Throws when the path has too many parts; use at wire decode sites.
+ */
+export function decode(raw: string): Valid {
+	const path = from(raw);
+	return encode(path);
+}
+
+/**
+ * Validate a path before writing it to the wire, enforcing {@link MAX_PARTS}.
+ *
+ * Throws when the path has too many parts; use at wire encode sites so we never
+ * emit a path the remote side is required to reject.
+ */
+export function encode(path: Valid): Valid {
+	if (parts(path).length > MAX_PARTS) {
+		throw new Error(`path exceeds ${MAX_PARTS} parts`);
+	}
+	return path;
 }
 
 /**
@@ -132,6 +169,59 @@ export function join(path: Valid, other: Valid): Valid {
 	}
 }
 
+/** The empty path, which is a prefix of every path. */
 export function empty(): Valid {
 	return "" as Valid;
+}
+
+/**
+ * Normalize a relative path reference: trim leading/trailing slashes, drop empty
+ * segments, and drop `.` segments (no-ops, matching POSIX). `..` is preserved and
+ * only interpreted by {@link resolve}.
+ *
+ * Mirrors the Rust `PathRelative::new` normalization, so JS and Rust agree
+ * byte-for-byte on the stored form. Two callers comparing normalized strings can
+ * detect that `""`, `"."`, `"/./"` etc. all mean "no reference".
+ */
+export function normalizeRelative(rel: string): string {
+	return rel
+		.split("/")
+		.filter((s) => s !== "" && s !== ".")
+		.join("/");
+}
+
+/**
+ * Resolve a relative path reference against a base path.
+ *
+ * `..` segments pop the last segment of the base; other segments are appended.
+ * `.` and empty segments are no-ops. Excess `..` once the base is empty is also a
+ * no-op (subsequent named segments still append). An empty / normalized-empty `rel`
+ * returns the base path unchanged.
+ *
+ * Mirrors the Rust `Path::resolve`, used by hang catalogs to express
+ * cross-broadcast track references (a rendition's `broadcast` field).
+ *
+ * @example
+ * ```typescript
+ * Path.resolve(Path.from("a/b/c"), "../source"); // "a/b/source"
+ * Path.resolve(Path.from("a/b"), "x/y");         // "a/b/x/y"
+ * Path.resolve(Path.from("a"), "../../x");       // "x"
+ * Path.resolve(Path.from("a/b"), "./c");         // "a/b/c"
+ * ```
+ */
+export function resolve(base: Valid, rel: string): Valid {
+	const segments = base === "" ? [] : base.split("/");
+
+	for (const seg of rel.split("/")) {
+		if (seg === "" || seg === ".") {
+			continue;
+		}
+		if (seg === "..") {
+			segments.pop();
+		} else {
+			segments.push(seg);
+		}
+	}
+
+	return segments.join("/") as Valid;
 }

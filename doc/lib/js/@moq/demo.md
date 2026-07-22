@@ -15,7 +15,7 @@ Follow the [Quick Start](/setup/) guide to get started.
 You can target a remote relay instead of a local one with the command:
 
 ```bash
-just web https://cdn.moq.dev/anon
+just web serve https://cdn.moq.dev/anon
 ```
 
 ## Watch Demo
@@ -29,11 +29,6 @@ The demo connects to a relay and renders video using WebCodecs.
 - Track subscription and group delivery
 - WebCodecs decoding
 - Latency measurement and adjustment
-
-## Watch Demo (MSE)
-
-The same thing as above but using MSE (Media Source Extensions) instead of WebCodecs.
-The latency will be a bit higher but it'll work on more devices.
 
 ## Publish Demo
 

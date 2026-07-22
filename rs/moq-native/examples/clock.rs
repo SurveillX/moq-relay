@@ -60,32 +60,36 @@ async fn main() -> anyhow::Result<()> {
 
 	tracing::info!(url = ?config.url, "connecting to server");
 
-	let track = Track {
-		name: config.track,
-		priority: 0,
-	};
+	let track = config.track;
 
 	let origin = moq_net::Origin::random().produce();
 
 	match config.role {
 		Command::Publish => {
-			let mut broadcast = moq_net::Broadcast::new().produce();
-			let track = broadcast.create_track(track)?;
+			let mut broadcast = origin
+				.create_broadcast(&config.broadcast, moq_net::broadcast::Route::new().with_announce(true))
+				.context("failed to create broadcast")?;
+			let track = broadcast.create_track(track, None)?;
 			let clock = Publisher::new(track);
 
-			origin.publish_broadcast(&config.broadcast, broadcast.consume());
+			let reconnect = client.with_publisher(&origin).reconnect(config.url);
 
-			let reconnect = client.with_publish(origin.consume()).reconnect(config.url);
-
-			tokio::select! {
-				res = reconnect.closed() => Ok(res?),
+			// Keep the result out of the `select!` arm (a `?` there would return
+			// before the close below runs), so the broadcast is always closed.
+			let result = tokio::select! {
+				res = reconnect.closed() => res.map_err(Into::into),
 				_ = clock.run() => Ok(()),
-			}
+			};
+
+			// Cleanly close the broadcast on exit so subscribers see a normal end
+			// rather than Error::Dropped.
+			broadcast.finish();
+			result
 		}
 		Command::Subscribe => {
-			let reconnect = client.with_consume(origin.clone()).reconnect(config.url);
+			let reconnect = client.with_subscriber(origin.clone()).reconnect(config.url);
 
-			// IETF MoQ + the current OriginConsumer API don't let us call
+			// IETF MoQ + the current origin::Consumer API don't let us call
 			// `session.consume_broadcast(&path)` directly, so loop on announces
 			// instead. This also makes the subscriber reconnect-aware.
 			tracing::info!(broadcast = %config.broadcast, "waiting for broadcast to be online");
@@ -94,19 +98,21 @@ async fn main() -> anyhow::Result<()> {
 			let mut origin = origin
 				.scope(&[path])
 				.context("not allowed to consume broadcast")?
-				.consume();
+				.consume()
+				.announced();
 
 			let mut clock: Option<Subscriber> = None;
 
 			loop {
 				tokio::select! {
-					Some(announce) = origin.announced() => match announce {
-						(path, Some(broadcast)) => {
+					Some(moq_net::announce::Update { path, broadcast }) = origin.next() => match broadcast {
+						Some(broadcast) => {
 							tracing::info!(broadcast = %path, "broadcast is online, subscribing to track");
-							let track = broadcast.subscribe_track(&track)?;
+							let track = broadcast
+								.track(&track)?.subscribe(None).await?;
 							clock = Some(Subscriber::new(track));
 						}
-						(path, None) => {
+						None => {
 							tracing::warn!(broadcast = %path, "broadcast is offline, waiting...");
 						}
 					},
@@ -120,11 +126,11 @@ async fn main() -> anyhow::Result<()> {
 }
 
 struct Publisher {
-	track: TrackProducer,
+	track: track::Producer,
 }
 
 impl Publisher {
-	fn new(track: TrackProducer) -> Self {
+	fn new(track: track::Producer) -> Self {
 		Self { track }
 	}
 
@@ -156,15 +162,15 @@ impl Publisher {
 		}
 	}
 
-	async fn send_segment(mut segment: GroupProducer, mut now: DateTime<Utc>) -> anyhow::Result<()> {
+	async fn send_segment(mut segment: group::Producer, mut now: DateTime<Utc>) -> anyhow::Result<()> {
 		// Everything but the second.
 		let base = now.format("%Y-%m-%d %H:%M:").to_string();
 
-		segment.write_frame(base.clone())?;
+		segment.write_frame(moq_native::moq_net::Timestamp::now(), base.clone())?;
 
 		loop {
 			let delta = now.format("%S").to_string();
-			segment.write_frame(delta.clone())?;
+			segment.write_frame(moq_native::moq_net::Timestamp::now(), delta.clone())?;
 
 			let next = now + chrono::Duration::try_seconds(1).unwrap();
 			let next = next.with_nanosecond(0).unwrap();
@@ -188,11 +194,11 @@ impl Publisher {
 }
 
 struct Subscriber {
-	track: TrackConsumer,
+	track: track::Subscriber,
 }
 
 impl Subscriber {
-	fn new(track: TrackConsumer) -> Self {
+	fn new(track: track::Subscriber) -> Self {
 		Self { track }
 	}
 
@@ -204,10 +210,10 @@ impl Subscriber {
 				.context("failed to get first object")?
 				.context("empty group")?;
 
-			let base = String::from_utf8_lossy(&base);
+			let base = String::from_utf8_lossy(&base.payload);
 
 			while let Some(object) = group.read_frame().await? {
-				let str = String::from_utf8_lossy(&object);
+				let str = String::from_utf8_lossy(&object.payload);
 				println!("{base}{str}");
 			}
 		}

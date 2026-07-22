@@ -5,14 +5,14 @@ description: Swift Package Manager target for Media over QUIC
 
 # Moq
 
-The Swift Package Manager target for [Media over QUIC](/).
+The ergonomic Swift Package Manager target for [Media over QUIC](/).
 
-This is an ergonomic wrapper around the UniFFI-generated `MoqFFI` types, providing `AsyncSequence` adapters and Swift-friendly errors.
+A Swift-native wrapper over the UniFFI-generated bindings: de-prefixed types, `AsyncSequence` streams, throwing initializers, `Sendable` handles, and Swift-friendly errors. The raw `MoqFFI` types it wraps stay out of your way (data types like `Frame` and `Catalog` are re-exported under de-prefixed names).
 
 ## Install
 
 ```swift
-.package(url: "https://github.com/moq-dev/moq-swift", from: "0.2.0"),
+.package(url: "https://github.com/moq-dev/moq-swift", from: "0.3.0"),
 ```
 
 Add `Moq` to your target's dependencies:
@@ -26,33 +26,28 @@ Add `Moq` to your target's dependencies:
 ),
 ```
 
-Supported platforms: iOS 15+, iPadOS 15+, macOS 12+. The package ships an XCFramework with iOS device (arm64), iOS Simulator (arm64 + x86_64), and macOS universal slices.
+The raw `MoqFFI` bindings and the prebuilt XCFramework are pulled in transitively from [moq-dev/moq-swift-ffi](https://github.com/moq-dev/moq-swift-ffi); you only depend on `moq-swift`.
+
+Supported platforms: iOS 15+, iPadOS 15+, macOS 12+. The XCFramework ships iOS device (arm64), iOS Simulator (arm64 + x86\_64), and macOS universal slices.
 
 ## Connect
 
 ```swift
 import Moq
 
-// Wire an origin as both publish source and consume sink for the
-// typical full-duplex client. Set just one side for a subscribe-only
-// or publish-only client.
-let origin = MoqOriginProducer()
-let client = MoqClient()
-client.setPublish(origin: origin)
-client.setConsume(origin: origin)
-
-let session = try await client.connect(url: "https://relay.example.com")
+let client = Client()
+let session = try await client.connect(to: "https://relay.example.com")
 ```
 
-For development against a relay with a self-signed certificate, configure the client before connecting:
+`session.publisher` and `session.consumer` are always populated: by whatever origin you wired via `setPublish` / `setConsume` before connecting, or by a fresh auto-created one for any side you left unset. The duplex no-config path (the typical client) shares one origin between both.
+
+For development against a relay with a self-signed certificate:
 
 ```swift
-let client = MoqClient()
-client.setTlsDisableVerify(disable: true)
-try client.setBind(addr: "127.0.0.1:0")
-client.setPublish(origin: origin)
-client.setConsume(origin: origin)
-let session = try await client.connect(url: "https://localhost:4443")
+let client = Client()
+client.setTlsVerify(false)
+try client.bind("127.0.0.1:0")
+let session = try await client.connect(to: "https://localhost:4443")
 ```
 
 When you're done, signal graceful shutdown to the peer:
@@ -61,37 +56,181 @@ When you're done, signal graceful shutdown to the peer:
 session.shutdown()  // alias for cancel(code: 0)
 ```
 
-## Subscribe
+A server can reject the connection on auth grounds: `MoqError.Unauthorized` (HTTP 401) or `MoqError.Forbidden` (HTTP 403). These are terminal: retrying without new credentials won't help, so handle them separately from a transient transport failure. Use the `isAuth` helper to catch both:
 
 ```swift
-let consumer = origin.consume()
-let announced = try consumer.announced(prefix: "demos/")
+do {
+    let session = try await client.connect(url: "https://relay.example.com")
+} catch let error as MoqError where error.isAuth {
+    // Prompt for credentials; don't reconnect.
+}
+```
 
-for try await announcement in announced.announcements {
-    let catalog = try announcement.broadcast().subscribeCatalog()
-    for try await update in catalog.updates {
+## Subscribe
+
+Every consumer is an `AsyncSequence`, so iterate directly:
+
+```swift
+let announced = try session.consumer.announced(prefix: "demos/")
+
+for try await announcement in announced {
+    let catalog = try announcement.broadcast.subscribeCatalog()
+    for try await update in catalog {
         print("catalog: \(update)")
     }
 }
 ```
 
+Raw track subscribers can query the publisher's track properties and change their own delivery preferences without resubscribing:
+
+```swift
+let track = try await announcement.broadcast.subscribeTrack(
+    name: "events",
+    subscription: Subscription(priority: 10))
+let info = try track.info()
+track.update(subscription: Subscription(priority: 20, ordered: false))
+```
+
+`ordered` controls prioritization only. When true, groups are prioritized in sequence order. Groups may always arrive out-of-order (or not at all) over the network.
+
 ## Publish
 
 ```swift
-let broadcast = try MoqBroadcastProducer()
-let audio = try broadcast.publishMedia(format: "opus", init: opusInitBytes)
+let broadcast = try session.publisher.createBroadcast(path: "my-stream")
+let audio = try broadcast.publishMedia(format: "opus", initData: opusInitBytes)
 
-try origin.publish(path: "my-stream", broadcast: broadcast)
-
-try audio.writeFrame(payload: payload, timestampUs: 0)
-try audio.writeFrame(payload: payload, timestampUs: 20_000)
+try audio.writeFrame(payload, timestampUs: 0)
+try audio.writeFrame(payload, timestampUs: 20_000)
 try audio.finish()
 try broadcast.finish()
 ```
 
+Video publishers can pass `video: VideoHint(...)` to seed catalog fields before the stream reveals them. Use `publishMedia(on:format:initData:video:)` to accept a media track obtained from `BroadcastDynamic`.
+
+For sparse or replayed raw tracks, use `track.createGroup(sequence:)`. `track.finish(at:)` declares the exclusive end while still permitting lower groups, and `group.abort(errorCode:)` terminates a group with an application error.
+
+### Fetching raw groups
+
+Fetch retrieves one group by track name and group sequence without keeping a live subscription:
+
+```swift
+let group = try await consumer.fetchGroup(
+    name: "events",
+    sequence: 42,
+    options: FetchGroupOptions(priority: 10)
+)
+for try await frame in group {
+    print(frame.timestampUs, frame.payload)
+}
+```
+
+A retained group resolves immediately. To serve a group that is not retained, keep a dynamic handler alive on its producer:
+
+```swift
+let dynamic = try track.dynamic()
+
+for try await request in dynamic {
+    let group = try request.accept()
+    try group.writeFrame(loadArchivedFrame(request.sequence), timestampUs: request.sequence * 20_000)
+    try group.finish()
+}
+```
+
+Call `request.abort(errorCode:)` when the requested group cannot be produced. Fetch is currently a single-group operation and is supported by the moq-lite 05+ FETCH wire path.
+
+### On-demand raw tracks
+
+Use a dynamic broadcast when subscribers should be able to request raw tracks that are not published yet:
+
+```swift
+let broadcast = try session.publisher.createBroadcast(path: "events")
+let dynamic = try broadcast.dynamic()
+
+for try await request in dynamic {
+    if try request.name == "alerts" {
+        let track = try request.accept()
+        try track.writeFrame(Data("ready".utf8), timestampUs: 20_000)
+        try track.finish()
+    } else {
+        try request.abort(errorCode: 404)
+    }
+}
+```
+
+Each request arrives as a `TrackRequest`; call `accept(info:)` to turn it into a `TrackProducer` (omit `info` for defaults), or `abort(errorCode:)` to reject the subscriber. Use `writeFrame(_:timestampUs:)` with a presentation timestamp in microseconds. Raw tracks default to a microsecond timescale. Raw consumers receive `Frame` values (payload plus timestamp) from `readFrame()` and group iteration; media subscriptions yield `MediaFrame`, which adds the codec-derived `keyframe` flag.
+
+### Raw datagrams
+
+Raw tracks can send a single best-effort payload without opening a group stream:
+
+```swift
+let sequence = try track.appendDatagram(Data("meter update".utf8), timestampUs: 42_000)
+let datagram = try await consumer.recvDatagram()
+
+for try await datagram in consumer.datagrams {
+    print(datagram.sequence, datagram.timestampUs)
+}
+```
+
+Datagrams are delivered as `Datagram(sequence, timestampUs, payload)`. Payloads are capped at 1200 bytes. Delivery requires a datagram-capable transport and lite-05 or newer moq-lite; IETF moq-transport, pre-lite-05, WebSocket, and TCP paths do not deliver them, and there is no stream fallback.
+
+### JSON tracks
+
+For JSON payloads, publish and subscribe with the framing handled for you. Values are your own `Codable` types, encoded and decoded at the boundary with `JSONEncoder` / `JSONDecoder`. You opt into one of two distinct modes, one method per mode:
+
+- **Snapshot** (lossy): one value updated over time; a subscriber only sees the latest. Ideal for status documents and metadata. A late joiner catches up to the newest value in one step.
+- **Stream** (lossless): an ordered append-log where every record is preserved. Ideal for event logs and timelines.
+
+```swift
+struct Status: Codable { var state: String; var viewers: Int }
+
+// Snapshot: each update supersedes the last.
+let status = try broadcast.publishJsonSnapshot(name: "status", of: Status.self, compression: true)
+try status.update(Status(state: "live", viewers: 42))
+try status.update(Status(state: "live", viewers: 43))
+
+let consumer = try broadcast.consume()
+for try await value in try await consumer.subscribeJsonSnapshot(name: "status", as: Status.self, compression: true) {
+    print(value.viewers)
+}
+
+// Stream: every record is delivered in order.
+struct Event: Codable { var event: String }
+let events = try broadcast.publishJsonStream(name: "events", of: Event.self)
+try events.append(Event(event: "started"))
+
+for try await record in try await consumer.subscribeJsonStream(name: "events", as: Event.self) {
+    print(record.event)
+}
+```
+
+`compression` must match on the producer and subscriber. Snapshot mode also takes `deltaRatio` (`0` disables merge-patch deltas, so every change is a fresh snapshot). Advertise the track with a catalog section (`setCatalogSection`) if subscribers should discover it.
+
+### On-demand broadcasts
+
+Use a dynamic origin when consumers should be able to request whole broadcasts that are not announced:
+
+```swift
+let origin = OriginProducer(cacheCapacityBytes: 256 * 1024 * 1024)
+let dynamic = origin.dynamic()
+
+for try await request in dynamic {
+    if try request.path == "events" {
+        let broadcast = try BroadcastProducer()
+        let track = try broadcast.publishTrack(name: "status")
+        try request.accept(broadcast: broadcast)
+        try track.writeFrame(Data("ready".utf8), timestampUs: 0)
+    } else {
+        try request.abort(errorCode: 404)
+    }
+}
+```
+
+The served broadcast is not announced. It only resolves consumers that call `requestBroadcast(path:)`. Each request arrives as a `BroadcastRequest`; call `accept(broadcast:)` to serve it, or `abort(errorCode:)` to fail the requester.
+
 ## Cancellation
 
-All async sequences cooperate with structured concurrency. Cancelling the surrounding `Task` propagates to the underlying `cancel()` call on the consumer:
+All async sequences cooperate with structured concurrency. Cancelling the surrounding `Task` propagates to the underlying `cancel()` on the consumer:
 
 ```swift
 let task = Task {
@@ -104,18 +243,22 @@ let task = Task {
 task.cancel()   // releases native resources
 ```
 
+## A note on enum casing
+
+`MoqError` keeps Rust's PascalCase variants, each carrying `message: String` (e.g. `MoqError.Closed(message: "...")`); use `error.isShutdown` to fold the graceful `Cancelled` / `Closed` cases. Plain enums round-trip to lowerCamelCase (`AudioFormat.s16`, `AudioCodec.opus`).
+
 ## Local development
 
 To run the test suite, build a host-only XCFramework first:
 
 ```bash
-just check-ffi
+just swift check
 ```
 
-This runs `swift/scripts/check.sh`, which builds `moq-ffi` for the host arch, regenerates the UniFFI Swift bindings, drops a single-slice `MoqFFI.xcframework` into `swift/`, and then runs `swift test`. Requires macOS with `xcodebuild`.
+This runs `swift/scripts/check.sh`, which builds `moq-ffi` for the host arch, regenerates the UniFFI Swift bindings, drops a single-slice `MoqFFI.xcframework` into `swift/`, and runs `swift test` against the monolithic local-dev `Package.swift`. Requires macOS with `xcodebuild`.
 
 ## See also
 
 - Source: [swift/Sources/Moq](https://github.com/moq-dev/moq/tree/main/swift/Sources/Moq)
-- Mirror repo: [moq-dev/moq-swift](https://github.com/moq-dev/moq-swift)
+- Mirror repos: [moq-dev/moq-swift](https://github.com/moq-dev/moq-swift) (wrapper), [moq-dev/moq-swift-ffi](https://github.com/moq-dev/moq-swift-ffi) (raw bindings)
 - The Rust crate this wraps: [moq-net](/lib/rs/crate/moq-net)

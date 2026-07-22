@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { Computed, Effect, Signal } from "./index.ts";
+import { Computed, Effect, Once, Signal } from "./index.ts";
 
 // Flush pending microtasks. Signal notifications and effect/computed reruns are
 // coalesced onto microtasks, so a chain of A -> B -> effect needs several flushes.
@@ -14,6 +14,19 @@ describe("Signal", () => {
 		expect(count.peek()).toBe(0);
 		count.set(1);
 		expect(count.peek()).toBe(1); // value is synchronous; only notification is deferred
+	});
+
+	test("set stores a function as the value; update transforms", () => {
+		const fn = () => 1;
+		const held = new Signal<() => number>(fn);
+		expect(held.peek()).toBe(fn);
+
+		const other = () => 2;
+		held.set(other); // stored as-is, never invoked as a transform
+		expect(held.peek()).toBe(other);
+
+		held.update(() => fn);
+		expect(held.peek()).toBe(fn);
 	});
 
 	test("subscribers are notified asynchronously", async () => {
@@ -125,6 +138,44 @@ describe("Effect", () => {
 		effect.close();
 
 		expect(log).toEqual(["run 0", "cleanup 0", "run 1", "cleanup 1"]);
+	});
+
+	test("run() returns a disposer that closes the child and releases it from the parent", async () => {
+		const parent = new Effect();
+		const trigger = new Signal(0);
+		const runs: number[] = [];
+		const log: string[] = [];
+
+		const dispose = parent.run((e) => {
+			runs.push(e.get(trigger));
+			e.cleanup(() => log.push("cleanup"));
+		});
+		await settle();
+		expect(runs).toEqual([0]);
+
+		// Disposing runs the child's cleanup and stops it from rerunning.
+		dispose();
+		expect(log).toEqual(["cleanup"]);
+		trigger.set(1);
+		await settle();
+		expect(runs).toEqual([0]);
+
+		// Idempotent, and the child was released so closing the parent doesn't re-run its cleanup.
+		dispose();
+		parent.close();
+		expect(log).toEqual(["cleanup"]);
+	});
+
+	test("run() children left undisposed are still closed with the parent", async () => {
+		const parent = new Effect();
+		const log: string[] = [];
+
+		parent.run((e) => e.cleanup(() => log.push("a")));
+		parent.run((e) => e.cleanup(() => log.push("b")));
+		await settle();
+
+		parent.close();
+		expect(log.sort()).toEqual(["a", "b"]);
 	});
 });
 
@@ -291,5 +342,45 @@ describe("effect.computed", () => {
 		await settle();
 		expect(computes).toBe(before);
 		observer.close();
+	});
+});
+
+describe("Once", () => {
+	test("awaits the settled value, immediately if already settled", async () => {
+		const { Once } = await import("./index.ts");
+		const once = new Once<string>();
+
+		let awaited: string | undefined;
+		void once.then((v) => {
+			awaited = v;
+		});
+		expect(awaited).toBeUndefined();
+
+		once.set("done");
+		await once; // resolves now
+		expect(await once).toBe("done"); // still resolves after the fact
+		expect(awaited).toBe("done");
+	});
+
+	test("peek returns undefined while pending, the value once settled", () => {
+		const once = new Once<number>();
+		expect(once.peek()).toBeUndefined();
+		once.set(7);
+		expect(once.peek()).toBe(7);
+	});
+
+	test("set throws if called twice", () => {
+		const once = new Once<boolean>();
+		once.set(true);
+		expect(() => once.set(true)).toThrow();
+	});
+
+	test("notifies subscribers once when it settles", async () => {
+		const once = new Once<string>();
+		const seen: (string | undefined)[] = [];
+		once.subscribe((v) => seen.push(v));
+		once.set("x");
+		await flush();
+		expect(seen).toEqual(["x"]);
 	});
 });

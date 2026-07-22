@@ -94,7 +94,7 @@ Each frame in `hang` consists of a timestamp and codec bitstream payload. See th
 
 ## CMAF Import
 
-For importing fMP4/CMAF/HLS files, see the [moq-mux](/lib/rs/crate/moq-mux) crate.
+For importing fMP4/CMAF files, see the [moq-mux](/lib/rs/crate/moq-mux) crate. For HLS, see [moq-hls](https://github.com/moq-dev/moq/tree/main/rs/moq-hls).
 
 ## Grouping
 
@@ -112,7 +112,7 @@ Groups are aligned with natural boundaries:
 - Usually 1 second of audio
 - Independent decoding
 
-See the [video example](https://github.com/moq-dev/moq/blob/main/rs/hang/examples/video.rs) for grouping with `OrderedProducer`.
+See the [video example](https://github.com/moq-dev/moq/blob/main/rs/hang/examples/video.rs) for grouping with `moq_mux::container::Producer`.
 
 ## Prioritization
 
@@ -126,23 +126,22 @@ This is handled automatically based on frame metadata.
 
 ## CLI Tool
 
-The `moq-cli` package provides a command-line tool (binary name: `moq-cli`):
+The `moq-cli` package provides a command-line tool (binary name: `moq`):
 
 ```bash
 # Install
 cargo install moq-cli
 
-# Publish a video file
-moq-cli publish video.mp4
+# Publish a video file (remux to MPEG-TS and pipe it in)
+ffmpeg -i input.mp4 -c copy -f mpegts - | \
+    moq --client-connect https://relay.example.com/anon --broadcast my-stream import ts
 
 # Publish from FFmpeg
-ffmpeg -i input.mp4 -f mpegts - | moq-cli publish -
-
-# Custom encoding settings
-moq-cli publish --codec h264 --bitrate 2000000 video.mp4
+ffmpeg -i input.mp4 -f mpegts - | \
+    moq --client-connect https://relay.example.com/anon --broadcast my-stream import ts
 ```
 
-See `moq-cli --help` for all options, or [FFmpeg documentation](/bin/cli).
+See `moq --help` for all options, or [FFmpeg documentation](/bin/cli).
 
 ## API Reference
 
@@ -154,7 +153,7 @@ Key types:
 - `Catalog` - Track metadata
 - `VideoConfig` / `AudioConfig` - Track configuration
 - `Frame` - Timestamp + codec bitstream
-- [moq-mux](/lib/rs/crate/moq-mux) - CMAF/fMP4/HLS import
+- [moq-mux](/lib/rs/crate/moq-mux) - CMAF/fMP4 import
 
 ## Protocol Specification
 

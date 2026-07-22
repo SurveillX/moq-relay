@@ -13,10 +13,12 @@ Media muxers and demuxers for converting existing media formats into MoQ broadca
 
 ## Overview
 
-`moq-mux` provides tools for importing media from various container formats:
+`moq-mux` provides tools for importing media from (and exporting it back to) various container formats:
 
 - **fMP4/CMAF** - Fragmented MP4 and Common Media Application Format
-- **HLS** - HTTP Live Streaming playlists
+- **MPEG-TS** - Transport stream (import and export)
+- **Matroska / WebM** - EBML container (import and export)
+- **FLV** - Flash Video / RTMP container (import and export). Legacy H.264 + AAC + MP3 plus the enhanced-RTMP FourCC codecs (HEVC, AV1, VP9, Opus, AC-3, E-AC-3), including enhanced-RTMP multitrack (several video/audio renditions in one stream)
 - **Annex B** - H.264/H.265 raw NAL unit streams
 
 This crate is designed for ingesting existing content into the MoQ ecosystem, converting from traditional formats into [hang](/lib/rs/crate/hang) broadcasts.
@@ -30,37 +32,34 @@ Add to your `Cargo.toml`:
 moq-mux = "0.1"
 ```
 
-### Feature Flags
-
-| Feature | Default | Description |
-|---------|---------|-------------|
-| `mp4` | ✓ | fMP4/CMAF support |
-| `h264` | ✓ | H.264 codec support |
-| `h265` | ✓ | H.265 codec support |
-| `hls` | ✓ | HLS playlist import |
-
 ## Quick Start
 
-### Import fMP4 / HLS
+### Import fMP4
 
-See the [moq-cli source](https://github.com/moq-dev/moq/tree/main/rs/moq-cli) for real-world usage of `moq-mux` for importing fMP4 and HLS streams.
+See the [moq-cli source](https://github.com/moq-dev/moq/tree/main/rs/moq-cli) for real-world usage of `moq-mux` for importing fMP4 streams. Use [moq-hls](https://github.com/moq-dev/moq/tree/main/rs/moq-hls) for HLS import and export.
 
 ## Supported Codecs
 
 **Video:**
 
-- H.264 (AVC) - requires `h264` feature
-- H.265 (HEVC) - requires `h265` feature
+- H.264 (AVC)
+- H.265 (HEVC)
+- AV1
+- VP8
+- VP9
 
 **Audio:**
 
 - AAC
 - Opus
+- MP3
+- MP2 (MPEG-TS only, carried verbatim)
+- AC-3 (MPEG-TS only, carried verbatim)
+- E-AC-3 (MPEG-TS only, carried verbatim)
 
 ## Use Cases
 
 - **Ingest existing content** - Convert VOD files to MoQ broadcasts
-- **HLS bridge** - Re-publish HLS streams over MoQ for lower latency
 - **Testing** - Use sample files for development and testing
 - **Migration** - Transition from traditional streaming to MoQ
 
@@ -74,9 +73,7 @@ Full API documentation: [docs.rs/moq-mux](https://docs.rs/moq-mux)
 
 Key types:
 
-- `Fmp4` - fMP4/CMAF importer
-- `Fmp4Config` - Configuration for fMP4 import
-- `Hls` - HLS playlist importer
+- `container::fmp4::Import` - fMP4/CMAF importer
 - `Decoder` - Codec-specific decoders (AAC, Opus, AVC, HEVC)
 
 ## CLI Tool
@@ -87,11 +84,13 @@ For command-line importing, use [moq-cli](/bin/cli):
 # Install
 cargo install moq-cli
 
-# Publish a video file
-moq-cli publish video.mp4
+# Publish a video file (remux to MPEG-TS and pipe it in)
+ffmpeg -i input.mp4 -c copy -f mpegts - | \
+    moq --client-connect https://relay.example.com/anon --broadcast my-stream import ts
 
 # Publish from FFmpeg
-ffmpeg -i input.mp4 -f mpegts - | moq-cli publish -
+ffmpeg -i input.mp4 -f mpegts - | \
+    moq --client-connect https://relay.example.com/anon --broadcast my-stream import ts
 ```
 
 ## Next Steps

@@ -1,0 +1,40 @@
+[package]
+name = "moq-rtc"
+description = "WebRTC (WHIP/WHEP) gateway for Media over QUIC"
+authors = ["Luke Curley <kixelated@gmail.com>"]
+repository = "https://github.com/moq-dev/moq"
+license = "MIT OR Apache-2.0"
+
+version = "0.1.5"
+edition = "2024"
+rust-version.workspace = true
+
+keywords = ["webrtc", "whip", "whep", "moq", "media"]
+categories = ["multimedia", "network-programming", "web-programming"]
+
+[lib]
+doctest = false
+
+# Pure library: the WHIP/WHEP <-> MoQ gateway (axum routers + WHEP/WHIP client).
+# The CLI lives in `moq-cli` (the `rtc` subcommand); embedders mount the routers
+# / dial with `Client` against their own origin.
+[dependencies]
+anyhow = { version = "1", features = ["backtrace"] }
+axum = { version = "0.8", features = ["tokio"] }
+bytes = "1"
+hang = { workspace = true }
+moq-mux = { workspace = true }
+moq-net = { workspace = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+str0m = "0.21"
+thiserror = "2"
+tokio = { workspace = true, features = ["full"] }
+tracing = "0.1"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+# Signs the MESSAGE-INTEGRITY on a forged STUN binding request: str0m rejects a
+# request without one, and its own SHA1 provider is private.
+aws-lc-rs = "1"
+tokio = { workspace = true, features = ["test-util"] }

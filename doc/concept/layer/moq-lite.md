@@ -22,6 +22,7 @@ See the [specification](https://datatracker.ietf.org/doc/draft-lcurley-moq-lite/
 - **Track** - A series of **groups**, potentially delivered out-of-order until closed/cancelled.
 - **Group** - A series of **frames** delivered in order until closed/cancelled.
 - **Frame** - A chunk of bytes with an upfront size.
+- **Datagram** - A single unreliable payload delivered best-effort over a QUIC datagram (lite-05+), an alternative to a group for tiny, latency-critical frames.
 
 **NOTE:** The IETF draft uses some different names.
 THE BIKE SHED MUST BE PAINTED RED.
@@ -51,7 +52,9 @@ Here's a list of currently supported ALPNs:
 See the Compatibility section below for more details about `moq-transport` support.
 
 Once the QUIC or WebTransport connection is established, there is a minimal MoQ handshake.
-The `SETUP` message is primarily used to negotiate extensions, then you're off to the races!
+Each endpoint sends a single `SETUP` message advertising its capabilities (for example whether it can probe the available bitrate), then you're off to the races.
+The two `SETUP` messages are independent, so neither side waits for the other before getting started.
+Transports that don't carry a request URI (native QUIC, or qmux over TCP/TLS) also use `SETUP` to carry the path the client wants to reach.
 
 ### Announcements
 
@@ -63,6 +66,9 @@ This asks the peer to notify us of any existing broadcasts that match the prefix
 This is extremely useful for conference rooms, as you can live discover when participants join and leave.
 It's also useful for individual broadcasts as you can get notifications it comes online or goes offline (no spamming F5).
 The [moq-relay clustering](/bin/relay/cluster) feature actually uses this to discover other nodes in the cluster AND what broadcasts are available on each node.
+
+The peer first replies with the set of broadcasts that are currently live, then streams updates as they change.
+This initial set is a discrete batch: the latest draft reports how many entries to expect up front, so a freshly connected session can wait until that snapshot has fully arrived before listing what's available, rather than racing the gossip.
 
 ### Subscriptions
 
@@ -85,6 +91,13 @@ Frames within a group are delivered reliably and in order.
 You can and should take advantage of this, for example using delta encoding.
 If frames within a group are actually independent, you should probably split them into individual groups!
 
+#### Datagrams
+
+As an optimization (lite-05+), the publisher may deliver a small single-frame group as a **datagram** instead of opening a QUIC stream.
+A datagram carries `subscribe ID | group sequence | timestamp | payload` in a single QUIC datagram, routed over the existing subscription: unreliable, unordered, never retransmitted, and capped at ~1200 bytes.
+It is a separate best-effort channel parallel to groups (they share one sequence namespace), suited to tiny latency-critical frames like audio.
+There is no group fallback, so a payload that doesn't fit simply isn't delivered this way.
+
 ### Congestion
 
 If it's not obvious by now, a lot of MoQ's behavior is designed to be robust to congestion.
@@ -97,7 +110,10 @@ Each Subscription consists of a few properties:
 
 - **Track Priority**: A value between 0 and 255. Tracks with higher priority will be delivered first.
 - **Group Order**: The order in which groups are delivered. Defaults to descending; higher IDs are delivered first.
-- **Group Timeout**: The maximum duration to keep old groups in cache/transit. Defaults to 30 seconds.
+- **Subscriber Max Latency**: The maximum age of a non-latest group before it is skipped. Defaults to zero, so stale groups are skipped immediately.
+
+The publisher also keeps old groups around for a best-effort **Publisher Max Latency** cache window so relays and late subscribers can still fetch them. This defaults to 5 seconds.
+The subscriber's maximum latency is bounded by this window: a group can't be waited for longer than it's actually kept around.
 
 By utilizing these properties, you can choose how your application behaves during congestion.
 For example, consider a conference room with Alice and Bob:
@@ -147,14 +163,13 @@ But if a publisher needs a feature, then the subscriber needs it too, so you can
 
 - **No Request IDs**: A bidirectional stream for each request to avoid HoLB. (NOTE: likely to be upstreamed into moq-transport)
 - **No Push**: A subscriber must explicitly subscribe to each track.
-- **No FETCH**: Use HTTP for VOD instead of reinventing the wheel.
+- **Single-group FETCH only (lite-05+)**: Fetch one complete group by sequence. Ranges and joining fetches are not supported.
 - **No Joining Fetch**: Subscriptions start at the latest group, not the latest frame.
 - **No sub-groups**: SVC layers should be separate tracks.
 - **No gaps**: Makes life much easier for the relay and every application.
 - **No object properties**: Encode your metadata into the frame payload.
 - **No pausing**: Unsubscribe if you don't want a track.
 - **No binary names**: Uses UTF-8 strings instead of arrays of byte arrays.
-- **No datagrams**: Maybe one day.
 
 This may seem like a lot of missing features, but in practice you don't need them.
 For example, [MSF](/concept/standard/msf) doesn't use any of these features so it's fully compatible with moq-lite.

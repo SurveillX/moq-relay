@@ -1,10 +1,13 @@
+//! Iroh P2P transport, dialed by endpoint id instead of a hostname.
+//!
+//! A single [`Endpoint`] serves both roles, hole-punching directly to peers and
+//! falling back to an iroh relay. Both WebTransport-over-H3 and raw QUIC are
+//! negotiated via ALPN.
+
 use std::{net, path::PathBuf, str::FromStr};
 
 use url::Url;
-use web_transport_iroh::{
-	http,
-	iroh::{self, SecretKey},
-};
+use web_transport_iroh::iroh::{self, SecretKey};
 // NOTE: web-transport-iroh should re-export proto like web-transport-quinn does.
 use web_transport_proto::{ConnectRequest, ConnectResponse};
 
@@ -15,60 +18,82 @@ pub use web_transport_iroh;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+	/// Reading or writing the secret key file failed.
 	#[error(transparent)]
 	Io(#[from] std::io::Error),
 
+	/// The configured secret was neither a valid hex key nor a readable key file.
 	#[error("invalid iroh secret key")]
 	Secret(#[source] iroh::KeyParsingError),
 
+	/// The endpoint could not bind its UDP socket.
 	#[error(transparent)]
 	Bind(#[from] iroh::endpoint::BindError),
 
+	/// A configured bind address was rejected by iroh.
 	#[error(transparent)]
 	BindAddr(#[from] iroh::endpoint::InvalidSocketAddr),
 
+	/// Dialing the peer failed before a connection was started.
 	#[error(transparent)]
 	Connect(#[from] iroh::endpoint::ConnectWithOptsError),
 
+	/// The QUIC handshake failed while connecting.
 	#[error(transparent)]
 	Connecting(#[from] iroh::endpoint::ConnectingError),
 
+	/// The peer never settled on an ALPN.
 	#[error(transparent)]
 	Alpn(#[from] iroh::endpoint::AlpnError),
 
+	/// An established connection was lost or closed.
 	#[error(transparent)]
 	Connection(#[from] iroh::endpoint::ConnectionError),
 
+	/// The client side of the WebTransport handshake failed.
 	#[error(transparent)]
 	Client(#[from] web_transport_iroh::ClientError),
 
+	/// The server side of the WebTransport handshake failed.
 	#[error(transparent)]
 	Server(#[from] web_transport_iroh::ServerError),
 
+	/// The negotiated ALPN was not valid UTF-8.
 	#[error("failed to decode ALPN")]
 	DecodeAlpn(#[from] std::string::FromUtf8Error),
 
+	/// The peer negotiated an ALPN this build does not speak.
 	#[error("unsupported ALPN: {0}")]
 	UnsupportedAlpn(String),
 
+	/// The URL had no host, so there is no endpoint id to dial.
 	#[error("Invalid URL: missing host")]
 	MissingHost,
 
+	/// The URL host was not an iroh endpoint id. Unlike QUIC, iroh dials a public key, not a hostname.
 	#[error("Invalid URL: host is not an iroh endpoint id")]
 	InvalidEndpointId(#[source] iroh::KeyParsingError),
 
+	/// The URL could not be rewritten to the `https` scheme for the H3 request.
 	#[error("invalid URL")]
 	InvalidUrl,
 
+	/// The rewritten URL failed to parse.
 	#[error(transparent)]
 	Url(#[from] url::ParseError),
 
+	/// The client connected but never sent a valid WebTransport CONNECT request.
 	#[error("failed to receive WebTransport request")]
 	RecvRequest(#[source] web_transport_iroh::ServerError),
+
+	/// GSO is always on for iroh, so `--quic-gso=false` cannot be honored.
+	#[error("the iroh backend cannot disable GSO; drop --quic-gso=false or use the quinn backend")]
+	GsoUnsupported,
 }
 
 type Result<T> = std::result::Result<T, Error>;
 
+/// Settings for the shared iroh endpoint, used by both the client and server.
 #[derive(clap::Args, Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 #[non_exhaustive]
@@ -114,9 +139,21 @@ pub struct EndpointConfig {
 }
 
 impl EndpointConfig {
-	pub async fn bind(self) -> Result<Option<Endpoint>> {
+	/// Bind the iroh endpoint, applying the per-connection [`crate::quic::Client`] knobs.
+	///
+	/// iroh is a single P2P endpoint shared by both roles, so it takes the client
+	/// section (the per-connection knobs are symmetric). It only honors the knobs
+	/// its transport-config builder exposes (stream limits, idle timeout, MTU
+	/// discovery); it has no keep-alive knob and cannot disable GSO, so `gso = false`
+	/// fails with [`Error::GsoUnsupported`].
+	pub async fn bind(self, quic: &crate::quic::Client) -> Result<Option<Endpoint>> {
 		if !self.enabled.unwrap_or(false) {
 			return Ok(None);
+		}
+
+		let quic = quic.resolve();
+		if quic.gso_disabled() {
+			return Err(Error::GsoUnsupported);
 		}
 
 		// If the secret matches the expected format (hex encoded), use it directly.
@@ -143,13 +180,25 @@ impl EndpointConfig {
 		let mut alpns: Vec<Vec<u8>> = moq_net::ALPNS.iter().map(|alpn| alpn.as_bytes().to_vec()).collect();
 		alpns.push(web_transport_iroh::ALPN_H3.as_bytes().to_vec());
 
+		// MoQ opens a stream per group, so raise the low default; also carry the
+		// shared idle-timeout / MTU knobs onto iroh's own transport config.
+		let max_streams = iroh::endpoint::VarInt::from_u64(quic.max_streams).unwrap_or(iroh::endpoint::VarInt::MAX);
+		let mut transport = iroh::endpoint::QuicTransportConfig::builder()
+			.max_concurrent_bidi_streams(max_streams)
+			.max_concurrent_uni_streams(max_streams)
+			.max_idle_timeout(Some(quic.idle_timeout.try_into().expect("idle timeout out of range")));
+		if !quic.mtu_discovery {
+			transport = transport.mtu_discovery_config(None);
+		}
+
 		let mut builder = if self.disable_relay.unwrap_or(false) {
 			Endpoint::builder(iroh::endpoint::presets::N0DisableRelay)
 		} else {
 			Endpoint::builder(iroh::endpoint::presets::N0)
 		}
 		.secret_key(secret_key)
-		.alpns(alpns);
+		.alpns(alpns)
+		.transport_config(transport.build());
 		if let Some(addr) = self.bind_v4 {
 			builder = builder.bind_addr(addr)?;
 		}
@@ -164,67 +213,40 @@ impl EndpointConfig {
 	}
 }
 
-pub enum Request {
-	Quic {
-		request: web_transport_iroh::QuicRequest,
-	},
-	WebTransport {
-		request: Box<web_transport_iroh::H3Request>,
-	},
-}
+/// Accept an iroh connection, negotiate WebTransport or raw QUIC, and complete the
+/// handshake. Returns the established session plus the request URL (raw QUIC carries
+/// none). iroh exposes no client-certificate identity, so the identity is always `None`.
+pub(crate) async fn accept(
+	conn: iroh::endpoint::Incoming,
+) -> Result<(
+	web_transport_iroh::Session,
+	Option<Url>,
+	Option<crate::tls::PeerIdentity>,
+)> {
+	let conn = conn.accept()?.await?;
+	let alpn = String::from_utf8(conn.alpn().to_vec())?;
+	tracing::Span::current().record("id", conn.stable_id());
+	tracing::debug!(remote = %conn.remote_id().fmt_short(), %alpn, "accepted");
+	match alpn.as_str() {
+		web_transport_iroh::ALPN_H3 => {
+			let request = web_transport_iroh::H3Request::accept(conn)
+				.await
+				.map_err(Error::RecvRequest)?;
+			let url = Some(request.url.clone());
 
-impl Request {
-	pub async fn accept(conn: iroh::endpoint::Incoming) -> Result<Self> {
-		let conn = conn.accept()?.await?;
-		let alpn = String::from_utf8(conn.alpn().to_vec())?;
-		tracing::Span::current().record("id", conn.stable_id());
-		tracing::debug!(remote = %conn.remote_id().fmt_short(), %alpn, "accepted");
-		match alpn.as_str() {
-			web_transport_iroh::ALPN_H3 => {
-				let request = web_transport_iroh::H3Request::accept(conn)
-					.await
-					.map_err(Error::RecvRequest)?;
-				Ok(Self::WebTransport {
-					request: Box::new(request),
-				})
+			let mut response = ConnectResponse::OK;
+			if let Some(protocol) = request.protocols.first() {
+				response = response.with_protocol(protocol);
 			}
-			alpn if moq_net::ALPNS.contains(&alpn) => Ok(Self::Quic {
-				request: web_transport_iroh::QuicRequest::accept(conn),
-			}),
-			_ => Err(Error::UnsupportedAlpn(alpn)),
+			let session = request.respond(response).await.map_err(Error::Server)?;
+			Ok((session, url, None))
 		}
-	}
-
-	/// Accept the session.
-	pub async fn ok(self) -> std::result::Result<web_transport_iroh::Session, web_transport_iroh::ServerError> {
-		match self {
-			Request::Quic { request } => Ok(request.ok()),
-			Request::WebTransport { request } => {
-				let mut response = ConnectResponse::OK;
-				if let Some(protocol) = request.protocols.first() {
-					response = response.with_protocol(protocol);
-				}
-				request.respond(response).await
-			}
+		// Raw QUIC carries no request URL; the path rides the SETUP.
+		alpn if moq_net::ALPNS.contains(&alpn) => {
+			let session = web_transport_iroh::QuicRequest::accept(conn).ok();
+			Ok((session, None, None))
 		}
-	}
-
-	/// Reject the session.
-	pub async fn close(self, status: http::StatusCode) -> std::result::Result<(), web_transport_iroh::ServerError> {
-		match self {
-			Request::Quic { request } => {
-				request.close(status);
-				Ok(())
-			}
-			Request::WebTransport { request, .. } => request.reject(status).await,
-		}
-	}
-
-	pub fn url(&self) -> Option<&Url> {
-		match self {
-			Request::Quic { .. } => None,
-			Request::WebTransport { request } => Some(&request.url),
-		}
+		_ => Err(Error::UnsupportedAlpn(alpn)),
 	}
 }
 

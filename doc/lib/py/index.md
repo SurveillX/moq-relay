@@ -37,9 +37,9 @@ uv pip install moq-rs # into the active environment
 
 This pulls in `moq-ffi`, for which prebuilt wheels are published for:
 
-- Linux x86_64 / aarch64 (manylinux_2_28)
-- macOS x86_64 / aarch64
-- Windows x86_64
+- Linux x86\_64 / aarch64 (manylinux\_2\_28)
+- macOS x86\_64 / aarch64
+- Windows x86\_64
 
 For other platforms (Alpine, BSD, etc.) `pip` falls back to building `moq-ffi` from source via the published sdist. You'll need a Rust toolchain and a C compiler.
 
@@ -71,9 +71,8 @@ import moq
 
 async def main():
     async with moq.Client("https://relay.quic.video") as client:
-        broadcast = moq.BroadcastProducer()
+        broadcast = client.create_broadcast("my-stream")
         audio = broadcast.publish_media("opus", opus_init_bytes)
-        client.publish("my-stream", broadcast)
 
         audio.write_frame(payload, timestamp_us=0)
         audio.write_frame(payload, timestamp_us=20_000)

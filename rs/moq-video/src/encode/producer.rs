@@ -1,59 +1,129 @@
-//! Encode decoded video frames and publish them as an H.264 moq track.
+//! Encode decoded video frames and publish them as a moq video track.
 //!
-//! Encoding is strictly on demand: the avc3 track and catalog entry are
-//! advertised immediately, but the camera stays closed (LED off, no CPU)
-//! until a subscriber appears. When the last viewer leaves, the camera is
-//! released again. This mirrors `moq-boy`, which pauses its emulator on
-//! `TrackProducer::used()` / `unused()`.
+//! Encoding is strictly on demand: the track and catalog entry are advertised
+//! immediately, but the camera stays closed (LED off, no CPU) until a subscriber
+//! appears. When the last viewer leaves, the camera is released again. This
+//! mirrors `moq-boy`, which pauses its emulator on `track::Producer::used()` /
+//! `unused()`.
 
-use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
-use moq_mux::container::Timestamp;
+use moq_net::Timestamp;
 
 use crate::Error;
-use crate::capture::{self, Camera};
+use crate::capture;
 
-use super::encoder::{self, Encoder};
+use super::encoder::{self, Codec};
+use super::rate::{Control, Policy};
+use super::sink::Sink;
 
 /// Last-resort framerate when neither the caller nor the camera reports one.
 const DEFAULT_FRAMERATE: u32 = 30;
 
-/// Publishes encoded H.264 frames as an avc3 moq track.
+/// Per-codec splitter + importer pair. Each codec frames its packets and resolves
+/// its catalog rendition differently, so the producer holds one of these.
+enum Codecs {
+	H264 {
+		split: moq_mux::codec::h264::Split,
+		import: moq_mux::codec::h264::Import,
+	},
+	H265 {
+		split: moq_mux::codec::h265::Split,
+		import: moq_mux::codec::h265::Import,
+	},
+}
+
+/// Publishes encoded video frames as a moq track (avc3 / hev1 depending on the
+/// codec).
 ///
 /// Built on the async side so the track is advertised (and the catalog
 /// registered) before the camera opens; this is what lets a subscriber
-/// trigger capture on demand. `moq_mux::codec::h264::Import` handles
-/// catalog registration and framing.
+/// trigger capture on demand. The `moq_mux::codec` importer for the codec
+/// handles catalog registration and framing.
 pub struct Producer {
-	import: moq_mux::codec::h264::Import,
+	codecs: Codecs,
 }
 
 impl Producer {
-	pub fn new(broadcast: moq_net::BroadcastProducer, catalog: moq_mux::catalog::Producer) -> Result<Self, Error> {
-		let import =
-			moq_mux::codec::h264::Import::new(broadcast, catalog).with_mode(moq_mux::codec::h264::Mode::Avc3)?;
-		Ok(Self { import })
+	/// Publish a track for `codec` into `broadcast`, registering its rendition
+	/// in `catalog`. The packets fed to [`publish`](Self::publish) must be in
+	/// that codec's framing (the matching [`Encoder`](super::Encoder) emits it).
+	pub fn new(
+		mut broadcast: moq_net::broadcast::Producer,
+		catalog: moq_mux::catalog::Producer,
+		codec: Codec,
+	) -> Result<Self, Error> {
+		let codecs = match codec {
+			Codec::H264 => {
+				let track = moq_mux::import::unique_track(&mut broadcast, ".avc3")?;
+				Codecs::H264 {
+					split: moq_mux::codec::h264::Split::new(),
+					import: moq_mux::codec::h264::Import::new(track, catalog.reserve(), Default::default()),
+				}
+			}
+			Codec::H265 => {
+				let track = moq_mux::import::unique_track(&mut broadcast, ".hev1")?;
+				Codecs::H265 {
+					split: moq_mux::codec::h265::Split::new(),
+					import: moq_mux::codec::h265::Import::new(track, catalog.reserve(), Default::default()),
+				}
+			}
+		};
+		Ok(Self { codecs })
 	}
 
-	/// The underlying track producer, eagerly created by avc3 mode. Clone it
-	/// to watch subscription state via [`used`](moq_net::TrackProducer::used) /
-	/// [`unused`](moq_net::TrackProducer::unused).
-	pub fn track(&self) -> Option<&moq_net::TrackProducer> {
-		self.import.track()
+	/// A watch-only handle to the track's subscriber demand, created eagerly so
+	/// subscription state is observable before any frames arrive. Watch it via
+	/// [`used`](moq_net::track::Demand::used) / [`unused`](moq_net::track::Demand::unused).
+	pub fn demand(&self) -> moq_net::track::Demand {
+		match &self.codecs {
+			Codecs::H264 { import, .. } => import.demand(),
+			Codecs::H265 { import, .. } => import.demand(),
+		}
 	}
 
-	/// Publish already-encoded Annex-B packets at the given timestamp.
+	/// Publish already-encoded packets at the given timestamp. Each packet is one
+	/// whole access unit in the producer's codec framing.
 	pub fn publish(&mut self, packets: Vec<bytes::Bytes>, timestamp: Timestamp) -> Result<(), Error> {
-		for mut packet in packets {
-			self.import.decode_frame(&mut packet, Some(timestamp))?;
+		for packet in packets {
+			// The encoder emits one whole access unit per packet, so flush to emit it.
+			match &mut self.codecs {
+				Codecs::H264 { split, import } => {
+					let mut frames = split.decode(&packet, Some(timestamp))?;
+					frames.extend(split.flush(Some(timestamp))?);
+					import.decode(frames)?;
+				}
+				Codecs::H265 { split, import } => {
+					let mut frames = split.decode(&packet, Some(timestamp))?;
+					frames.extend(split.flush(Some(timestamp))?);
+					import.decode(frames)?;
+				}
+			}
 		}
 		Ok(())
 	}
 
 	/// Finalize the track.
-	pub fn finish(&mut self) -> Result<(), Error> {
-		self.import.finish()?;
+	///
+	/// Consumes the producer: nothing can be published after the track ends, so
+	/// this is the last call rather than one leaving a dead producer in your hands.
+	pub fn finish(mut self) -> Result<(), Error> {
+		match &mut self.codecs {
+			Codecs::H264 { import, .. } => import.finish()?,
+			Codecs::H265 { import, .. } => import.finish()?,
+		}
 		Ok(())
+	}
+
+	/// Abort the track with `err` instead of finishing it cleanly, so subscribers
+	/// see the real cause rather than [`moq_net::Error::Dropped`].
+	///
+	/// Consumes the producer, like [`finish`](Self::finish).
+	pub fn abort(mut self, err: moq_net::Error) {
+		match &mut self.codecs {
+			Codecs::H264 { import, .. } => import.abort(err),
+			Codecs::H265 { import, .. } => import.abort(err),
+		}
 	}
 }
 
@@ -64,16 +134,46 @@ impl Producer {
 ///
 /// `#[non_exhaustive]`: construct via [`Options::default`] and set fields, so
 /// new knobs can be added without breaking callers.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct Options {
 	/// Target bitrate in bits per second; `None` derives from resolution.
+	///
+	/// This is a ceiling, not a fixed rate: with [`bandwidth`](Self::bandwidth)
+	/// set, the encoder backs off below it while the uplink is congested and
+	/// climbs back afterwards, but never exceeds it.
 	pub bitrate: Option<u64>,
+	/// Output codec. Defaults to [`Codec::H264`].
+	pub codec: Codec,
 	/// Encoder implementation preference.
 	pub kind: encoder::Kind,
+	/// The connection's send-bandwidth estimate, from
+	/// [`Session::send_bandwidth`](moq_net::Session::send_bandwidth) (or
+	/// `moq_native::Reconnect::send_bandwidth`, which survives reconnects).
+	///
+	/// Set it and the encoder tracks the estimate per the default
+	/// [`rate::Policy`](super::rate::Policy), so a closing uplink gets a softer
+	/// picture instead of a stalled one. Leave it `None` and the
+	/// encoder holds [`bitrate`](Self::bitrate) regardless of congestion, which
+	/// is what you want when the estimate isn't meaningful (a local file, a test
+	/// harness) or unavailable (a publisher that only accepts inbound sessions).
+	pub bandwidth: Option<moq_net::bandwidth::Consumer>,
 }
 
-/// Capture a webcam and publish it as on-demand H.264.
+// Hand-written: `bandwidth::Consumer` isn't `Debug`, but its presence is the
+// only part worth printing anyway.
+impl std::fmt::Debug for Options {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("Options")
+			.field("bitrate", &self.bitrate)
+			.field("codec", &self.codec)
+			.field("kind", &self.kind)
+			.field("bandwidth", &self.bandwidth.is_some())
+			.finish()
+	}
+}
+
+/// Capture a webcam and publish it as an on-demand video track.
 ///
 /// Returns when the broadcast is dropped (the track stops being announced)
 /// or the capture loop fails. The camera is opened only while at least one
@@ -81,7 +181,7 @@ pub struct Options {
 /// same [`Clock`](moq_mux::Clock) to a concurrent audio publish keeps the two
 /// tracks aligned.
 pub async fn publish_capture(
-	broadcast: moq_net::BroadcastProducer,
+	broadcast: moq_net::broadcast::Producer,
 	catalog: moq_mux::catalog::Producer,
 	capture: capture::Config,
 	encode: Options,
@@ -93,43 +193,93 @@ pub async fn publish_capture(
 		return Err(Error::InvalidFramerate(0));
 	}
 
-	let producer = Producer::new(broadcast, catalog)?;
-	let track = producer
-		.track()
-		.cloned()
-		.ok_or_else(|| Error::Codec(anyhow::anyhow!("avc3 track was not created")))?;
+	let mut producer = Producer::new(broadcast, catalog, encode.codec)?;
+	let demand = producer.demand();
 
-	let gate = Gate::new();
+	let result = capture_loop(&mut producer, &demand, &capture, &encode, &clock).await;
 
-	// ffmpeg capture + encode is blocking; keep it off the async runtime.
-	let worker_gate = gate.clone();
-	let mut worker = tokio::task::spawn_blocking(move || capture_loop(producer, capture, encode, worker_gate, clock));
-
-	tokio::select! {
-		// Surface a capture/encode failure (e.g. camera open) promptly.
-		res = &mut worker => res.map_err(|e| Error::Codec(anyhow::anyhow!("capture task: {e}")))?,
-		// The broadcast was dropped: stop the worker and wait for it to flush.
-		() = monitor_demand(&track, &gate) => {
-			gate.close();
-			worker
-				.await
-				.map_err(|e| Error::Codec(anyhow::anyhow!("capture task: {e}")))?
+	// This runs only when the loop ends on its own (the track is usually already
+	// going away by then); a Ctrl+C cancels the future before this point, since
+	// async `Drop` can't finalize the track.
+	match &result {
+		// Clean end (the track was dropped): best-effort finish.
+		Ok(()) => {
+			if let Err(err) = producer.finish() {
+				tracing::debug!(error = %err, "video track finish after capture ended");
+			}
 		}
+		// The capture loop failed: abort with the real cause so subscribers see it.
+		Err(err) => producer.abort(moq_net::Error::Transport(err.to_string())),
+	}
+	result
+}
+
+/// Off macOS, [`publish_capture`]'s future must stay `Send` so a server can
+/// `tokio::spawn` it: the encoder runs on its own thread and the capture guard
+/// is `Send` there. This is never called; it exists only to fail compilation if
+/// the future ever regains a `!Send` component. macOS is exempt (the objc
+/// capture session is `!Send`).
+#[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
+fn assert_publish_capture_send(
+	broadcast: moq_net::broadcast::Producer,
+	catalog: moq_mux::catalog::Producer,
+	capture: capture::Config,
+	encode: Options,
+	clock: moq_mux::Clock,
+) {
+	fn is_send<T: Send>(_: &T) {}
+	is_send(&publish_capture(broadcast, catalog, capture, encode, clock));
+}
+
+/// The live rate control state: the estimate source paired with the policy
+/// tracking it. `None` once there's nothing left to track, which is what stops
+/// the `select!` arm from spinning on a channel that is permanently ready.
+type Rate = Option<(moq_net::bandwidth::Consumer, Control)>;
+
+/// Wait for the next bandwidth estimate, or forever when rate control is off or
+/// finished. Cancel-safe: [`Consumer::changed`](moq_net::bandwidth::Consumer::changed)
+/// only reads shared state, so losing this race to a frame drops no estimate,
+/// it just re-reads the latest one next time round.
+async fn next_estimate(rate: &mut Rate) -> Option<Option<u64>> {
+	match rate {
+		Some((bandwidth, _)) => bandwidth.changed().await.ok(),
+		// No estimate source: park this arm forever so `select!` ignores it.
+		None => std::future::pending().await,
 	}
 }
 
-/// Toggle the gate as viewers subscribe and unsubscribe. Returns once the
-/// track stops being announced (broadcast dropped / aborted).
-async fn monitor_demand(track: &moq_net::TrackProducer, gate: &Gate) {
-	loop {
-		match track.used().await {
-			Ok(()) => gate.set_active(true),
-			Err(err) => return log_track_ended(err),
+/// Feed an estimate through the policy and retune the encoder if it moved.
+///
+/// `None` means the producer is gone (the session ended for good), so rate
+/// control retires; a `Some(None)` estimate means the value is merely
+/// unavailable right now, which the policy holds through.
+async fn apply_estimate(encoder: &mut Sink, rate: &mut Rate, estimate: Option<Option<u64>>) {
+	let Some((_, control)) = rate.as_mut() else { return };
+
+	let Some(estimate) = estimate else {
+		tracing::debug!("bandwidth estimate ended; holding the current encoder bitrate");
+		*rate = None;
+		return;
+	};
+
+	let Some(bitrate) = control.update(estimate, Instant::now()) else {
+		return;
+	};
+
+	match encoder.set_bitrate(bitrate).await {
+		Ok(()) => tracing::debug!(bitrate, estimate, "adjusted encoder bitrate"),
+		// The encoder can't retune, so keep encoding at the rate it opened with
+		// and stop asking. Dropping the source also stops the estimate arm, which
+		// would otherwise wake this loop for nothing on every change.
+		Err(Error::BitrateUnsupported(name)) => {
+			tracing::warn!(encoder = name, "encoder cannot follow the bandwidth estimate");
+			*rate = None;
 		}
-		match track.unused().await {
-			Ok(()) => gate.set_active(false),
-			Err(err) => return log_track_ended(err),
-		}
+		// A transient failure: keep the policy running so the next change retries.
+		// The policy already moved its target, so a persistent failure just means
+		// the encoder trails it; that's better than giving up on the first blip.
+		Err(err) => tracing::warn!(error = %err, bitrate, "failed to adjust encoder bitrate"),
 	}
 }
 
@@ -144,141 +294,178 @@ fn log_track_ended(err: moq_net::Error) {
 	}
 }
 
-/// Blocking capture/encode loop. Captures one frame up front to populate the
+/// Async capture/encode loop. Captures one frame up front to populate the
 /// catalog (the codec/resolution only exist once the encoder has produced an
-/// SPS), then releases the camera whenever the gate goes idle.
-fn capture_loop(
-	mut producer: Producer,
-	capture: capture::Config,
-	encode: Options,
-	gate: Arc<Gate>,
-	clock: moq_mux::Clock,
+/// SPS), then releases the camera whenever the last viewer leaves and reopens it
+/// when one returns.
+///
+/// Cancel safety: every wait here is a real `.await` (a frame read, a demand
+/// transition, or an encode), so dropping this future (e.g. on Ctrl+C) drops
+/// `camera` and `encoder`, which release the device (LED off) and join the
+/// encode thread. Both the capture and encode threads sit idle between frames,
+/// so their joins return promptly unless the underlying device or encoder is
+/// itself wedged.
+async fn capture_loop(
+	producer: &mut Producer,
+	demand: &moq_net::track::Demand,
+	capture: &capture::Config,
+	encode: &Options,
+	clock: &moq_mux::Clock,
 ) -> Result<(), Error> {
-	let mut camera: Option<Camera> = None;
-	let mut encoder: Option<Encoder> = None;
-	let mut last_ts = Timestamp::from_micros(0)?;
-	// The catalog video rendition only appears once a frame has been encoded
-	// (the importer reads the SPS). Until then we keep capturing regardless of
-	// the gate, so a catalog-driven subscriber can discover the track and
-	// trigger `used()`. After that we release the camera while unwatched.
+	// The catalog video rendition only appears once a frame has been encoded (the
+	// importer reads the SPS). Until then we capture regardless of demand so a
+	// catalog-driven subscriber can discover the track and trigger `used()`.
+	// After that we release the camera while unwatched.
 	let mut catalog_ready = false;
 
 	loop {
-		if catalog_ready && !gate.is_active() {
-			// No viewers: drop the camera so its LED turns off and it stops
-			// consuming CPU, then block until someone subscribes.
-			if camera.take().is_some() {
-				encoder = None;
-				tracing::info!("no viewers: released camera");
+		if catalog_ready {
+			// Idle until a viewer subscribes; the track ending is a clean exit.
+			if let Err(err) = demand.used().await {
+				log_track_ended(err);
+				return Ok(());
 			}
-			if !gate.wait_active() {
-				break; // closed
-			}
-			continue;
 		}
 
-		// Open the camera (and an encoder sized to its negotiated mode) the
-		// first time we're watched after being idle.
-		if camera.is_none() {
-			let cam = Camera::open(&capture)?;
-			// Prefer an explicit --fps, otherwise use the camera's reported
-			// rate, falling back only if the backend doesn't expose one.
-			let framerate = capture
-				.framerate
-				.or_else(|| cam.framerate())
-				.unwrap_or(DEFAULT_FRAMERATE);
-			let mut encoder_config = encoder::Config::new(cam.width(), cam.height(), framerate);
-			encoder_config.bitrate = encode.bitrate;
-			encoder_config.kind = encode.kind.clone();
-			let enc = Encoder::new(&encoder_config)?;
-			tracing::info!(
-				encoder = enc.name(),
-				device = cam.device(),
-				"viewer subscribed: capturing"
-			);
-			camera = Some(cam);
-			encoder = Some(enc);
-		}
+		// Open the camera and an encoder sized to its negotiated mode.
+		let mut camera = capture::open(capture).await?;
+		// Prefer an explicit --fps, otherwise the camera's reported rate, falling
+		// back only if the backend doesn't expose one.
+		let framerate = capture
+			.framerate
+			.or_else(|| camera.framerate())
+			.unwrap_or(DEFAULT_FRAMERATE);
+		let mut encoder_config = encoder::Config::new(camera.width(), camera.height(), framerate);
+		encoder_config.bitrate = encode.bitrate;
+		encoder_config.codec = encode.codec;
+		encoder_config.kind = encode.kind.clone();
+		// Off macOS this opens the encoder on a dedicated thread; see `sink`.
+		let mut encoder = Sink::open(&encoder_config).await?;
+		// Force an IDR on the first frame of each (re)open so a viewer subscribing
+		// after an idle gap can start decoding immediately.
+		let mut force_keyframe = true;
+		tracing::info!(encoder = encoder.name(), device = camera.device(), "capturing");
 
-		let frame = match camera.as_mut().expect("camera open above").read()? {
-			Some(frame) => frame,
-			None => break, // device stopped producing frames
-		};
+		// Rate control is per encoder: this one opened at the configured bitrate,
+		// so the policy's ceiling is that rate and the target starts there. A
+		// reopened camera starts optimistic again rather than inheriting the
+		// backed-off rate from whatever the link was doing last time.
+		let mut rate = encode
+			.bandwidth
+			.clone()
+			.map(|bandwidth| (bandwidth, Control::new(Policy::new(encoder_config.resolved_bitrate()))));
 
-		let ts = Timestamp::from_micros(clock.micros())?;
-		last_ts = ts;
-
-		let packets = encoder.as_mut().expect("encoder built above").encode(&frame)?;
-		// Once the encoder has emitted a frame, the importer has parsed the SPS
-		// and the catalog rendition exists, so the gate can take over.
-		catalog_ready |= !packets.is_empty();
-		producer.publish(packets, ts)?;
-	}
-
-	// Flush whatever the encoder still holds, then close the track. Log
-	// (don't discard) flush/publish errors at shutdown; they're not worth
-	// aborting the close over, but silently dropping them hides real failures.
-	if let Some(enc) = encoder.as_mut() {
-		match enc.finish() {
-			Ok(packets) => {
-				if let Err(err) = producer.publish(packets, last_ts) {
-					tracing::warn!(error = %err, "failed to publish final video packets");
+		loop {
+			// While watched, race the next frame against the last viewer leaving so
+			// we release the camera promptly when demand drops. `biased` checks
+			// demand first so an unwatched track stops before reading another frame.
+			let frame = if catalog_ready {
+				tokio::select! {
+					biased;
+					res = demand.unused() => {
+						if let Err(err) = res {
+							log_track_ended(err);
+							return Ok(());
+						}
+						break; // no viewers: release the camera, then wait for one
+					}
+					// Retune between frames rather than mid-encode, and only when
+					// the policy says the target actually moved.
+					estimate = next_estimate(&mut rate) => {
+						apply_estimate(&mut encoder, &mut rate, estimate).await;
+						continue;
+					}
+					frame = camera.read() => frame,
 				}
-			}
-			Err(err) => tracing::warn!(error = %err, "failed to flush video encoder"),
+			} else {
+				camera.read().await
+			};
+
+			let Some(frame) = frame else { break }; // device stopped producing frames
+
+			let ts = Timestamp::from_micros(clock.micros())?;
+			let packets = encoder.encode(frame, force_keyframe).await?;
+			force_keyframe = false;
+			// Once the encoder emits a frame the importer has parsed the SPS and
+			// the catalog rendition exists, so demand gating can take over.
+			catalog_ready |= !packets.is_empty();
+			producer.publish(packets, ts)?;
+		}
+
+		// Drop the camera (LED off) and encoder before waiting for the next viewer.
+		drop(camera);
+		if catalog_ready {
+			tracing::info!("no viewers: released camera");
 		}
 	}
-	producer.finish()?;
-	Ok(())
 }
 
-/// Bridges the async demand monitor to the blocking capture thread: the
-/// monitor flips `active`, the capture loop waits on it.
-struct Gate {
-	state: Mutex<GateState>,
-	cond: Condvar,
-}
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::encode::{Config, Encoder};
 
-#[derive(Default)]
-struct GateState {
-	active: bool,
-	closed: bool,
-}
+	/// Encode a handful of synthetic frames for `codec` and publish them through a
+	/// real [`Producer`], returning the catalog rendition's track name. The
+	/// rendition only appears once the matching importer parses the codec config
+	/// out of the encoded keyframe, so a returned name proves the whole
+	/// encode -> split -> import -> catalog path works for that codec.
+	///
+	/// `kind` is explicit so the test picks a deterministic encoder rather than
+	/// `Auto`, which on Linux CI would try the NVENC backend and panic in cudarc
+	/// on a GPU-less runner.
+	async fn roundtrip_rendition(codec: Codec, kind: encoder::Kind) -> String {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = moq_mux::catalog::Producer::new(&mut broadcast).unwrap();
+		let mut producer = Producer::new(broadcast, catalog.clone(), codec).unwrap();
 
-impl Gate {
-	fn new() -> Arc<Self> {
-		Arc::new(Self {
-			state: Mutex::new(GateState::default()),
-			cond: Condvar::new(),
-		})
-	}
+		let mut config = Config::new(320, 240, 30);
+		config.codec = codec;
+		config.kind = kind;
+		let mut encoder = Encoder::new(&config).unwrap();
+		assert_eq!(encoder.codec(), codec);
 
-	fn set_active(&self, active: bool) {
-		let mut state = self.state.lock().unwrap();
-		state.active = active;
-		self.cond.notify_all();
-	}
-
-	fn close(&self) {
-		let mut state = self.state.lock().unwrap();
-		// Clear active too: otherwise a shutdown that races an
-		// still-subscribed track leaves the worker in the capture path,
-		// where it never checks `closed` until the next publish fails.
-		state.active = false;
-		state.closed = true;
-		self.cond.notify_all();
-	}
-
-	fn is_active(&self) -> bool {
-		self.state.lock().unwrap().active
-	}
-
-	/// Block until active or closed. Returns `false` if closed.
-	fn wait_active(&self) -> bool {
-		let mut state = self.state.lock().unwrap();
-		while !state.active && !state.closed {
-			state = self.cond.wait(state).unwrap();
+		let rgba = vec![0x80u8; 320 * 240 * 4];
+		for i in 0..10u64 {
+			let packets = encoder.encode_rgba(&rgba, crate::Size::new(320, 240), i == 0).unwrap();
+			let ts = Timestamp::from_micros(i * 33_333).unwrap();
+			producer.publish(packets, ts).unwrap();
 		}
-		!state.closed
+		let tail = encoder.finish().unwrap();
+		producer
+			.publish(tail, Timestamp::from_micros(10 * 33_333).unwrap())
+			.unwrap();
+
+		let snapshot = catalog.snapshot();
+		snapshot
+			.video
+			.renditions
+			.keys()
+			.next()
+			.cloned()
+			.expect("the importer should have registered a video rendition")
+	}
+
+	#[tokio::test]
+	async fn h264_roundtrip_publishes_avc3() {
+		// Software (openh264) so the test is deterministic and never touches a
+		// hardware backend.
+		assert!(
+			roundtrip_rendition(Codec::H264, encoder::Kind::Software)
+				.await
+				.ends_with(".avc3")
+		);
+	}
+
+	/// H.265 has no software encoder, so this only runs where a hardware one
+	/// exists (VideoToolbox on macOS, the only hardware backend on this target).
+	#[cfg(target_os = "macos")]
+	#[tokio::test]
+	async fn h265_roundtrip_publishes_hev1() {
+		assert!(
+			roundtrip_rendition(Codec::H265, encoder::Kind::Hardware)
+				.await
+				.ends_with(".hev1")
+		);
 	}
 }

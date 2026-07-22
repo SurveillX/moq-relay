@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.28](https://github.com/moq-dev/moq/compare/moq-boy-v0.2.27...moq-boy-v0.2.28) - 2026-07-18
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.2.27](https://github.com/moq-dev/moq/compare/moq-boy-v0.2.26...moq-boy-v0.2.27) - 2026-07-16
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.2.26](https://github.com/moq-dev/moq/compare/moq-boy-v0.2.25...moq-boy-v0.2.26) - 2026-07-12
+
+### Other
+
+- split into snapshot/stream modules and expose JSON tracks through moq-ffi/libmoq ([#2196](https://github.com/moq-dev/moq/pull/2196))
+
+## [0.2.25](https://github.com/moq-dev/moq/compare/moq-boy-v0.2.24...moq-boy-v0.2.25) - 2026-07-09
+
+### Other
+
+- updated the following local packages: moq-json, moq-audio
+
+## [0.2.24](https://github.com/moq-dev/moq/compare/moq-boy-v0.2.23...moq-boy-v0.2.24) - 2026-07-05
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.2.23](https://github.com/moq-dev/moq/compare/moq-boy-v0.2.22...moq-boy-v0.2.23) - 2026-07-04
+
+### Other
+
+- Move the connect URL and connect/serve loops into moq-native ([#2048](https://github.com/moq-dev/moq/pull/2048))
+- [codex] Future-proof moq-net metadata structs ([#2046](https://github.com/moq-dev/moq/pull/2046))
+
+## [0.2.22](https://github.com/moq-dev/moq/compare/moq-boy-v0.2.21...moq-boy-v0.2.22) - 2026-06-30
+
+### Added
+
+- *(json)* group-scoped DEFLATE compression with browser support ([#1897](https://github.com/moq-dev/moq/pull/1897))
+
+### Other
+
+- Backport moq-mux to main (adapted to main's moq-net, no wire/API breaks) ([#1918](https://github.com/moq-dev/moq/pull/1918))
+
+## [0.2.21](https://github.com/moq-dev/moq/compare/moq-boy-v0.2.20...moq-boy-v0.2.21) - 2026-06-23
+
+### Other
+
+- *(deps)* bump boytacean to 0.12.1 (hold reqwest-middleware at 0.4) ([#1820](https://github.com/moq-dev/moq/pull/1820))
+
+## [0.2.20](https://github.com/moq-dev/moq/compare/moq-boy-v0.2.19...moq-boy-v0.2.20) - 2026-06-19
+
+### Other
+
+- Route moq-boy status and command tracks through moq-json ([#1778](https://github.com/moq-dev/moq/pull/1778))
+
+## [0.2.19](https://github.com/moq-dev/moq/compare/moq-boy-v0.2.18...moq-boy-v0.2.19) - 2026-06-16
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.2.18](https://github.com/moq-dev/moq/compare/moq-boy-v0.2.17...moq-boy-v0.2.18) - 2026-06-10
 
 ### Added

@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.8...moq-audio-v0.0.9) - 2026-07-16
+
+### Added
+
+- *(moq-mux)* cut(end) as the group boundary ([#2270](https://github.com/moq-dev/moq/pull/2270))
+
+## [0.0.8](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.7...moq-audio-v0.0.8) - 2026-07-09
+
+### Other
+
+- Per-track timeline index for each media track ([#2109](https://github.com/moq-dev/moq/pull/2109))
+
+## [0.0.7](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.6...moq-audio-v0.0.7) - 2026-07-04
+
+### Other
+
+- [codex] Future-proof moq-net metadata structs ([#2046](https://github.com/moq-dev/moq/pull/2046))
+
+## [0.0.6](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.5...moq-audio-v0.0.6) - 2026-06-30
+
+### Other
+
+- API cleanup before the semver bump ([#1941](https://github.com/moq-dev/moq/pull/1941))
+- Backport moq-mux to main (adapted to main's moq-net, no wire/API breaks) ([#1918](https://github.com/moq-dev/moq/pull/1918))
+
+## [0.0.5](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.4...moq-audio-v0.0.5) - 2026-06-23
+
+### Other
+
+- updated the following local packages: moq-mux
+
+## [0.0.4](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.3...moq-audio-v0.0.4) - 2026-06-16
+
+### Fixed
+
+- *(moq-audio)* surface denied/unavailable mic instead of hanging ([#1708](https://github.com/moq-dev/moq/pull/1708))
+
 ## [0.0.3](https://github.com/moq-dev/moq/compare/moq-audio-v0.0.2...moq-audio-v0.0.3) - 2026-06-10
 
 ### Added

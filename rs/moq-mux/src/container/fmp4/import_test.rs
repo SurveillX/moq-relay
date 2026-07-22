@@ -5,7 +5,7 @@ use mp4_atom::{Decode, Encode};
 /// Drain every group currently buffered on the consumer without waiting for new ones.
 /// Used in tests where the producer is still alive after writing.
 #[cfg(test)]
-fn drain_group_sequences(consumer: &mut moq_net::TrackConsumer) -> Vec<u64> {
+fn drain_group_sequences(consumer: &mut moq_net::track::Subscriber) -> Vec<u64> {
 	let mut sequences = Vec::new();
 	while let Some(group) = consumer.recv_group().now_or_never().and_then(|r| r.ok().flatten()) {
 		sequences.push(group.sequence);
@@ -14,14 +14,34 @@ fn drain_group_sequences(consumer: &mut moq_net::TrackConsumer) -> Vec<u64> {
 }
 
 fn run_fmp4(data: &[u8]) -> crate::catalog::hang::Catalog {
-	let mut broadcast = moq_net::Broadcast::new().produce();
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
 
-	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.clone());
+	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve());
 
-	let mut buf = bytes::BytesMut::from(data);
+	let buf = bytes::BytesMut::from(data);
 	// Ignore errors from incomplete/malformed trailing fragments in test files.
-	let _ = fmp4.decode(&mut buf);
+	let _ = fmp4.decode(&buf);
+
+	catalog.snapshot()
+}
+
+fn run_fmp4_select(data: &[u8], select: crate::select::Broadcast) -> crate::catalog::hang::Catalog {
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+
+	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_select(select);
+
+	// A dropped track's moof fragments must be skipped, not raise `UnknownTrack`.
+	// (The test files end on a malformed fragment, so other decode errors are expected
+	// and ignored; only `UnknownTrack` would mean the skip path regressed.)
+	let buf = bytes::BytesMut::from(data);
+	if let Err(err) = fmp4.decode(&buf) {
+		assert!(
+			!matches!(err, crate::Error::Cmaf(crate::container::fmp4::Error::UnknownTrack(_))),
+			"a skipped track's fragment raised UnknownTrack: {err:?}"
+		);
+	}
 
 	catalog.snapshot()
 }
@@ -52,6 +72,60 @@ fn test_bbb_catalog() {
 	assert_eq!(audio.sample_rate, 44100);
 	assert_eq!(audio.channel_count, 2);
 	assert!(matches!(audio.container, Container::Cmaf { .. }));
+}
+
+#[test]
+fn dropping_import_retires_catalog_renditions() {
+	let data = include_bytes!("test_data/bbb.mp4");
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
+
+	{
+		let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve());
+		let mut cursor = std::io::Cursor::new(data);
+		mp4_atom::Ftyp::decode(&mut cursor).unwrap();
+		mp4_atom::Moov::decode(&mut cursor).unwrap();
+		fmp4.decode(&data[..cursor.position() as usize]).unwrap();
+		let snapshot = catalog.snapshot();
+		assert_eq!(snapshot.video.renditions.len(), 1);
+		assert_eq!(snapshot.audio.renditions.len(), 1);
+	}
+
+	let snapshot = catalog.snapshot();
+	assert!(snapshot.video.renditions.is_empty());
+	assert!(snapshot.audio.renditions.is_empty());
+}
+
+#[test]
+fn select_video_only() {
+	use crate::select::{Broadcast, Video};
+
+	let data = include_bytes!("test_data/bbb.mp4");
+	let catalog = run_fmp4_select(data, Broadcast::default().video(Video::default()));
+
+	// The muxed audio track is dropped; only video is published.
+	assert_eq!(catalog.video.renditions.len(), 1);
+	assert!(catalog.audio.renditions.is_empty());
+}
+
+#[test]
+fn select_audio_only() {
+	use crate::select::{Audio, Broadcast};
+
+	let data = include_bytes!("test_data/bbb.mp4");
+	let catalog = run_fmp4_select(data, Broadcast::default().audio(Audio::default()));
+
+	assert!(catalog.video.renditions.is_empty());
+	assert_eq!(catalog.audio.renditions.len(), 1);
+}
+
+#[test]
+fn select_nothing_publishes_nothing() {
+	let data = include_bytes!("test_data/bbb.mp4");
+	let catalog = run_fmp4_select(data, crate::select::Broadcast::default());
+
+	assert!(catalog.video.renditions.is_empty());
+	assert!(catalog.audio.renditions.is_empty());
 }
 
 #[test]
@@ -146,10 +220,10 @@ fn test_vp9_catalog() {
 async fn test_seek_sets_initial_sequence() {
 	use mp4_atom::{Any, DecodeMaybe};
 
-	let mut broadcast = moq_net::Broadcast::new().produce();
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let broadcast_consumer = broadcast.consume();
 	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
-	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.clone());
+	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve());
 
 	let data = include_bytes!("test_data/bbb.mp4");
 
@@ -177,18 +251,20 @@ async fn test_seek_sets_initial_sequence() {
 	}
 
 	// Decode init so the tracks exist, then seek, then decode the fragments.
-	fmp4.decode(&mut init_buf).unwrap();
-	assert!(fmp4.is_initialized());
+	fmp4.decode(&init_buf).unwrap();
 
 	let snap = catalog.snapshot();
 	let video_name = snap.video.renditions.keys().next().expect("video track").clone();
 	let mut video_track = broadcast_consumer
-		.subscribe_track(&moq_net::Track::new(&video_name))
+		.track(&video_name)
+		.unwrap()
+		.subscribe(None)
+		.await
 		.expect("video track should exist");
 
 	fmp4.seek(100).unwrap();
 	// Trailing partial fragments may error; ignore.
-	let _ = fmp4.decode(&mut frag_buf);
+	let _ = fmp4.decode(&frag_buf);
 	fmp4.finish().unwrap();
 
 	let sequences = drain_group_sequences(&mut video_track);
@@ -208,20 +284,23 @@ async fn test_seek_sets_initial_sequence() {
 /// exercises the full unified pipeline (hang -> MSF JSON on the wire -> hang).
 #[tokio::test]
 async fn test_msf_catalog_roundtrip() {
-	let mut broadcast = moq_net::Broadcast::new().produce();
-	// Take the consumer before adding tracks; subscribe_track is called after the
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	// Take the consumer before adding tracks; track() is called after the
 	// MSF catalog track has been created by `catalog::Producer::new`.
 	let consumer = broadcast.consume();
 	let catalog = crate::catalog::Producer::new(&mut broadcast).unwrap();
-	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog);
+	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve());
 
 	let data = include_bytes!("test_data/bbb.mp4");
-	let mut buf = bytes::BytesMut::from(&data[..]);
+	let buf = bytes::BytesMut::from(&data[..]);
 	// Trailing fragments may error out (e.g. partial mdat); ignore.
-	let _ = fmp4.decode(&mut buf);
+	let _ = fmp4.decode(&buf);
 
 	let track = consumer
-		.subscribe_track(&moq_net::Track::new(moq_msf::DEFAULT_NAME))
+		.track(moq_msf::DEFAULT_NAME)
+		.unwrap()
+		.subscribe(None)
+		.await
 		.expect("MSF catalog track should exist");
 	let mut msf = crate::catalog::msf::Consumer::new(track);
 
@@ -247,4 +326,121 @@ async fn test_msf_catalog_roundtrip() {
 	assert_eq!(audio.sample_rate, 44100);
 	assert_eq!(audio.channel_count, 2);
 	assert!(matches!(audio.container, Container::Cmaf { .. }));
+}
+
+// ---- Sample-duration handling in decode() ----
+
+fn scale() -> moq_net::Timescale {
+	moq_net::Timescale::new(1_000_000).unwrap()
+}
+
+fn sample(timestamp_us: u64, keyframe: bool, duration_us: Option<u64>) -> crate::container::Frame {
+	crate::container::Frame {
+		timestamp: moq_net::Timestamp::from_micros(timestamp_us).unwrap(),
+		payload: bytes::Bytes::from_static(&[0xDE, 0xAD]),
+		keyframe,
+		duration: duration_us.map(|d| moq_net::Timestamp::from_micros(d).unwrap()),
+	}
+}
+
+/// A multi-sample fragment whose non-final sample carries no duration can't have its
+/// DTS reconstructed, so decode rejects it rather than collapsing the timestamps.
+#[test]
+fn decode_rejects_durationless_multisample() {
+	let frames = vec![sample(0, true, None), sample(33_000, false, None)];
+	let frag = super::encode_fragment(1, scale(), 0, &frames).unwrap();
+	let err = super::decode(frag, scale()).unwrap_err();
+	assert!(matches!(err, super::Error::MissingSampleDuration), "got {err:?}");
+}
+
+/// A single-sample fragment needs no duration (nothing follows it), so it still decodes.
+#[test]
+fn decode_single_sample_no_duration_ok() {
+	let frag = super::encode_fragment(1, scale(), 0, &[sample(0, true, None)]).unwrap();
+	let out = super::decode(frag, scale()).unwrap();
+	assert_eq!(out.len(), 1);
+	assert_eq!(out[0].timestamp.as_micros(), 0);
+}
+
+/// With the durations the producer now backfills, every sample's DTS round-trips
+/// through a multi-sample fragment.
+#[test]
+fn decode_multisample_with_durations_roundtrips() {
+	let frames = vec![sample(0, true, Some(33_000)), sample(33_000, false, Some(33_000))];
+	let frag = super::encode_fragment(1, scale(), 0, &frames).unwrap();
+	let out = super::decode(frag, scale()).unwrap();
+	assert_eq!(out.len(), 2);
+	assert_eq!(out[0].timestamp.as_micros(), 0);
+	assert_eq!(out[1].timestamp.as_micros(), 33_000);
+}
+
+/// A FLAC track (fLaC sample entry + dfLa STREAMINFO) imports into the catalog with
+/// rate/channels taken from STREAMINFO (not the 16.16 audio box) and the WebCodecs
+/// description carried out of band.
+#[test]
+fn test_flac_catalog() {
+	// 96 kHz can't be represented in the sample entry's 16.16 `Audio` rate field, so
+	// this also proves STREAMINFO is the source of truth.
+	let stream_info = mp4_atom::FlacMetadataBlock::StreamInfo {
+		minimum_block_size: 4096,
+		maximum_block_size: 4096,
+		minimum_frame_size: 0u32.try_into().unwrap(),
+		maximum_frame_size: 0u32.try_into().unwrap(),
+		sample_rate: 96_000,
+		num_channels_minus_one: 1,
+		bits_per_sample_minus_one: 23,
+		number_of_interchannel_samples: 0,
+		md5_checksum: vec![0; 16],
+	};
+	let flac = mp4_atom::Flac {
+		audio: mp4_atom::Audio {
+			data_reference_index: 1,
+			channel_count: 2,
+			sample_size: 24,
+			sample_rate: mp4_atom::FixedPoint::from(0u16),
+		},
+		dfla: mp4_atom::Dfla {
+			blocks: vec![stream_info],
+		},
+	};
+
+	let trak = super::build_audio_trak(1, 96_000, mp4_atom::Codec::from(flac));
+	let moov = mp4_atom::Moov {
+		mvhd: mp4_atom::Mvhd {
+			timescale: 1000,
+			..Default::default()
+		},
+		trak: vec![trak],
+		mvex: Some(mp4_atom::Mvex {
+			mehd: None,
+			trex: vec![mp4_atom::Trex {
+				track_id: 1,
+				default_sample_description_index: 1,
+				..Default::default()
+			}],
+		}),
+		..Default::default()
+	};
+	let ftyp = mp4_atom::Ftyp {
+		major_brand: b"isom".into(),
+		minor_version: 0x200,
+		compatible_brands: vec![b"isom".into(), b"iso6".into()],
+	};
+
+	let mut data = Vec::new();
+	ftyp.encode(&mut data).unwrap();
+	moov.encode(&mut data).unwrap();
+
+	let catalog = run_fmp4(&data);
+	assert_eq!(catalog.audio.renditions.len(), 1);
+
+	let a = catalog.audio.renditions.values().next().unwrap();
+	assert!(matches!(a.codec, hang::catalog::AudioCodec::Flac));
+	assert_eq!(a.sample_rate, 96_000);
+	assert_eq!(a.channel_count, 2);
+	// fmp4 import is CMAF passthrough.
+	assert!(matches!(a.container, Container::Cmaf { .. }));
+	// The WebCodecs FLAC description: `fLaC` marker + STREAMINFO.
+	let desc = a.description.as_ref().expect("flac description");
+	assert_eq!(&desc[..4], b"fLaC");
 }

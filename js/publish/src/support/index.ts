@@ -1,7 +1,12 @@
-// https://bugzilla.mozilla.org/show_bug.cgi?id=1967793
-const isFirefox = navigator.userAgent.toLowerCase().includes("firefox");
+/**
+ * Feature detection for publishing: which codecs encode, whether capture works, and
+ * whether WebTransport works.
+ *
+ * @module
+ */
+import * as Util from "@moq/hang/util";
 
-export type Partial = "full" | "partial" | "none";
+export type Level = "full" | "partial" | "none";
 
 export type Codec = {
 	hardware?: boolean; // undefined when we can't detect hardware acceleration
@@ -10,7 +15,7 @@ export type Codec = {
 
 export type Audio = {
 	aac: boolean;
-	opus: Partial;
+	opus: Level;
 };
 
 export type Video = {
@@ -22,13 +27,13 @@ export type Video = {
 };
 
 export type Full = {
-	webtransport: Partial;
+	webtransport: Level;
 	audio: {
 		capture: boolean;
 		encoding: Audio;
 	};
 	video: {
-		capture: Partial;
+		capture: Level;
 		encoding: Video | undefined;
 	};
 };
@@ -73,7 +78,11 @@ async function videoEncoderSupported(codec: keyof typeof CODECS): Promise<Codec>
 		hardwareAcceleration: "prefer-hardware",
 	});
 
-	const unknown = isFirefox || hardware.config?.hardwareAcceleration !== "prefer-hardware";
+	// Safari always echoes "prefer-hardware" back, so the hint tells us nothing. Treat it like
+	// Firefox and report hardware support as unknown rather than advertising hardware VP9/AV1 it
+	// doesn't have.
+	const unknown =
+		Util.Hacks.isFirefox || Util.Hacks.isSafari || hardware.config?.hardwareAcceleration !== "prefer-hardware";
 
 	return {
 		hardware: unknown ? undefined : hardware.supported === true,
@@ -85,7 +94,7 @@ export async function isSupported(): Promise<Full> {
 	return {
 		// Firefox's WebTransport drops server-initiated bidi streams, so we force the
 		// WebSocket fallback. Report "partial" to surface the degraded path in UI.
-		webtransport: typeof WebTransport !== "undefined" ? (isFirefox ? "partial" : "full") : "partial",
+		webtransport: typeof WebTransport !== "undefined" ? (Util.Hacks.isFirefox ? "partial" : "full") : "partial",
 		audio: {
 			capture: typeof AudioWorkletNode !== "undefined",
 			encoding: {
@@ -99,7 +108,8 @@ export async function isSupported(): Promise<Full> {
 				// @ts-expect-error No typescript types yet.
 				typeof MediaStreamTrackProcessor !== "undefined"
 					? "full"
-					: typeof OffscreenCanvas !== "undefined"
+					: // The fallback drives a <video> element via requestVideoFrameCallback.
+						"requestVideoFrameCallback" in HTMLVideoElement.prototype
 						? "partial"
 						: "none",
 			encoding:

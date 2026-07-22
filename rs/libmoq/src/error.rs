@@ -87,13 +87,13 @@ pub enum Error {
 	#[error("unknown format: {0}")]
 	UnknownFormat(String),
 
-	/// Media decoder initialization failed.
+	/// Initialization failed (e.g. logging setup).
 	#[error("init failed: {0}")]
 	InitFailed(Arc<anyhow::Error>),
 
-	/// Media frame decode failed.
-	#[error("decode failed: {0}")]
-	DecodeFailed(Arc<anyhow::Error>),
+	/// Buffer was not fully consumed.
+	#[error("buffer was not fully consumed")]
+	BufferNotConsumed,
 
 	/// Timestamp value overflow.
 	#[error("timestamp overflow")]
@@ -115,13 +115,21 @@ pub enum Error {
 	#[error("offline")]
 	Offline,
 
+	/// Connection was rejected as unauthorized by the server.
+	#[error("unauthorized")]
+	Unauthorized,
+
+	/// Connection was forbidden by the server.
+	#[error("forbidden")]
+	Forbidden,
+
 	/// Error from the hang media layer.
 	#[error("hang error: {0}")]
 	Hang(#[from] hang::Error),
 
 	/// Error from the moq-mux consumer layer.
 	#[error("mux error: {0}")]
-	Mux(Arc<moq_mux::Error>),
+	Mux(#[from] moq_mux::Error),
 
 	/// Index out of bounds.
 	#[error("no index")]
@@ -133,28 +141,51 @@ pub enum Error {
 
 	/// Error from the moq-audio codec layer.
 	#[error("audio error: {0}")]
-	Audio(Arc<moq_audio::AudioError>),
+	Audio(Arc<moq_audio::Error>),
+
+	/// Error from the moq-video codec layer.
+	#[error("video error: {0}")]
+	Video(Arc<moq_video::Error>),
+
+	/// Invalid JSON passed for a catalog section.
+	#[error("json error: {0}")]
+	Json(Arc<serde_json::Error>),
+
+	/// Error from the moq-json snapshot/stream layer.
+	#[error("json track error: {0}")]
+	JsonTrack(Arc<moq_json::Error>),
 }
 
-impl From<moq_audio::AudioError> for Error {
-	fn from(err: moq_audio::AudioError) -> Self {
+impl From<moq_json::Error> for Error {
+	fn from(err: moq_json::Error) -> Self {
+		match err {
+			moq_json::Error::Net(e) => Error::Moq(e),
+			e => Error::JsonTrack(Arc::new(e)),
+		}
+	}
+}
+
+impl From<serde_json::Error> for Error {
+	fn from(err: serde_json::Error) -> Self {
+		Error::Json(Arc::new(err))
+	}
+}
+
+impl From<moq_audio::Error> for Error {
+	fn from(err: moq_audio::Error) -> Self {
 		Error::Audio(Arc::new(err))
+	}
+}
+
+impl From<moq_video::Error> for Error {
+	fn from(err: moq_video::Error) -> Self {
+		Error::Video(Arc::new(err))
 	}
 }
 
 impl From<tracing::metadata::ParseLevelError> for Error {
 	fn from(err: tracing::metadata::ParseLevelError) -> Self {
 		Error::Level(Arc::new(err))
-	}
-}
-
-impl From<moq_mux::Error> for Error {
-	fn from(err: moq_mux::Error) -> Self {
-		match err {
-			moq_mux::Error::Moq(e) => Error::Moq(e),
-			moq_mux::Error::Hang(e) => Error::Hang(e),
-			e => Error::Mux(Arc::new(e)),
-		}
 	}
 }
 
@@ -174,7 +205,6 @@ impl ffi::ReturnCode for Error {
 			Error::NotFound => -8,
 			Error::UnknownFormat(_) => -9,
 			Error::InitFailed(_) => -10,
-			Error::DecodeFailed(_) => -11,
 			Error::TimestampOverflow(_) => -13,
 			Error::Level(_) => -14,
 			Error::InvalidCode => -15,
@@ -193,8 +223,14 @@ impl ffi::ReturnCode for Error {
 			Error::FrameNotFound => -28,
 			Error::Mux(_) => -29,
 			Error::Audio(_) => -30,
-			Error::GroupNotFound => -31,
-			Error::Native(_) => -32,
+			Error::BufferNotConsumed => -31,
+			Error::GroupNotFound => -32,
+			Error::Native(_) => -33,
+			Error::Unauthorized => -34,
+			Error::Forbidden => -35,
+			Error::Video(_) => -36,
+			Error::Json(_) => -37,
+			Error::JsonTrack(_) => -38,
 		}
 	}
 }

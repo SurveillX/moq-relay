@@ -14,15 +14,19 @@ pub(crate) const NEGOTIATED: [Version; 3] = [
 	Version::Ietf(ietf::Version::Draft14),
 ];
 
-/// ALPN strings for supported versions.
+/// ALPN strings for supported versions, most-preferred first. `ALPNS[0]` is the
+/// newest moq-lite ALPN that both sides converge on.
 ///
-/// Intentionally excludes `ALPN_LITE_05_WIP`: lite-05 is still work-in-progress
-/// and must not be advertised by default. Callers can opt in by including
-/// `Version::Lite(lite::Version::Lite05Wip)` in their [`Versions`] explicitly.
+/// `ALPN_LITE_06_WIP` is deliberately absent: lite-06's wire format is still
+/// work-in-progress, so it is never advertised or negotiated by default. It is only
+/// reachable when both peers explicitly opt in (e.g. `--version moq-lite-06-wip`),
+/// which is enough to exercise it in tests without shipping it to real peers.
 pub const ALPNS: &[&str] = &[
+	ALPN_LITE_05,
 	ALPN_LITE_04,
 	ALPN_LITE_03,
 	ALPN_LITE,
+	ALPN_19,
 	ALPN_18,
 	ALPN_17,
 	ALPN_16,
@@ -34,12 +38,14 @@ pub const ALPNS: &[&str] = &[
 pub(crate) const ALPN_LITE: &str = "moql";
 pub(crate) const ALPN_LITE_03: &str = "moq-lite-03";
 pub(crate) const ALPN_LITE_04: &str = "moq-lite-04";
-pub(crate) const ALPN_LITE_05_WIP: &str = "moq-lite-05-wip";
+pub(crate) const ALPN_LITE_05: &str = "moq-lite-05";
+pub(crate) const ALPN_LITE_06_WIP: &str = "moq-lite-06-wip";
 pub(crate) const ALPN_14: &str = "moq-00";
 pub(crate) const ALPN_15: &str = "moqt-15";
 pub(crate) const ALPN_16: &str = "moqt-16";
 pub(crate) const ALPN_17: &str = "moqt-17";
 pub(crate) const ALPN_18: &str = "moqt-18";
+pub(crate) const ALPN_19: &str = "moqt-19";
 
 /// A MoQ protocol version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -57,12 +63,14 @@ impl Version {
 			0xff0dad02 => Some(Self::Lite(lite::Version::Lite02)),
 			0xff0dad03 => Some(Self::Lite(lite::Version::Lite03)),
 			0xff0dad04 => Some(Self::Lite(lite::Version::Lite04)),
-			0xff0dad05 => Some(Self::Lite(lite::Version::Lite05Wip)),
+			0xff0dad05 => Some(Self::Lite(lite::Version::Lite05)),
+			0xff0dad06 => Some(Self::Lite(lite::Version::Lite06Wip)),
 			0xff00000e => Some(Self::Ietf(ietf::Version::Draft14)),
 			0xff00000f => Some(Self::Ietf(ietf::Version::Draft15)),
 			0xff000010 => Some(Self::Ietf(ietf::Version::Draft16)),
 			0xff000011 => Some(Self::Ietf(ietf::Version::Draft17)),
 			0xff000012 => Some(Self::Ietf(ietf::Version::Draft18)),
+			0xff000013 => Some(Self::Ietf(ietf::Version::Draft19)),
 			_ => None,
 		}
 	}
@@ -74,12 +82,14 @@ impl Version {
 			Self::Lite(lite::Version::Lite02) => 0xff0dad02,
 			Self::Lite(lite::Version::Lite03) => 0xff0dad03,
 			Self::Lite(lite::Version::Lite04) => 0xff0dad04,
-			Self::Lite(lite::Version::Lite05Wip) => 0xff0dad05,
+			Self::Lite(lite::Version::Lite05) => 0xff0dad05,
+			Self::Lite(lite::Version::Lite06Wip) => 0xff0dad06,
 			Self::Ietf(ietf::Version::Draft14) => 0xff00000e,
 			Self::Ietf(ietf::Version::Draft15) => 0xff00000f,
 			Self::Ietf(ietf::Version::Draft16) => 0xff000010,
 			Self::Ietf(ietf::Version::Draft17) => 0xff000011,
 			Self::Ietf(ietf::Version::Draft18) => 0xff000012,
+			Self::Ietf(ietf::Version::Draft19) => 0xff000013,
 		}
 	}
 
@@ -92,12 +102,14 @@ impl Version {
 			ALPN_LITE => None, // Multiple versions share this ALPN, need SETUP negotiation
 			ALPN_LITE_03 => Some(Self::Lite(lite::Version::Lite03)),
 			ALPN_LITE_04 => Some(Self::Lite(lite::Version::Lite04)),
-			ALPN_LITE_05_WIP => Some(Self::Lite(lite::Version::Lite05Wip)),
+			ALPN_LITE_05 => Some(Self::Lite(lite::Version::Lite05)),
+			ALPN_LITE_06_WIP => Some(Self::Lite(lite::Version::Lite06Wip)),
 			ALPN_14 => Some(Self::Ietf(ietf::Version::Draft14)),
 			ALPN_15 => Some(Self::Ietf(ietf::Version::Draft15)),
 			ALPN_16 => Some(Self::Ietf(ietf::Version::Draft16)),
 			ALPN_17 => Some(Self::Ietf(ietf::Version::Draft17)),
 			ALPN_18 => Some(Self::Ietf(ietf::Version::Draft18)),
+			ALPN_19 => Some(Self::Ietf(ietf::Version::Draft19)),
 			_ => None,
 		}
 	}
@@ -105,7 +117,8 @@ impl Version {
 	/// Returns the ALPN string for this version.
 	pub fn alpn(&self) -> &'static str {
 		match self {
-			Self::Lite(lite::Version::Lite05Wip) => ALPN_LITE_05_WIP,
+			Self::Lite(lite::Version::Lite06Wip) => ALPN_LITE_06_WIP,
+			Self::Lite(lite::Version::Lite05) => ALPN_LITE_05,
 			Self::Lite(lite::Version::Lite04) => ALPN_LITE_04,
 			Self::Lite(lite::Version::Lite03) => ALPN_LITE_03,
 			Self::Lite(lite::Version::Lite01 | lite::Version::Lite02) => ALPN_LITE,
@@ -114,6 +127,7 @@ impl Version {
 			Self::Ietf(ietf::Version::Draft16) => ALPN_16,
 			Self::Ietf(ietf::Version::Draft17) => ALPN_17,
 			Self::Ietf(ietf::Version::Draft18) => ALPN_18,
+			Self::Ietf(ietf::Version::Draft19) => ALPN_19,
 		}
 	}
 
@@ -161,25 +175,25 @@ impl FromStr for Version {
 			"moq-lite-02" => Ok(Self::Lite(lite::Version::Lite02)),
 			"moq-lite-03" => Ok(Self::Lite(lite::Version::Lite03)),
 			"moq-lite-04" => Ok(Self::Lite(lite::Version::Lite04)),
-			"moq-lite-05-wip" => Ok(Self::Lite(lite::Version::Lite05Wip)),
+			"moq-lite-05" => Ok(Self::Lite(lite::Version::Lite05)),
+			"moq-lite-06-wip" => Ok(Self::Lite(lite::Version::Lite06Wip)),
 			"moq-transport-14" => Ok(Self::Ietf(ietf::Version::Draft14)),
 			"moq-transport-15" => Ok(Self::Ietf(ietf::Version::Draft15)),
 			"moq-transport-16" => Ok(Self::Ietf(ietf::Version::Draft16)),
 			"moq-transport-17" => Ok(Self::Ietf(ietf::Version::Draft17)),
 			"moq-transport-18" => Ok(Self::Ietf(ietf::Version::Draft18)),
+			"moq-transport-19" => Ok(Self::Ietf(ietf::Version::Draft19)),
 			_ => Err(format!("unknown version: {s}")),
 		}
 	}
 }
 
-#[cfg(feature = "serde")]
 impl serde::Serialize for Version {
 	fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
 		serializer.serialize_str(&self.to_string())
 	}
 }
 
-#[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for Version {
 	fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
 		let s = String::deserialize(deserializer)?;
@@ -225,13 +239,20 @@ impl From<Vec<Version>> for coding::Versions {
 pub struct Versions(Vec<Version>);
 
 impl Versions {
-	/// All supported versions exposed by default.
+	/// All versions exposed by default.
+	///
+	/// `Lite06Wip` is intentionally excluded: its wire format is still work-in-progress,
+	/// so it is not advertised until a caller opts in explicitly (e.g. a pinned
+	/// `version = ["moq-lite-06-wip"]`). It is otherwise a fully-defined version, so an
+	/// opt-in set that includes it negotiates normally.
 	pub fn all() -> Self {
 		Self(vec![
+			Version::Lite(lite::Version::Lite05),
 			Version::Lite(lite::Version::Lite04),
 			Version::Lite(lite::Version::Lite03),
 			Version::Lite(lite::Version::Lite02),
 			Version::Lite(lite::Version::Lite01),
+			Version::Ietf(ietf::Version::Draft19),
 			Version::Ietf(ietf::Version::Draft18),
 			Version::Ietf(ietf::Version::Draft17),
 			Version::Ietf(ietf::Version::Draft16),

@@ -14,7 +14,7 @@ import type { Effect } from "@moq/signals";
  */
 export class CatalogProducer {
 	#value: Catalog.Root = {};
-	#outputs = new Set<Json.Producer<Catalog.Root>>();
+	#outputs = new Set<Json.Snapshot.Producer<Catalog.Root>>();
 
 	/** Edit the catalog in place; the result is published to all current subscribers. */
 	mutate(fn: (catalog: Catalog.Root) => void): void {
@@ -24,9 +24,18 @@ export class CatalogProducer {
 		for (const output of this.#outputs) output.update(value);
 	}
 
-	/** Serve a subscription request: seed it with the current catalog, then forward updates. */
-	serve(track: Moq.Track, effect: Effect): void {
-		const output = new Json.Producer<Catalog.Root>(track);
+	/**
+	 * Serve a subscription request: seed it with the current catalog, then forward updates.
+	 *
+	 * Pass `opts.compression` to DEFLATE-compress this subscriber's frames, so the same catalog can be
+	 * served both plaintext and compressed (e.g. `catalog.json` and `catalog.json.z`).
+	 */
+	serve(track: Moq.Track.Producer, effect: Effect, opts?: { compression?: boolean }): void {
+		const output = new Json.Snapshot.Producer<Catalog.Root>({
+			track,
+			compression: opts?.compression,
+			deltaRatio: 0,
+		});
 		output.update(this.#value);
 
 		this.#outputs.add(output);

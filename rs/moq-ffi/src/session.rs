@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
-use moq_net::Session;
 use url::Url;
 
 use crate::error::MoqError;
 use crate::ffi::Task;
-use crate::origin::MoqOriginProducer;
+use crate::origin::{MoqOriginConsumer, MoqOriginProducer};
 
 struct Client {
 	config: moq_native::ClientConfig,
@@ -15,23 +14,79 @@ struct Client {
 
 impl Client {
 	async fn connect(&self, url: Url) -> Result<Arc<MoqSession>, MoqError> {
-		let client = self
-			.config
-			.clone()
-			.init()
-			.map_err(|err| MoqError::Connect(format!("{err}")))?;
+		let client = self.config.clone().init().map_err(map_connect_error)?;
 
-		let publish = self.publish.as_ref().map(|o| o.inner().consume());
-		let consume = self.consume.as_ref().map(|o| o.inner().clone());
+		// Materialize both origin sides so the session can publish/subscribe and the FFI can
+		// always hand back a publisher/consumer.
+		let (publish, subscribe) = crate::origin::resolve_pair(self.publish.as_ref(), self.consume.as_ref());
 
 		let session = client
-			.with_publish(publish)
-			.with_consume(consume)
+			.with_publisher(&publish)
+			.with_subscriber(subscribe.clone())
 			.connect(url)
 			.await
-			.map_err(|err| MoqError::Connect(format!("{err}")))?;
+			.map_err(map_connect_error)?;
 
-		Ok(Arc::new(MoqSession::new(session)))
+		Ok(Arc::new(MoqSession::new(session, publish, subscribe)))
+	}
+}
+
+fn map_connect_error(err: moq_native::Error) -> MoqError {
+	match err.connect_error() {
+		Some(moq_native::ConnectError::Unauthorized) => MoqError::Unauthorized,
+		Some(moq_native::ConnectError::Forbidden) => MoqError::Forbidden,
+		_ => MoqError::Connect(format!("{err}")),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn maps_native_auth_connect_errors() {
+		assert!(matches!(
+			map_connect_error(moq_native::ConnectError::Unauthorized.into()),
+			MoqError::Unauthorized
+		));
+		assert!(matches!(
+			map_connect_error(moq_native::ConnectError::Forbidden.into()),
+			MoqError::Forbidden
+		));
+	}
+
+	#[test]
+	fn sets_tls_system_roots() {
+		let client = MoqClient::new();
+
+		client.set_tls_system_roots(true);
+		{
+			let state = client.task.lock().expect("client state should be available");
+			assert_eq!(state.config.tls.system_roots, Some(true));
+		}
+
+		client.set_tls_system_roots(false);
+		let state = client.task.lock().expect("client state should be available");
+		assert_eq!(state.config.tls.system_roots, Some(false));
+	}
+
+	#[test]
+	fn sets_tls_client_cert_and_key() {
+		let client = MoqClient::new();
+
+		client.set_tls_cert(Some("cert.pem".into()));
+		client.set_tls_key(Some("key.pem".into()));
+		{
+			let state = client.task.lock().expect("client state should be available");
+			assert_eq!(state.config.tls.cert.as_deref(), Some(std::path::Path::new("cert.pem")));
+			assert_eq!(state.config.tls.key.as_deref(), Some(std::path::Path::new("key.pem")));
+		}
+
+		client.set_tls_cert(None);
+		client.set_tls_key(None);
+		let state = client.task.lock().expect("client state should be available");
+		assert_eq!(state.config.tls.cert, None);
+		assert_eq!(state.config.tls.key, None);
 	}
 }
 
@@ -59,6 +114,61 @@ impl MoqClient {
 	pub fn set_tls_disable_verify(&self, disable: bool) {
 		if let Some(mut state) = self.task.lock() {
 			state.config.tls.disable_verify = Some(disable);
+		}
+	}
+
+	/// Trust these PEM root certificate file(s) instead of the system roots.
+	///
+	/// Pass the paths to PEM-encoded CA certificates. An empty list restores the
+	/// default behavior of using the platform's native root store.
+	pub fn set_tls_roots(&self, paths: Vec<String>) {
+		if let Some(mut state) = self.task.lock() {
+			state.config.tls.root = paths.into_iter().map(Into::into).collect();
+		}
+	}
+
+	/// Configure whether to also trust the platform's native root certificates.
+	///
+	/// By default, system roots are trusted only when no custom roots are configured.
+	/// Set this to `true` to trust system roots in addition to roots from
+	/// `set_tls_roots`, or `false` to trust only custom roots.
+	pub fn set_tls_system_roots(&self, system_roots: bool) {
+		if let Some(mut state) = self.task.lock() {
+			state.config.tls.system_roots = Some(system_roots);
+		}
+	}
+
+	/// Pin the peer to a certificate with one of these SHA-256 fingerprints, encoded as hex.
+	///
+	/// This is the native equivalent of the browser's WebTransport `serverCertificateHashes`
+	/// and accepts the same values a server reports (see `MoqServer.cert_fingerprints`). Use it
+	/// to trust a self-signed certificate without disabling verification. An empty list clears
+	/// any pinned fingerprints.
+	pub fn set_tls_fingerprints(&self, fingerprints: Vec<String>) {
+		if let Some(mut state) = self.task.lock() {
+			state.config.tls.fingerprint = fingerprints;
+		}
+	}
+
+	/// Present this PEM certificate chain when the relay requires mTLS.
+	///
+	/// Only certificates are read from the file; any private keys are ignored. Must be
+	/// paired with `set_tls_key`, otherwise `connect` fails with an incomplete-auth error.
+	/// Pass `None` to clear a previously set path.
+	pub fn set_tls_cert(&self, path: Option<String>) {
+		if let Some(mut state) = self.task.lock() {
+			state.config.tls.cert = path.map(Into::into);
+		}
+	}
+
+	/// Present this PEM private key when the relay requires mTLS.
+	///
+	/// Only the private key is read from the file; any certificates are ignored. Must be
+	/// paired with `set_tls_cert`, otherwise `connect` fails with an incomplete-auth error.
+	/// Pass `None` to clear a previously set path.
+	pub fn set_tls_key(&self, path: Option<String>) {
+		if let Some(mut state) = self.task.lock() {
+			state.config.tls.key = path.map(Into::into);
 		}
 	}
 
@@ -91,6 +201,13 @@ impl MoqClient {
 
 	/// Connect to a MoQ server and wait for the session to be established.
 	///
+	/// Both origin sides are always accessible via [`MoqSession::publisher`] and
+	/// [`MoqSession::consumer`], without the caller constructing a [`MoqOriginProducer`]
+	/// themselves. With neither [`set_publish`](Self::set_publish) nor
+	/// [`set_consume`](Self::set_consume) wired, the two sides share one origin, so a broadcast
+	/// announced on this session is also discoverable through it. Wiring either side opts out of
+	/// that and gives the other side its own fresh origin.
+	///
 	/// Can be cancelled by calling `cancel()`.
 	pub async fn connect(&self, url: String) -> Result<Arc<MoqSession>, MoqError> {
 		let url = Url::parse(&url)?;
@@ -104,17 +221,74 @@ impl MoqClient {
 	}
 }
 
+/// A snapshot of connection statistics for a [`MoqSession`].
+///
+/// Each field is `None` when the transport backend doesn't report that metric (native QUIC
+/// reports all of them; the browser WebTransport reports few or none), or when it isn't yet
+/// available (e.g. `send_rate_bps` before the congestion controller has a window). A `None` is
+/// not the same as a zero value.
+#[derive(uniffi::Record)]
+pub struct MoqConnectionStats {
+	/// Smoothed round-trip time, in microseconds.
+	pub rtt_us: Option<u64>,
+	/// Estimated send bandwidth from the congestion controller, in bits per second.
+	pub send_rate_bps: Option<u64>,
+	/// Estimated receive bandwidth from MoQ PROBE, in bits per second.
+	pub recv_rate_bps: Option<u64>,
+	/// Total bytes sent, including retransmissions and overhead.
+	pub bytes_sent: Option<u64>,
+	/// Total bytes received, including duplicates and overhead.
+	pub bytes_received: Option<u64>,
+	/// Total bytes lost (detected via retransmission or acknowledgement).
+	pub bytes_lost: Option<u64>,
+	/// Total datagrams sent.
+	pub packets_sent: Option<u64>,
+	/// Total datagrams received.
+	pub packets_received: Option<u64>,
+	/// Total datagrams detected as lost.
+	pub packets_lost: Option<u64>,
+}
+
+impl From<moq_net::ConnectionStats> for MoqConnectionStats {
+	fn from(stats: moq_net::ConnectionStats) -> Self {
+		Self {
+			rtt_us: stats.rtt.map(|d| d.as_micros() as u64),
+			send_rate_bps: stats.estimated_send_rate,
+			recv_rate_bps: stats.estimated_recv_rate,
+			bytes_sent: stats.bytes_sent,
+			bytes_received: stats.bytes_received,
+			bytes_lost: stats.bytes_lost,
+			packets_sent: stats.packets_sent,
+			packets_received: stats.packets_received,
+			packets_lost: stats.packets_lost,
+		}
+	}
+}
+
 #[derive(uniffi::Object)]
 pub struct MoqSession {
 	inner: Option<moq_net::Session>,
-	closed: Task<Session>,
+	closed: Task<moq_net::Session>,
+	publisher: Arc<MoqOriginProducer>,
+	consumer: Arc<MoqOriginConsumer>,
 }
 
 impl MoqSession {
-	pub(crate) fn new(session: moq_net::Session) -> Self {
+	pub(crate) fn new(
+		session: moq_net::Session,
+		publish: moq_net::origin::Producer,
+		subscribe: moq_net::origin::Producer,
+	) -> Self {
+		// Eagerly wrap the wired origin sides so each publisher()/consumer()
+		// call hands back the same Arc. `publish` is published into; `subscribe`
+		// is where the remote's broadcasts land (read via its consumer view).
+		let publisher = Arc::new(MoqOriginProducer::from_inner(publish));
+		let consumer = Arc::new(MoqOriginConsumer::from_inner(subscribe.consume()));
 		Self {
 			inner: Some(session.clone()),
 			closed: Task::new(session),
+			publisher,
+			consumer,
 		}
 	}
 }
@@ -122,7 +296,14 @@ impl MoqSession {
 impl Drop for MoqSession {
 	fn drop(&mut self) {
 		let _guard = crate::ffi::RUNTIME.enter();
-		self.inner.take();
+		// Close the transport while the runtime is entered. The backend spawns a
+		// lingering CLOSE task, which panics (aborting under panic=abort) if no reactor
+		// is in context. We can't leave this to the last `Session` clone's drop: that
+		// clone lives in the `closed` task and is released after this guard, off-runtime.
+		// Close-once dedup then makes that trailing drop a no-op.
+		if let Some(session) = self.inner.take() {
+			session.abort(moq_net::Error::Cancel);
+		}
 	}
 }
 
@@ -132,7 +313,7 @@ impl MoqSession {
 	pub async fn closed(&self) -> Result<(), MoqError> {
 		// We have a task to run all of the closed calls juuuuust so they use the same tokio runtime.
 		self.closed
-			.run(|session| async move { session.closed().await.map_err(Into::into) })
+			.run(|session| async move { Err(session.closed().await.into()) })
 			.await
 	}
 
@@ -140,7 +321,7 @@ impl MoqSession {
 	pub fn cancel(&self, code: u32) {
 		let _guard = crate::ffi::RUNTIME.enter();
 		if let Some(inner) = &self.inner {
-			inner.clone().close(moq_net::Error::Remote(code));
+			inner.abort(moq_net::Error::Remote(code));
 		}
 		// NOTE: we don't abort the closed Task because it will be aborted via above ^
 		// We'll get a slightly better error message instead of Cancelled.
@@ -154,5 +335,35 @@ impl MoqSession {
 	/// thing per binding.
 	pub fn shutdown(&self) {
 		self.cancel(0);
+	}
+
+	/// The publish-side origin: where local broadcasts get advertised
+	/// to the remote. Either the producer the caller wired via
+	/// `set_publish` / `set_consume` before connect/accept, or one
+	/// auto-created if neither was set.
+	pub fn publisher(&self) -> Arc<MoqOriginProducer> {
+		self.publisher.clone()
+	}
+
+	/// The subscribe-side origin: a read handle for receiving
+	/// announcements pushed by the remote. Either derived from the
+	/// origin the caller wired via `set_consume`, or auto-created if
+	/// neither was set.
+	pub fn consumer(&self) -> Arc<MoqOriginConsumer> {
+		self.consumer.clone()
+	}
+
+	/// Snapshot the current connection statistics (RTT, bandwidth estimates,
+	/// byte/packet counters). Cheap to call; intended for periodic polling.
+	///
+	/// Individual fields are `None` when the transport backend doesn't report
+	/// them; see [`MoqConnectionStats`].
+	pub fn stats(&self) -> MoqConnectionStats {
+		let _guard = crate::ffi::RUNTIME.enter();
+		self.inner
+			.as_ref()
+			.map(moq_net::Session::stats)
+			.unwrap_or_default()
+			.into()
 	}
 }

@@ -1,103 +1,112 @@
-use bytes::{Buf, BytesMut};
-
 use super::Config;
+use crate::catalog::hang::CatalogExt;
+use crate::container::Frame;
 
 /// Opus importer.
 ///
-/// Initialized from an OpusHead packet. Each input buffer passed to [`decode`](Self::decode)
-/// is published as one hang frame in its own group, so the relay can forward each frame
-/// without waiting for a group boundary. Opus' packet loss concealment handles drops.
-/// Ogg framing is not supported, feed raw Opus packets.
-pub struct Import {
-	catalog: crate::catalog::Producer,
+/// Publishes raw Opus frames (no Ogg framing) to a single moq track. Build it with
+/// [`new`](Self::new), passing the track producer and the
+/// [`catalog::Reserved`](crate::catalog::Reserved) it reserves its rendition from.
+///
+/// Each packet handed to [`decode`](Self::decode) is published in its own group so
+/// the relay can forward it immediately without waiting for a group boundary; Opus'
+/// packet loss concealment handles drops.
+pub struct Import<E: CatalogExt = ()> {
 	track: crate::container::Producer<crate::catalog::hang::Container>,
-	zero: Option<tokio::time::Instant>,
+	rendition: crate::catalog::AudioTrack<E>,
 }
 
-impl Import {
+impl<E: CatalogExt> Import<E> {
+	/// Publish on an existing track producer with a resolved catalog config.
+	///
+	/// Audio can't derive its config from frames, so the caller passes a complete
+	/// [`AudioConfig`](hang::catalog::AudioConfig) (build one from an OpusHead with [`config`], or
+	/// from an out-of-band [`Config`] via `into()`). The rendition publishes immediately.
 	pub fn new(
-		mut broadcast: moq_net::BroadcastProducer,
-		mut catalog: crate::catalog::Producer,
-		config: Config,
-	) -> anyhow::Result<Self> {
-		let track = broadcast.unique_track(".opus")?;
-
-		let mut audio_config = hang::catalog::AudioConfig::new(
-			hang::catalog::AudioCodec::Opus,
-			config.sample_rate,
-			config.channel_count,
-		);
-		audio_config.container = hang::catalog::Container::Legacy;
-
-		tracing::debug!(name = ?track.name, config = ?audio_config, "starting track");
-		catalog.lock().audio.renditions.insert(track.name.clone(), audio_config);
-
-		Ok(Self {
-			catalog,
-			track: crate::container::Producer::new(track, crate::catalog::hang::Container::Legacy),
-			zero: None,
-		})
+		track: moq_net::track::Producer,
+		reserved: crate::catalog::Reserved<E>,
+		config: hang::catalog::AudioConfig,
+	) -> Self {
+		tracing::debug!(name = ?track.name(), ?config, "starting track");
+		let mut rendition = reserved.audio(track.name());
+		rendition.set(config);
+		Self {
+			track: reserved
+				.producer()
+				.media_producer(track, crate::catalog::hang::Container::Legacy),
+			rendition,
+		}
 	}
 
-	/// Returns a reference to the underlying track producer, e.g. for
-	/// monitoring subscriber state via `used()`/`unused()`.
-	pub fn track(&self) -> &moq_net::TrackProducer {
-		self.track.track()
+	/// The MoQ track name this importer publishes on.
+	pub fn name(&self) -> &str {
+		self.track.track().name()
+	}
+
+	/// A watch-only handle to this track's subscriber demand.
+	pub fn demand(&self) -> moq_net::track::Demand {
+		self.track.track().demand()
 	}
 
 	/// Finish the track, flushing the current group.
-	pub fn finish(&mut self) -> anyhow::Result<()> {
+	pub fn finish(&mut self) -> crate::Result<()> {
+		self.rendition.record_group_end(None);
 		self.track.finish()?;
 		Ok(())
 	}
 
+	/// Abort the track with `err` instead of finishing it cleanly, so subscribers
+	/// see the real cause rather than [`moq_net::Error::Dropped`].
+	pub fn abort(&mut self, err: moq_net::Error) {
+		self.track.abort(err);
+	}
+
+	/// Cut the current group at `end` without finishing the track.
+	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> crate::Result<()> {
+		self.rendition.record_group_end(end);
+		self.track.cut(end)?;
+		Ok(())
+	}
+
 	/// Close the current group and open the next one at `sequence`.
-	pub fn seek(&mut self, sequence: u64) -> anyhow::Result<()> {
+	pub fn seek(&mut self, sequence: u64) -> crate::Result<()> {
+		self.rendition.record_group_end(None);
 		self.track.seek(sequence)?;
 		Ok(())
 	}
 
-	pub fn decode<T: Buf>(&mut self, buf: &mut T, pts: Option<crate::container::Timestamp>) -> anyhow::Result<()> {
-		let pts = self.pts(pts)?;
-
-		// Collect the input into a contiguous Bytes payload.
-		let mut payload = BytesMut::with_capacity(buf.remaining());
-		while buf.has_remaining() {
-			let chunk = buf.chunk();
-			payload.extend_from_slice(chunk);
-			let len = chunk.len();
-			buf.advance(len);
-		}
-
-		// Each frame is its own group so the relay can forward it immediately.
-		// Opus' packet loss concealment handles drops.
-		let frame = crate::container::Frame {
-			timestamp: pts,
-			payload: payload.freeze(),
+	/// Publish one Opus packet as its own group, stamping `pts` or a wall clock when absent.
+	pub fn decode<B: moq_net::IntoBytes>(&mut self, frame: B, pts: Option<moq_net::Timestamp>) -> crate::Result<()> {
+		let timestamp = self.rendition.timestamp(pts)?;
+		self.rendition.record_group_end(Some(timestamp));
+		let bytes = frame.as_ref().len();
+		self.track.write(Frame {
+			timestamp,
+			payload: frame.into_bytes(),
 			keyframe: true,
-		};
-
-		self.track.write(frame)?;
-		self.track.finish_group()?;
-
+			duration: None,
+		})?;
+		self.track.cut(None)?;
+		self.rendition.record_frame(timestamp, bytes);
 		Ok(())
-	}
-
-	fn pts(&mut self, hint: Option<crate::container::Timestamp>) -> anyhow::Result<crate::container::Timestamp> {
-		if let Some(pts) = hint {
-			return Ok(pts);
-		}
-
-		let zero = self.zero.get_or_insert_with(tokio::time::Instant::now);
-		Ok(crate::container::Timestamp::from_micros(
-			zero.elapsed().as_micros() as u64
-		)?)
 	}
 }
 
-impl Drop for Import {
-	fn drop(&mut self) {
-		tracing::debug!(name = ?self.track.name, "ending track");
-		self.catalog.lock().audio.renditions.remove(&self.track.name);
+/// Build a catalog config from an OpusHead. Errors on a malformed or empty buffer.
+pub fn config(init: &[u8]) -> crate::Result<hang::catalog::AudioConfig> {
+	let mut buf = init;
+	Ok(Config::parse(&mut buf)?.into())
+}
+
+impl From<Config> for hang::catalog::AudioConfig {
+	/// Build a catalog config from a config resolved out of band (e.g. gstreamer caps).
+	fn from(config: Config) -> Self {
+		let mut audio = hang::catalog::AudioConfig::new(
+			hang::catalog::AudioCodec::Opus,
+			config.sample_rate,
+			config.channel_count,
+		);
+		audio.container = hang::catalog::Container::Legacy;
+		audio
 	}
 }

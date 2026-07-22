@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.12](https://github.com/moq-dev/moq/compare/moq-gst-v0.2.11...moq-gst-v0.2.12) - 2026-07-15
+
+### Fixed
+
+- *(moq-gst)* reconnect the moqsink publisher instead of dying on transport death ([#2240](https://github.com/moq-dev/moq/pull/2240))
+
+## [0.2.11](https://github.com/moq-dev/moq/compare/moq-gst-v0.2.10...moq-gst-v0.2.11) - 2026-07-12
+
+### Other
+
+- updated the following local packages: moq-native
+
+## [0.2.10](https://github.com/moq-dev/moq/compare/moq-gst-v0.2.9...moq-gst-v0.2.10) - 2026-07-04
+
+### Added
+
+- *(moq-mux,moq-gst)* MP3 support for MKV and GStreamer ([#1970](https://github.com/moq-dev/moq/pull/1970))
+
+## [0.2.9](https://github.com/moq-dev/moq/compare/moq-gst-v0.2.8...moq-gst-v0.2.9) - 2026-06-30
+
+### Other
+
+- Backport moq-mux to main (adapted to main's moq-net, no wire/API breaks) ([#1918](https://github.com/moq-dev/moq/pull/1918))
+- moqsink on a bare Element with direct (no-channel) writes ([#1893](https://github.com/moq-dev/moq/pull/1893))
+
+## [0.2.8](https://github.com/moq-dev/moq/compare/moq-gst-v0.2.7...moq-gst-v0.2.8) - 2026-06-23
+
+### Fixed
+
+- *(moq-gst)* deterministic moqsrc pad names so CMAF playback works ([#1809](https://github.com/moq-dev/moq/pull/1809))
+
+### Other
+
+- split CLAUDE.md into per-directory guides ([#1846](https://github.com/moq-dev/moq/pull/1846))
+- fix plugin license + broadcast-aligned timestamps ([#1808](https://github.com/moq-dev/moq/pull/1808))
+
+## [0.2.7](https://github.com/moq-dev/moq/compare/moq-gst-v0.2.6...moq-gst-v0.2.7) - 2026-06-17
+
+### Added
+
+- *(hang)* add Catalog.Producer/Consumer wrapping @moq/json ([#1767](https://github.com/moq-dev/moq/pull/1767))
+
+## [0.2.6](https://github.com/moq-dev/moq/compare/moq-gst-v0.2.5...moq-gst-v0.2.6) - 2026-06-16
+
+### Other
+
+- *(moq-gst)* moqsrc reconcile follow-ups ([#1647](https://github.com/moq-dev/moq/pull/1647)) ([#1683](https://github.com/moq-dev/moq/pull/1683))
+
 ## [0.2.5](https://github.com/moq-dev/moq/compare/moq-gst-v0.2.4...moq-gst-v0.2.5) - 2026-06-10
 
 ### Added

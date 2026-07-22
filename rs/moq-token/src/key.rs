@@ -2,9 +2,9 @@ use crate::error::KeyError;
 use crate::generate::generate;
 use crate::{Algorithm, Claims};
 use base64::Engine;
-use elliptic_curve::SecretKey;
-use elliptic_curve::pkcs8::EncodePrivateKey;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header};
+use p256::elliptic_curve::SecretKey;
+use p256::elliptic_curve::pkcs8::EncodePrivateKey;
 use rsa::BigUint;
 use rsa::pkcs1::EncodeRsaPrivateKey;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -413,7 +413,12 @@ impl Key {
 		Ok(self.encode.get_or_init(|| encoding_key))
 	}
 
-	pub fn decode(&self, token: &str) -> crate::Result<Claims> {
+	/// Verify a token's signature with this key and return its claims.
+	///
+	/// Rejects an expired token (the `exp` claim) and one that grants nothing.
+	/// Scoping the claims to a connection path is a separate step; see
+	/// [`Claims::authorize`].
+	pub fn verify(&self, token: &str) -> crate::Result<Claims> {
 		if !self.operations.contains(&KeyOperation::Verify) {
 			return Err(KeyError::VerifyUnsupported.into());
 		}
@@ -437,7 +442,8 @@ impl Key {
 		Ok(token.claims)
 	}
 
-	pub fn encode(&self, payload: &Claims) -> crate::Result<String> {
+	/// Sign the claims with this key, returning the encoded token.
+	pub fn sign(&self, payload: &Claims) -> crate::Result<String> {
 		if !self.operations.contains(&KeyOperation::Sign) {
 			return Err(KeyError::SignUnsupported.into());
 		}
@@ -450,6 +456,18 @@ impl Key {
 		header.kid = self.kid.as_ref().map(|k| k.to_string());
 		let token = jsonwebtoken::encode(&header, &payload, encode)?;
 		Ok(token)
+	}
+
+	#[doc(hidden)]
+	#[deprecated(note = "renamed to Key::sign")]
+	pub fn encode(&self, payload: &Claims) -> crate::Result<String> {
+		self.sign(payload)
+	}
+
+	#[doc(hidden)]
+	#[deprecated(note = "renamed to Key::verify")]
+	pub fn decode(&self, token: &str) -> crate::Result<Claims> {
+		self.verify(token)
 	}
 
 	/// Generate a key pair for the given algorithm, returning the private and public keys.
@@ -534,7 +552,6 @@ mod tests {
 			root: "test-path".to_string(),
 			publish: vec!["test-pub".into()],
 			subscribe: vec!["test-sub".into()],
-			usid: None,
 			expires: Some(SystemTime::now() + Duration::from_secs(3600)),
 			issued: Some(SystemTime::now()),
 		}
@@ -609,7 +626,7 @@ mod tests {
 	fn test_key_sign_success() {
 		let key = create_test_key();
 		let claims = create_test_claims();
-		let token = key.encode(&claims).unwrap();
+		let token = key.sign(&claims).unwrap();
 
 		assert!(!token.is_empty());
 		assert_eq!(token.matches('.').count(), 2); // JWT format: header.payload.signature
@@ -621,7 +638,7 @@ mod tests {
 		key.operations = [KeyOperation::Verify].into();
 		let claims = create_test_claims();
 
-		let result = key.encode(&claims);
+		let result = key.sign(&claims);
 		assert!(result.is_err());
 		assert!(result.unwrap_err().to_string().contains("key does not support signing"));
 	}
@@ -633,12 +650,11 @@ mod tests {
 			root: "test-path".to_string(),
 			publish: vec![],
 			subscribe: vec![],
-			usid: None,
 			expires: None,
 			issued: None,
 		};
 
-		let result = key.encode(&invalid_claims);
+		let result = key.sign(&invalid_claims);
 		assert!(result.is_err());
 		assert!(
 			result
@@ -652,9 +668,9 @@ mod tests {
 	fn test_key_verify_success() {
 		let key = create_test_key();
 		let claims = create_test_claims();
-		let token = key.encode(&claims).unwrap();
+		let token = key.sign(&claims).unwrap();
 
-		let verified_claims = key.decode(&token).unwrap();
+		let verified_claims = key.verify(&token).unwrap();
 		assert_eq!(verified_claims.root, claims.root);
 		assert_eq!(verified_claims.publish, claims.publish);
 		assert_eq!(verified_claims.subscribe, claims.subscribe);
@@ -665,7 +681,7 @@ mod tests {
 		let mut key = create_test_key();
 		key.operations = [KeyOperation::Sign].into();
 
-		let result = key.decode("some.jwt.token");
+		let result = key.verify("some.jwt.token");
 		assert!(result.is_err());
 		assert!(
 			result
@@ -678,7 +694,7 @@ mod tests {
 	#[test]
 	fn test_key_verify_invalid_token() {
 		let key = create_test_key();
-		let result = key.decode("invalid-token");
+		let result = key.verify("invalid-token");
 		assert!(result.is_err());
 	}
 
@@ -686,10 +702,10 @@ mod tests {
 	fn test_key_verify_path_mismatch() {
 		let key = create_test_key();
 		let claims = create_test_claims();
-		let token = key.encode(&claims).unwrap();
+		let token = key.sign(&claims).unwrap();
 
 		// This test was expecting a path mismatch error, but now decode succeeds
-		let result = key.decode(&token);
+		let result = key.verify(&token);
 		assert!(result.is_ok());
 	}
 
@@ -698,9 +714,9 @@ mod tests {
 		let key = create_test_key();
 		let mut claims = create_test_claims();
 		claims.expires = Some(SystemTime::now() - Duration::from_secs(3600)); // 1 hour ago
-		let token = key.encode(&claims).unwrap();
+		let token = key.sign(&claims).unwrap();
 
-		let result = key.decode(&token);
+		let result = key.verify(&token);
 		assert!(result.is_err());
 	}
 
@@ -711,13 +727,12 @@ mod tests {
 			root: "test-path".to_string(),
 			publish: vec!["".to_string()],
 			subscribe: vec!["".to_string()],
-			usid: None,
 			expires: None,
 			issued: None,
 		};
-		let token = key.encode(&claims).unwrap();
+		let token = key.sign(&claims).unwrap();
 
-		let verified_claims = key.decode(&token).unwrap();
+		let verified_claims = key.verify(&token).unwrap();
 		assert_eq!(verified_claims.root, claims.root);
 		assert_eq!(verified_claims.publish, claims.publish);
 		assert_eq!(verified_claims.subscribe, claims.subscribe);
@@ -731,13 +746,12 @@ mod tests {
 			root: "test-path".to_string(),
 			publish: vec!["test-pub".into()],
 			subscribe: vec!["test-sub".into()],
-			usid: None,
 			expires: Some(SystemTime::now() + Duration::from_secs(3600)),
 			issued: Some(SystemTime::now()),
 		};
 
-		let token = key.encode(&original_claims).unwrap();
-		let verified_claims = key.decode(&token).unwrap();
+		let token = key.sign(&original_claims).unwrap();
+		let verified_claims = key.verify(&token).unwrap();
 
 		assert_eq!(verified_claims.root, original_claims.root);
 		assert_eq!(verified_claims.publish, original_claims.publish);
@@ -959,8 +973,8 @@ mod tests {
 
 		let claims = create_test_claims();
 
-		let token = key.encode(&claims).unwrap();
-		let verified_claims = key.decode(&token).unwrap();
+		let token = key.sign(&claims).unwrap();
+		let verified_claims = key.verify(&token).unwrap();
 
 		assert_eq!(verified_claims.root, claims.root);
 		assert_eq!(verified_claims.publish, claims.publish);
@@ -1065,8 +1079,8 @@ mod tests {
 			assert!(key.is_ok());
 			let key = key.unwrap();
 
-			let token = key.encode(&claims).unwrap();
-			let verified_claims = key.decode(&token).unwrap();
+			let token = key.sign(&claims).unwrap();
+			let verified_claims = key.verify(&token).unwrap();
 			assert_eq!(verified_claims.root, claims.root);
 		}
 	}
@@ -1115,15 +1129,15 @@ mod tests {
 		let key = key.unwrap();
 
 		let claims = create_test_claims();
-		let token = key.encode(&claims).unwrap();
+		let token = key.sign(&claims).unwrap();
 
-		let private_verified_claims = key.decode(&token).unwrap();
+		let private_verified_claims = key.verify(&token).unwrap();
 		assert_eq!(
 			private_verified_claims.root, claims.root,
 			"validation using private key"
 		);
 
-		let public_verified_claims = key.to_public().unwrap().decode(&token).unwrap();
+		let public_verified_claims = key.to_public().unwrap().verify(&token).unwrap();
 		assert_eq!(public_verified_claims.root, claims.root, "validation using public key");
 	}
 
@@ -1138,10 +1152,10 @@ mod tests {
 		let key_384 = key_384.unwrap();
 
 		let claims = create_test_claims();
-		let token = key_256.encode(&claims).unwrap();
+		let token = key_256.sign(&claims).unwrap();
 
 		// Different algorithm should fail verification
-		let result = key_384.decode(&token);
+		let result = key_384.verify(&token);
 		assert!(result.is_err());
 	}
 
@@ -1156,11 +1170,11 @@ mod tests {
 		let key_ps256 = key_ps256.unwrap();
 
 		let claims = create_test_claims();
-		let token = key_rs256.encode(&claims).unwrap();
+		let token = key_rs256.sign(&claims).unwrap();
 
 		// Different algorithm should fail verification
-		let private_result = key_ps256.decode(&token);
-		let public_result = key_ps256.to_public().unwrap().decode(&token);
+		let private_result = key_ps256.verify(&token);
+		let public_result = key_ps256.to_public().unwrap().verify(&token);
 		assert!(private_result.is_err());
 		assert!(public_result.is_err());
 	}
@@ -1335,7 +1349,7 @@ mod tests {
 	#[test]
 	fn test_js_hs256_token_verify() {
 		let key = Key::from_str(JS_HS256_KEY).unwrap();
-		let claims = key.decode(JS_HS256_TOKEN).unwrap();
+		let claims = key.verify(JS_HS256_TOKEN).unwrap();
 		assert_eq!(claims.root, "live");
 		assert_eq!(claims.publish, vec!["camera1"]);
 		assert_eq!(claims.subscribe, vec!["camera1", "camera2"]);
@@ -1350,8 +1364,8 @@ mod tests {
 			subscribe: vec!["sub1".into()],
 			..Default::default()
 		};
-		let token = key.encode(&claims).unwrap();
-		let verified = key.decode(&token).unwrap();
+		let token = key.sign(&claims).unwrap();
+		let verified = key.verify(&token).unwrap();
 		assert_eq!(verified.root, "rust-test");
 		assert_eq!(verified.publish, vec!["pub1"]);
 	}
@@ -1369,7 +1383,7 @@ mod tests {
 	#[test]
 	fn test_js_eddsa_token_verify_with_private_key() {
 		let key = Key::from_str(JS_EDDSA_PRIVATE_KEY).unwrap();
-		let claims = key.decode(JS_EDDSA_TOKEN).unwrap();
+		let claims = key.verify(JS_EDDSA_TOKEN).unwrap();
 		assert_eq!(claims.root, "stream");
 		assert_eq!(claims.publish, vec!["video"]);
 	}
@@ -1377,7 +1391,7 @@ mod tests {
 	#[test]
 	fn test_js_eddsa_token_verify_with_public_key() {
 		let key = Key::from_str(JS_EDDSA_PUBLIC_KEY).unwrap();
-		let claims = key.decode(JS_EDDSA_TOKEN).unwrap();
+		let claims = key.verify(JS_EDDSA_TOKEN).unwrap();
 		assert_eq!(claims.root, "stream");
 		assert_eq!(claims.publish, vec!["video"]);
 	}
@@ -1386,7 +1400,7 @@ mod tests {
 	fn test_js_token_wrong_key_fails() {
 		// Generate a different HS256 key
 		let wrong_key = Key::generate(Algorithm::HS256, None).unwrap();
-		let result = wrong_key.decode(JS_HS256_TOKEN);
+		let result = wrong_key.verify(JS_HS256_TOKEN);
 		assert!(result.is_err());
 	}
 
@@ -1394,7 +1408,7 @@ mod tests {
 	fn test_js_eddsa_token_wrong_key_fails() {
 		// Try verifying EdDSA token with the HS256 key
 		let wrong_key = Key::from_str(JS_HS256_KEY).unwrap();
-		let result = wrong_key.decode(JS_EDDSA_TOKEN);
+		let result = wrong_key.verify(JS_EDDSA_TOKEN);
 		assert!(result.is_err());
 	}
 

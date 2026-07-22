@@ -28,7 +28,7 @@ Here is Big Buck Bunny's `catalog.json` as of 2026-02-02:
         "description": "0164001fffe100196764001fac2484014016ec0440000003004000000c23c60c9201000568ee32c8b0",
         "codedWidth": 1280,
         "codedHeight": 720,
-        "container": "legacy"
+        "container": { "kind": "legacy" }
       }
     }
   },
@@ -39,12 +39,21 @@ Here is Big Buck Bunny's `catalog.json` as of 2026-02-02:
         "sampleRate": 44100,
         "numberOfChannels": 2,
         "bitrate": 283637,
-        "container": "legacy"
+        "container": { "kind": "legacy" }
       }
     }
   }
 }
 ```
+
+### Compression
+
+The catalog is published on two tracks with identical content: `catalog.json` (plain JSON) and `catalog.json.z` (the same JSON, DEFLATE-compressed per group).
+A publisher always serves both; a consumer reads whichever it prefers and defaults to the uncompressed `catalog.json`.
+
+The compression is the group-scoped `deflate-raw` ([RFC 1951](https://www.rfc-editor.org/rfc/rfc1951.html)) stream used by `@moq/json` / `moq-json`, interoperable between the browser and native.
+To read the compressed track, opt in explicitly: pass `--catalog-format hangz` to `moq export`, `CatalogFormat::HangZ` in Rust, or `catalogFormat: "hangz"` to `@moq/watch`.
+The `.hang` broadcast suffix is unchanged: the compressed track is an extra track on the same broadcast, not a different broadcast name.
 
 ### Audio
 
@@ -66,22 +75,47 @@ For example, it's not possible to have a different `flip` or `rotation` value fo
 Each rendition is an extension of [VideoDecoderConfig](https://www.w3.org/TR/webcodecs/#video-decoder-config).
 This is the minimum amount of information required to initialize a video decoder.
 
+### Cross-broadcast renditions
+
+A rendition may set an optional `broadcast` field: a path relative to the broadcast that served the catalog (e.g. `"../source"`), pointing at another broadcast that publishes the actual track.
+A consumer resolves the reference against the catalog broadcast's own path (`..` pops a segment, other segments append) and subscribes to the track on the resolved broadcast over the same connection.
+When the field is absent, the track lives in the same broadcast as the catalog.
+
+This lets a transcoder publish a sidecar catalog that adds new renditions while pointing unchanged ones at the original broadcast, instead of re-publishing those bytes through the transcoder.
+For example, a transcoder consuming `room/source` can publish `room/transcode` whose catalog contains a downscaled `480p` rendition plus the original `1080p` rendition marked `"broadcast": "../source"`.
+A viewer of `room/transcode` then pulls `480p` from the transcoder and `1080p` directly from the source, and the relay dedupes the source subscription with the transcoder's own.
+
+`@moq/watch` resolves the reference automatically. In Rust, the `moq-mux` exporters do the same: they take a `Source::new(origin, path)`, and both the catalog broadcast and any referenced broadcast resolve through the origin over the same connection.
+
 ### Extensions
 
 The base catalog carries only the media sections (`video` and `audio`).
 Applications add their own root sections (for example `scte35`) without modifying hang.
 
-The catalog is a JSON document published through the merge-patch helper (`@moq/json` / `moq-json`), and an extension is just an extra top-level key:
+The catalog is a JSON document published through the merge-patch snapshot helper (the `Snapshot` mode of `@moq/json` / `moq-json`), and an extension is just an extra top-level key:
 
 - **Reading**: the base schema is permissive, so unknown sections pass through validation untouched.
   A base consumer ignores them; an extension reads its own section and treats its absence as "not present".
-  In TypeScript, build an extended schema with `z.extend(Catalog.RootSchema, { scte35: ... })`; in Rust, flatten the catalog into your own struct with `#[serde(flatten)]`.
+  In TypeScript, build an extended schema with `z.extend(Catalog.RootSchema, { scte35: ... })`.
+  In Rust, either flatten the catalog into your own struct with `#[serde(flatten)]` for typed access, or read sections untyped from an `Extra` catalog, which keeps unknown keys as raw JSON (`catalog.section("scte35")`). The `()` default drops sections it doesn't model.
+  The FFI bindings always use the untyped form, one JSON string per section keyed by name (`catalog.sections["scte35"]` in Python, `moq_catalog_get_section()` / `moq_catalog_section_at()` in C).
 - **Writing**: the catalog producer holds one shared document.
-  Each owner edits only its own keys and publishes (`producer.mutate(c => { c.scte35 = ... })` in TypeScript, or the `Deref`/`DerefMut` lock guard from `producer.lock()` in Rust).
+  Each owner edits only its own keys and publishes: `producer.mutate(c => { c.scte35 = ... })` in TypeScript; the `Deref`/`DerefMut` lock guard from `producer.lock()` for a typed Rust extension, or `producer.set_section("scte35", value)` for an untyped one; `broadcast.set_catalog_section("scte35", value)` in Python; `moq_publish_catalog_section()` in C.
   Every edit starts from the latest value, so the base media sections and any extension sections compose instead of clobbering one another.
-  Removing a key publishes a deletion, which a consumer reads as the section being removed.
+  Removing a key publishes a deletion (`producer.remove_section(...)`, `broadcast.remove_catalog_section(...)` in Python, `moq_publish_catalog_section_remove()` in C), which a consumer reads as the section being removed.
 
 This keeps application-specific sections in the application layer while the base catalog stays generic.
+
+### Custom tracks
+
+A custom catalog section can carry its payload inline (for low-rate metadata), or it can reference a separate track in the same broadcast (for a stream of data, e.g. a `meta.json` track or an SCTE-35 event track). The relay treats such a track like any other; only the publisher and consumer give it meaning.
+
+The `@moq/publish` and `@moq/watch` components publish and subscribe to these tracks generically, with no per-application support. Each exposes a low-level track hook, and the application uses `@moq/json` to encode the payload itself:
+
+- **Publish**: `broadcast.publishTrack(name, serve)` runs `serve(track, effect)` per subscriber. For JSON, serve each track from a shared track-less `Json.Snapshot.Producer` (the same fan-out producer the catalog uses, seeding late joiners with the latest value). Advertise the track by writing your own catalog section with `broadcast.catalog.mutate(...)`.
+- **Watch**: `broadcast.subscribeTrack(name, priority, consume)` follows the active broadcast across reconnects. For JSON, wrap the track in a `Json.Snapshot.Consumer` inside `consume`. Read your section back from `broadcast.catalog` (unknown sections pass through the loose schema).
+
+So an application supports something like SCTE-35 entirely in its own code: publish an `scte35` section (and optionally a track) on one side, read it on the other, without hang, `@moq/publish`, or `@moq/watch` knowing anything about SCTE-35.
 
 ## Container
 

@@ -46,30 +46,76 @@ let
     # jemalloc's configure uses -O0 test builds, which conflict with
     # Nix's _FORTIFY_SOURCE hardening (requires -O).
     hardeningDisable = [ "fortify" ];
+    # Auth::new builds a rustls client config up front, which loads native
+    # roots and now errors when none are found. The build sandbox has no
+    # system trust store, so point rustls-native-certs at cacert's bundle
+    # for the check phase (even the http-only auth tests hit this path).
+    nativeBuildInputs = [ final.cacert ];
+    SSL_CERT_FILE = "${final.cacert}/etc/ssl/certs/ca-bundle.crt";
   };
 
   moqCliArgs = crateInfo ../rs/moq-cli/Cargo.toml // {
     src = craneLib.cleanCargoSource ../.;
     cargoExtraArgs = "-p moq-cli";
+    # The crate is `moq-cli`, but its `[[bin]]` ships as `moq`.
+    meta.mainProgram = "moq";
   };
 
   moqTokenCliArgs = crateInfo ../rs/moq-token-cli/Cargo.toml // {
     src = craneLib.cleanCargoSource ../.;
     cargoExtraArgs = "-p moq-token-cli";
-    meta.mainProgram = "moq-token-cli";
+    # The crate is `moq-token-cli`, but its `[[bin]]` ships as `moq-token`.
+    meta.mainProgram = "moq-token";
+  };
+  moqTokenPackage = craneLib.buildPackage moqTokenCliArgs;
+  moqTokenX86DarwinPackage = craneLib.buildPackage (crossX86Darwin moqTokenCliArgs);
+
+  moqBenchArgs = crateInfo ../rs/moq-bench/Cargo.toml // {
+    src = craneLib.cleanCargoSource ../.;
+    cargoExtraArgs = "-p moq-bench";
   };
 
   libmoqInfo = crateInfo ../rs/libmoq/Cargo.toml;
+
+  # The native libraries an external linker must pass alongside libmoq.a.
+  # rs/libmoq/native-libs/ is the single source: build.rs bakes it into moq.pc
+  # and rs/libmoq/CMakeLists.txt reads it for in-tree consumers. This installPhase
+  # substitutes the find_package template directly rather than running CMake, so
+  # format the same list here, matching CMakeLists.txt's MOQ_NATIVE_LIBS_QUOTED.
+  libmoqNativeLibs =
+    let
+      platform =
+        if final.stdenv.hostPlatform.isDarwin then
+          "apple"
+        else if final.stdenv.hostPlatform.isWindows then
+          "windows"
+        else
+          "linux";
+      lines = final.lib.splitString "\n" (builtins.readFile ../rs/libmoq/native-libs/${platform}.txt);
+      entries = builtins.filter (line: line != "" && !(final.lib.hasPrefix "#" line)) lines;
+      quote =
+        entry:
+        if final.lib.hasPrefix "framework:" entry then
+          ''"-framework ${final.lib.removePrefix "framework:" entry}"''
+        else
+          ''"${entry}"'';
+    in
+    final.lib.concatMapStringsSep " " quote entries;
+
   libmoqArgs = libmoqInfo // {
-    # libmoq's build.rs reads moq.pc.in at compile time to generate the
-    # pkgconfig file. craneLib.cleanCargoSource's default filter drops
-    # .pc.in files, which makes build.rs silently skip pkgconfig
-    # generation (see the `if let Ok(template)` in rs/libmoq/build.rs)
+    # libmoq's build.rs reads moq.pc.in and native-libs/*.txt at compile time to
+    # generate the pkgconfig file. craneLib.cleanCargoSource's default filter
+    # drops both, which makes build.rs skip pkgconfig generation (see the
+    # `if let Ok(template)` in rs/libmoq/build.rs) or fail reading the lib list,
     # and the installPhase's `cp .../moq.pc` then fails.
     src = final.lib.cleanSourceWith {
       src = ../.;
       name = "source";
-      filter = path: type: (final.lib.hasSuffix ".pc.in" path) || (craneLib.filterCargoSources path type);
+      filter =
+        path: type:
+        (final.lib.hasSuffix ".pc.in" path)
+        || (final.lib.hasInfix "/rs/libmoq/native-libs/" path)
+        || (craneLib.filterCargoSources path type);
     };
     cargoExtraArgs = "-p libmoq";
     doCheck = false;
@@ -92,19 +138,28 @@ let
       mkdir -p $out/lib/pkgconfig $out/include $out/lib/cmake/moq
 
       # build.rs derives its output dir from OUT_DIR, so a cross --target
-      # build puts the staticlib, header and pkgconfig under target/<triple>/.
-      # Keep the prefix target-aware so the native and cross outputs share
-      # one installPhase.
+      # build puts the staticlib and pkgconfig (under <profile>/lib/) below
+      # target/<triple>/, and the shared header under target/<triple>/include/.
+      # Keep the prefix target-aware so the native and cross outputs share one
+      # installPhase.
       tdir="target''${CARGO_BUILD_TARGET:+/$CARGO_BUILD_TARGET}"
       cp "$tdir/release/libmoq.a" $out/lib/
       cp "$tdir/include/moq.h" $out/include/
-      cp "$tdir/pkgconfig/moq.pc" $out/lib/pkgconfig/
+      cp "$tdir/release/lib/pkgconfig/moq.pc" $out/lib/pkgconfig/
+
+      # build.rs points libdir at the raw cargo target tree's profile dir
+      # (../.. from the .pc). The installPhase puts the staticlib in $out/lib
+      # alongside pkgconfig/, so rewrite libdir one level up. Match the whole
+      # line so this is independent of the profile name and the exact .pc
+      # template. Stays relocatable; no build-time path leaks into the store.
+      sed -i 's#^libdir=.*#libdir=''${pcfiledir}/..#' $out/lib/pkgconfig/moq.pc
 
       major_version="$(echo "${libmoqInfo.version}" | cut -d. -f1)"
       substitute ${../rs/libmoq/cmake/moq-config.cmake.in} \
         $out/lib/cmake/moq/moq-config.cmake \
         --subst-var-by LIB_FILE libmoq.a \
-        --subst-var-by VERSION "${libmoqInfo.version}"
+        --subst-var-by VERSION "${libmoqInfo.version}" \
+        --subst-var-by MOQ_NATIVE_LIBS_QUOTED ${final.lib.escapeShellArg libmoqNativeLibs}
       substitute ${../rs/libmoq/cmake/moq-config-version.cmake.in} \
         $out/lib/cmake/moq/moq-config-version.cmake \
         --subst-var-by VERSION "${libmoqInfo.version}" \
@@ -193,6 +248,14 @@ let
       fi
     '';
   };
+
+  # CI checks (clippy / doc / test) run as plain cargo via `just rs ci`, not
+  # through crane/`nix flake check`. The self-hosted runner caches compilation
+  # per-crate with sccache (wired into the runner environment, not here), so a
+  # Cargo.lock change recompiles only the changed crate + its reverse-deps.
+  # ./target stays ephemeral (wiped per job) -- the persistent CARGO_TARGET_DIR
+  # growth that the old crane checks were introduced to fix doesn't recur.
+  # Release artifacts still build via crane `buildPackage` below.
 in
 {
   moq-relay = craneLib.buildPackage moqRelayArgs;
@@ -201,8 +264,13 @@ in
   moq-cli = craneLib.buildPackage moqCliArgs;
   moq-cli-x86_64-apple-darwin = craneLib.buildPackage (crossX86Darwin moqCliArgs);
 
-  moq-token-cli = craneLib.buildPackage moqTokenCliArgs;
-  moq-token-cli-x86_64-apple-darwin = craneLib.buildPackage (crossX86Darwin moqTokenCliArgs);
+  moq-bench = craneLib.buildPackage moqBenchArgs;
+  moq-bench-x86_64-apple-darwin = craneLib.buildPackage (crossX86Darwin moqBenchArgs);
+
+  moq-token = moqTokenPackage;
+  moq-token-cli = moqTokenPackage;
+  moq-token-x86_64-apple-darwin = moqTokenX86DarwinPackage;
+  moq-token-cli-x86_64-apple-darwin = moqTokenX86DarwinPackage;
 
   moq-boy = craneLib.buildPackage (
     crateInfo ../rs/moq-boy/Cargo.toml

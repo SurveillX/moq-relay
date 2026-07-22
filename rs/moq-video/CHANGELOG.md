@@ -7,6 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `decode::Frame::resize(width, height)`: a scaled copy of a decoded frame,
+  preserving the timestamp. A CUDA frame (NVDEC output) resizes on the GPU with
+  a box-filter kernel (vendored PTX, JIT-compiled by the driver; no CUDA
+  toolkit needed to build) and stays in device memory; CPU frames resize with a
+  SIMD bilinear convolution. Fans one decoded stream out to several sizes, e.g.
+  a transcode ladder sharing one decoder.
+
+- H.264 / H.265 hardware decode on Linux via NVIDIA NVDEC, behind the
+  default-on `nvdec` feature. Decoded frames stay in CUDA device memory and
+  feed the NVENC encoder zero-copy through the new
+  `encode::Encoder::encode(frame)` entry point; `decode::Config::resize` scales
+  in the decoder for free. Like NVENC, everything is dlopen'd at runtime, so a
+  driverless host falls back to the next decoder.
+- AV1 hardware decode on Linux via NVDEC for 8-bit 4:2:0 sources. AV1 is
+  decode-only and emits the same CUDA NV12 frame type as H.264/H.265, so it can
+  feed existing NVENC H.264/H.265 transcode output.
+- `decode::Frame` pixels are now private: `into_i420()` returns the packed
+  I420 bytes (downloading a GPU frame), replacing the public `data` field, and
+  each frame's `timestamp_us` now rides the decoder (correct across reordering)
+  instead of echoing the input.
+- `decode::Decoder::new` takes the full `decode::Config` instead of just the
+  `Kind`, so decoder knobs (like `resize`) stay additive.
+
+- `decode::Decoder` is public: the payload-in, frames-out layer under
+  `decode::Consumer`, for callers that don't read from a plain track
+  subscription (e.g. a transcoder decoding individually fetched groups).
+- `encode::Encoder::encode_i420`: encode a tightly-packed I420 frame directly,
+  the zero-conversion input path for callers that already hold I420 (decoder
+  output), alongside the existing `encode_rgba`.
+- Native H.264 decode: a `decode` module mirroring `encode`, with a
+  `decode::Consumer` (the counterpart to `moq-audio`'s `AudioConsumer`) that
+  subscribes to an H.264 track and returns raw I420 frames. Backends are
+  VideoToolbox (macOS) and openh264 (portable software fallback); no ffmpeg.
+- H.264 hardware decode on Windows via Media Foundation. The Microsoft decoder
+  MFT runs synchronously with a Direct3D11 device bound to it, so the decode
+  happens on the GPU through DXVA (NVDEC / Intel / AMD); output textures are
+  downloaded to I420. Requires a GPU: a GPU-less host falls back to openh264.
+- Windows screen capture (`capture::Source::Display`) via DXGI Desktop
+  Duplication. Duplicates a monitor on a Direct3D11 device, copies each desktop
+  frame to a staging texture, and converts BGRA to I420. Whole-monitor capture;
+  select one with a bare index or `display:{index}`. The read loop paces to the
+  target frame rate and re-emits the last frame while the screen is static.
+- H.265 decode: the `decode` module now handles H.265 tracks (hvc1 and hev1)
+  alongside H.264, sharing the same length-prefixed -> Annex-B front end.
+  VideoToolbox (macOS) and Media Foundation (Windows, DXVA) decode it on
+  hardware, pulling VPS/SPS/PPS out of each keyframe to build the format
+  description. There is no software H.265 decoder, so H.265 has no fallback below
+  the hardware path. The macOS VideoToolbox path is verified by an end-to-end
+  HEVC encode -> decode round-trip on Apple silicon; the Windows path is
+  unverified on hardware (the test box had no HEVC decoder MFT installed).
+- H.265 encode via the NVENC backend (Linux, `nvenc` feature). The codec is
+  selected by `encode::Codec`; the NVENC HEVC path shares the H.264 preset / GOP
+  / rate-control setup and emits Annex-B with inline VPS/SPS/PPS.
+- NVENC H.264/H.265 encode verified end-to-end on a Linux + NVIDIA box (RTX 30
+  series), which fixed three correctness bugs the software-only path had hidden:
+  a forced keyframe now emits an IDR (via the `FORCEIDR` picture flag, since
+  picture-type decision makes NVENC ignore `pictureType`); every IDR, not just
+  the first, carries inline SPS/PPS (VPS too for HEVC) so a mid-stream subscriber
+  can join at any keyframe (`repeatSPSPPS` + `idrPeriod`); and the input frame is
+  copied at NVENC's real buffer pitch (e.g. 512 for a 320-wide buffer) instead of
+  a flat copy that sheared the image, which also drops the former width-multiple-
+  of-64 restriction. Requires a matching `moq-nvenc` change
+  (`force_idr` flag + pitched `BufferLock::write_rows`).
+
+## [0.0.6](https://github.com/moq-dev/moq/compare/moq-video-v0.0.5...moq-video-v0.0.6) - 2026-06-30
+
+### Other
+
+- Backport moq-mux to main (adapted to main's moq-net, no wire/API breaks) ([#1918](https://github.com/moq-dev/moq/pull/1918))
+
+## [0.0.5](https://github.com/moq-dev/moq/compare/moq-video-v0.0.4...moq-video-v0.0.5) - 2026-06-23
+
+### Added
+
+- *(catalog)* expose untyped catalog extensions via moq-ffi and libmoq ([#1886](https://github.com/moq-dev/moq/pull/1886))
+
+## [0.0.4](https://github.com/moq-dev/moq/compare/moq-video-v0.0.3...moq-video-v0.0.4) - 2026-06-16
+
+### Other
+
+- *(moq-cli)* remove the capture feature ([#1728](https://github.com/moq-dev/moq/pull/1728))
+
 ## [0.0.3](https://github.com/moq-dev/moq/compare/moq-video-v0.0.2...moq-video-v0.0.3) - 2026-06-10
 
 ### Added

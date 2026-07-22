@@ -16,21 +16,21 @@ import moq
 
 
 async def publish(url: str, broadcast_name: str, track_name: str, tls_verify: bool) -> None:
-    broadcast = moq.BroadcastProducer()
-    track = broadcast.publish_track(track_name)
-
     async with moq.Client(url, tls_verify=tls_verify) as client:
-        client.publish(broadcast_name, broadcast)
+        broadcast = client.create_broadcast(broadcast_name)
+        track = broadcast.publish_track(track_name)
         print(f"publishing {broadcast_name!r} track={track_name!r} at {url}")
 
         while True:
             now = datetime.now(timezone.utc).replace(microsecond=0)
+            timestamp_us = int(now.timestamp()) * 1_000_000
             group = track.append_group()
-            group.write_frame(now.strftime("%Y-%m-%d %H:%M:").encode())
+            group.write_frame(now.strftime("%Y-%m-%d %H:%M:").encode(), timestamp_us)
 
             current_minute = now.minute
             while now.minute == current_minute:
-                group.write_frame(now.strftime("%S").encode())
+                timestamp_us = int(now.timestamp()) * 1_000_000
+                group.write_frame(now.strftime("%S").encode(), timestamp_us)
                 await asyncio.sleep(1 - datetime.now(timezone.utc).microsecond / 1_000_000)
                 now = datetime.now(timezone.utc).replace(microsecond=0)
 
@@ -43,15 +43,15 @@ async def subscribe(url: str, broadcast_name: str, track_name: str, tls_verify: 
         broadcast = await client.announced_broadcast(broadcast_name)
 
         print(f"subscribed to {broadcast_name!r} track={track_name!r}")
-        track = broadcast.subscribe_track(track_name)
+        track = await broadcast.subscribe_track(track_name)
 
         async for group in track:
             prefix: bytes | None = None
             async for frame in group:
                 if prefix is None:
-                    prefix = frame
+                    prefix = frame.payload
                     continue
-                print(f"{prefix.decode()}{frame.decode()}")
+                print(f"{prefix.decode()}{frame.payload.decode()}")
 
 
 def main() -> None:

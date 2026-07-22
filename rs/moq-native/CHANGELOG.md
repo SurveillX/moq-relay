@@ -7,6 +7,152 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.3](https://github.com/moq-dev/moq/compare/moq-native-v0.18.2...moq-native-v0.18.3) - 2026-07-18
+
+### Fixed
+
+- *(moq-native)* silence gso_disabled dead-code in default builds ([#2360](https://github.com/moq-dev/moq/pull/2360))
+
+### Other
+
+- *(deps)* bump the cargo group across 1 directory with 3 updates ([#2273](https://github.com/moq-dev/moq/pull/2273))
+
+## [0.18.2](https://github.com/moq-dev/moq/compare/moq-native-v0.18.1...moq-native-v0.18.2) - 2026-07-16
+
+### Fixed
+
+- *(moq-native)* accept SNI-less raw QUIC connections ([#2294](https://github.com/moq-dev/moq/pull/2294))
+
+### Other
+
+- *(moq-native)* ignore flaky quiche_webtransport (SIGSEGV on CI) ([#2300](https://github.com/moq-dev/moq/pull/2300))
+
+## [0.18.1](https://github.com/moq-dev/moq/compare/moq-native-v0.18.0...moq-native-v0.18.1) - 2026-07-15
+
+### Fixed
+
+- *(moq-gst)* reconnect the moqsink publisher instead of dying on transport death ([#2240](https://github.com/moq-dev/moq/pull/2240))
+
+## [0.18.0](https://github.com/moq-dev/moq/compare/moq-native-v0.17.8...moq-native-v0.18.0) - 2026-07-12
+
+### Added
+
+- *(moq-native)* add quic::Client/quic::Server transport config ([#2161](https://github.com/moq-dev/moq/pull/2161))
+
+## [0.17.8](https://github.com/moq-dev/moq/compare/moq-native-v0.17.7...moq-native-v0.17.8) - 2026-07-09
+
+### Added
+
+- *(moq-native)* optional client TLS host_name (SNI) override ([#2107](https://github.com/moq-dev/moq/pull/2107))
+- *(moq-net,js/net)* add moq-transport draft-19 (moqt-19) ([#2106](https://github.com/moq-dev/moq/pull/2106))
+
+### Fixed
+
+- *(moq-native)* compile for target_os="android" under jni 0.22 ([#2105](https://github.com/moq-dev/moq/pull/2105))
+
+## [0.17.7](https://github.com/moq-dev/moq/compare/moq-native-v0.17.6...moq-native-v0.17.7) - 2026-07-05
+
+### Other
+
+- *(deps)* bump the cargo group with 9 updates ([#2098](https://github.com/moq-dev/moq/pull/2098))
+
+## [0.17.6](https://github.com/moq-dev/moq/compare/moq-native-v0.17.5...moq-native-v0.17.6) - 2026-07-04
+
+### Added
+
+- *(moq-mux)* Opus audio over MPEG-TS (import + export) ([#1965](https://github.com/moq-dev/moq/pull/1965))
+- *(moq-net)* moq-lite-05 SETUP message + PATH parameter ([#1954](https://github.com/moq-dev/moq/pull/1954))
+
+### Fixed
+
+- *(moq-native)* verify server certs with the OS platform verifier ([#1968](https://github.com/moq-dev/moq/pull/1968))
+
+### Other
+
+- resolve client protocol versions once, thread into QUIC backends ([#2065](https://github.com/moq-dev/moq/pull/2065))
+- Enable TCP keepalive on the HTTP/WebSocket listener and RTMP client ([#2069](https://github.com/moq-dev/moq/pull/2069))
+- Move the connect URL and connect/serve loops into moq-native ([#2048](https://github.com/moq-dev/moq/pull/2048))
+- [codex] Future-proof moq-net metadata structs ([#2046](https://github.com/moq-dev/moq/pull/2046))
+- Fold the internal listener into --server-bind (one authenticated accept path) ([#1974](https://github.com/moq-dev/moq/pull/1974))
+- *(rs)* upgrade reqwest 0.12 -> 0.13 across the workspace ([#1972](https://github.com/moq-dev/moq/pull/1972))
+
+## [0.17.5](https://github.com/moq-dev/moq/compare/moq-native-v0.17.4...moq-native-v0.17.5) - 2026-06-30
+
+### Added
+
+- *(moq-rtmp)* RTMP/E-RTMP gateway + enhanced-RTMP FLV codecs on main ([#1914](https://github.com/moq-dev/moq/pull/1914))
+- *(moq-relay)* reuse client TLS for outbound auth HTTP; make --client-tls-* flags consistent ([#1901](https://github.com/moq-dev/moq/pull/1901))
+- *(moq-native)* unified client TLS verification + quiche backend support ([#1902](https://github.com/moq-dev/moq/pull/1902))
+
+### Other
+
+- [codex] support relay HTTPS cert arrays ([#1932](https://github.com/moq-dev/moq/pull/1932))
+
+## [0.17.4](https://github.com/moq-dev/moq/compare/moq-native-v0.17.3...moq-native-v0.17.4) - 2026-06-23
+
+### Added
+
+- *(relay)* unauthenticated internal listener over qmux (tcp:// + unix://) ([#1810](https://github.com/moq-dev/moq/pull/1810))
+
+### Fixed
+
+- *(moq-native)* back off when a session flaps instead of busy-looping ([#1806](https://github.com/moq-dev/moq/pull/1806))
+
+### Other
+
+- Skip dual-stack bind tests when the host lacks IPv6 ([#1878](https://github.com/moq-dev/moq/pull/1878))
+- release ([#1774](https://github.com/moq-dev/moq/pull/1774))
+
+## [0.17.3](https://github.com/moq-dev/moq/compare/moq-native-v0.17.2...moq-native-v0.17.3) - 2026-06-19
+
+### Added
+
+- *(relay)* close sessions when the token/cert expires ([#1789](https://github.com/moq-dev/moq/pull/1789))
+
+### Fixed
+
+- *(moq-native)* keep has_peer_certificate as deprecated, release 0.17.3 ([#1790](https://github.com/moq-dev/moq/pull/1790))
+
+## [0.17.2](https://github.com/moq-dev/moq/compare/moq-native-v0.17.1...moq-native-v0.17.2) - 2026-06-17
+
+### Fixed
+
+- *(moq-relay,moq-native)* stop the cert-reload busy loop, then dedupe FileWatcher ([#1773](https://github.com/moq-dev/moq/pull/1773))
+
+### Other
+
+- release ([#1676](https://github.com/moq-dev/moq/pull/1676))
+
+## [0.17.1](https://github.com/moq-dev/moq/compare/moq-native-v0.17.0...moq-native-v0.17.1) - 2026-06-16
+
+### Added
+
+- *(moq-native)* mTLS + preferred_address on the noq backend ([#1741](https://github.com/moq-dev/moq/pull/1741))
+- *(moq-native)* add --tls-system-roots to trust custom and system roots together ([#1711](https://github.com/moq-dev/moq/pull/1711))
+- *(moq-native)* enable BBR3 congestion control on the noq backend ([#1706](https://github.com/moq-dev/moq/pull/1706))
+- certificate pinning for native and browser clients ([#1698](https://github.com/moq-dev/moq/pull/1698))
+
+### Fixed
+
+- *(moq-native)* watch current dir for bare-filename certs ([#1751](https://github.com/moq-dev/moq/pull/1751))
+- *(moq-net)* don't tear down session on unauthorized announce-interest ([#1717](https://github.com/moq-dev/moq/pull/1717))
+- *(native)* surface terminal auth connect errors ([#1649](https://github.com/moq-dev/moq/pull/1649))
+
+### Other
+
+- *(moq-native)* bump to 0.17.1 to unblock moq-relay release ([#1755](https://github.com/moq-dev/moq/pull/1755))
+- Windows support: dual-stack IPv4/IPv6 sockets, setup.bat, and `just dev` ([#1732](https://github.com/moq-dev/moq/pull/1732))
+- *(moq-native)* remove tokio-console instrumentation ([#1699](https://github.com/moq-dev/moq/pull/1699))
+- *(demo,doc)* drop redundant /anon prefix from localhost URLs ([#1688](https://github.com/moq-dev/moq/pull/1688))
+
+### Added
+
+- *(moq-native)* support mTLS client certificates and `preferred_address` on the noq backend, bringing it to parity with quinn.
+
+### Changed
+
+- *(moq-native)* rename `Error::MtlsQuinnOnly` to `Error::MtlsUnsupported`; mTLS now works on both the quinn and noq backends.
+
 ## [0.17.0](https://github.com/moq-dev/moq/compare/moq-native-v0.16.3...moq-native-v0.17.0) - 2026-06-10
 
 ### Added

@@ -2,7 +2,7 @@
 //! successful MoQ handshake between a Quinn server and client.
 //!
 //! This covers both ALPN-based version negotiation (moq-lite-03/04,
-//! moqt-15/16/17/18) and SETUP-based version negotiation (moql, moq-00) used
+//! moqt-15/16/17/18/19) and SETUP-based version negotiation (moql, moq-00) used
 //! by older protocol versions like moq-transport-14 and moq-lite-01/02.
 //!
 //! It also tests WebTransport, which uses sub-protocols in the HTTP CONNECT
@@ -24,7 +24,6 @@ async fn connect_with_version(version: &str) {
 
 	// Provide a dummy origin so the MoQ handshake has something to negotiate.
 	let origin = moq_native::moq_net::Origin::random().produce();
-	let consumer = origin.consume();
 
 	// ── client ──────────────────────────────────────────────────────
 	let mut client_config = moq_native::ClientConfig::default();
@@ -37,12 +36,13 @@ async fn connect_with_version(version: &str) {
 	let url: url::Url = format!("moqt://localhost:{}", addr.port()).parse().unwrap();
 
 	// Run server accept and client connect concurrently.
+	let server_origin = origin.clone();
 	let server_handle = tokio::spawn(async move {
 		let request = server.accept().await.expect("no incoming connection");
-		request.with_publish(consumer).ok().await
+		request.with_publisher(&server_origin).ok().await
 	});
 
-	let client = client.with_publish(origin.consume());
+	let client = client.with_publisher(&origin);
 	let client_result = client.connect(url).await;
 
 	let server_result = server_handle.await.expect("server task panicked");
@@ -74,7 +74,6 @@ async fn connect_with_webtransport(version: Option<&str>) {
 	let addr = server.local_addr().expect("failed to get local addr");
 
 	let origin = moq_native::moq_net::Origin::random().produce();
-	let consumer = origin.consume();
 
 	// ── client ──────────────────────────────────────────────────────
 	let mut client_config = moq_native::ClientConfig::default();
@@ -88,12 +87,13 @@ async fn connect_with_webtransport(version: Option<&str>) {
 	// Use https:// URL to trigger the WebTransport path.
 	let url: url::Url = format!("https://localhost:{}", addr.port()).parse().unwrap();
 
+	let server_origin = origin.clone();
 	let server_handle = tokio::spawn(async move {
 		let request = server.accept().await.expect("no incoming connection");
-		request.with_publish(consumer).ok().await
+		request.with_publisher(&server_origin).ok().await
 	});
 
-	let client = client.with_publish(origin.consume());
+	let client = client.with_publisher(&origin);
 	let client_result = client.connect(url).await;
 
 	let server_result = server_handle.await.expect("server task panicked");
@@ -163,6 +163,12 @@ async fn version_moq_transport_18() {
 	connect_with_version("moq-transport-18").await;
 }
 
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn version_moq_transport_19() {
+	connect_with_version("moq-transport-19").await;
+}
+
 // ── WebTransport: sub-protocol negotiation ──────────────────────────
 // Browser clients use WebTransport (h3 ALPN) and negotiate the MoQ
 // protocol version via sub-protocols in the HTTP CONNECT request.
@@ -219,4 +225,10 @@ async fn webtransport_moq_transport_17() {
 #[tokio::test]
 async fn webtransport_moq_transport_18() {
 	connect_with_webtransport(Some("moq-transport-18")).await;
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn webtransport_moq_transport_19() {
+	connect_with_webtransport(Some("moq-transport-19")).await;
 }

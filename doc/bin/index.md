@@ -26,8 +26,25 @@ Another tool does the encoding (ex. ffmpeg), making it easy to pipe any media in
 
 ```bash
 # Publish your webcam
-ffmpeg -f avfoundation -i "0" -f mp4 - | moq-cli publish https://relay.example.com my-stream
+ffmpeg -f avfoundation -i "0" -f mpegts - | moq --client-connect https://relay.example.com/anon --broadcast my-stream import ts
 ```
+
+## [moq-rtc](/bin/rtc)
+
+A WebRTC <-> MoQ gateway. Speaks WHIP (publish) and WHEP (subscribe) in either
+HTTP role, so it can accept incoming peers (OBS, browsers) or dial out to a
+remote WebRTC server. Ingest and egress both work for H.264, VP8, VP9, and Opus.
+
+## [moq-hls](/bin/hls)
+
+An HLS <-> MoQ gateway. Serves a MoQ broadcast as HLS (fetching media on demand) and
+Low-Latency HLS over HTTP, or imports a remote HLS playlist into MoQ.
+
+## [moq-rtmp](/bin/rtmp)
+
+An RTMP / enhanced-RTMP -> MoQ ingest gateway. Accepts RTMP from any encoder
+(OBS, ffmpeg) and publishes it into MoQ, supporting H.264/HEVC/AV1/VP9 and
+AAC/Opus/AC-3.
 
 ## [OBS Plugin](/bin/obs)
 

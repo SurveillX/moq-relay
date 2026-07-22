@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.37](https://github.com/moq-dev/moq/compare/moq-token-cli-v0.5.36...moq-token-cli-v0.5.37) - 2026-07-18
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.5.36](https://github.com/moq-dev/moq/compare/moq-token-cli-v0.5.35...moq-token-cli-v0.5.36) - 2026-07-17
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.5.35](https://github.com/moq-dev/moq/compare/moq-token-cli-v0.5.34...moq-token-cli-v0.5.35) - 2026-07-15
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.5.34](https://github.com/moq-dev/moq/compare/moq-token-cli-v0.5.33...moq-token-cli-v0.5.34) - 2026-07-12
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.5.33](https://github.com/moq-dev/moq/compare/moq-token-cli-v0.5.32...moq-token-cli-v0.5.33) - 2026-07-05
+
+### Other
+
+- [codex] rename moq token binary ([#2082](https://github.com/moq-dev/moq/pull/2082))
+
+## [0.5.32](https://github.com/moq-dev/moq/compare/moq-token-cli-v0.5.31...moq-token-cli-v0.5.32) - 2026-06-30
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.5.31](https://github.com/moq-dev/moq/compare/moq-token-cli-v0.5.30...moq-token-cli-v0.5.31) - 2026-06-19
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.5.30](https://github.com/moq-dev/moq/compare/moq-token-cli-v0.5.29...moq-token-cli-v0.5.30) - 2026-06-16
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.5.29](https://github.com/moq-dev/moq/compare/moq-token-cli-v0.5.28...moq-token-cli-v0.5.29) - 2026-06-04
 
 ### Other

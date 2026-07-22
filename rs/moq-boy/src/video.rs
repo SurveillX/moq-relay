@@ -19,8 +19,8 @@ use crate::emulator::{HEIGHT, WIDTH};
 /// Frames are submitted via `try_frame()` (non-blocking, drops if full).
 pub struct VideoEncoder {
 	tx: tokio::sync::mpsc::Sender<EncoderMsg>,
-	/// Clone of the video track producer, for monitoring used/unused.
-	pub track: moq_net::TrackProducer,
+	/// Watch-only handle to the video track, for monitoring used/unused.
+	pub demand: moq_net::track::Demand,
 	force_keyframe: Arc<AtomicBool>,
 	/// Latest encode duration in microseconds.
 	encode_duration: Arc<AtomicU64>,
@@ -33,10 +33,11 @@ struct EncoderMsg {
 }
 
 impl VideoEncoder {
-	pub fn spawn(broadcast: moq_net::BroadcastProducer, catalog: moq_mux::catalog::Producer) -> Self {
+	pub fn spawn(broadcast: moq_net::broadcast::Producer, catalog: moq_mux::catalog::Producer) -> Self {
 		let (tx, rx) = tokio::sync::mpsc::channel(4);
-		let producer = moq_video::encode::Producer::new(broadcast, catalog).expect("failed to create avc3 producer");
-		let track = producer.track().expect("avc3 track is eagerly created").clone();
+		let producer = moq_video::encode::Producer::new(broadcast, catalog, moq_video::encode::Codec::H264)
+			.expect("failed to create avc3 producer");
+		let demand = producer.demand();
 
 		let force_keyframe = Arc::new(AtomicBool::new(false));
 		let encode_duration = Arc::new(AtomicU64::new(0));
@@ -49,7 +50,7 @@ impl VideoEncoder {
 
 		Self {
 			tx,
-			track,
+			demand,
 			force_keyframe,
 			encode_duration,
 			_thread: thread,
@@ -88,8 +89,8 @@ fn encoder_thread(
 		let enc = match encoder.as_mut() {
 			Some(enc) => enc,
 			None => {
-				// Game Boy is 160x144; force software (libx264) since hardware
-				// encoders can reject such tiny resolutions.
+				// Game Boy is 160x144; force the openh264 software encoder since
+				// hardware encoders can reject such tiny resolutions.
 				let mut config = moq_video::encode::Config::new(WIDTH, HEIGHT, 60);
 				config.kind = moq_video::encode::Kind::Software;
 				match moq_video::encode::Encoder::new(&config) {
@@ -104,7 +105,7 @@ fn encoder_thread(
 
 		let keyframe = force_keyframe.swap(false, Ordering::AcqRel);
 		let start = Instant::now();
-		match enc.encode_rgba(&msg.rgba, WIDTH, HEIGHT, keyframe) {
+		match enc.encode_rgba(&msg.rgba, moq_video::Size::new(WIDTH, HEIGHT), keyframe) {
 			Ok(packets) => {
 				if let Err(e) = producer.publish(packets, msg.ts) {
 					// Publish only fails once the track/broadcast is gone, which

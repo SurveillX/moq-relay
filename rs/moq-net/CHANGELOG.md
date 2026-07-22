@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.18](https://github.com/moq-dev/moq/compare/moq-net-v0.1.17...moq-net-v0.1.18) - 2026-07-15
+
+### Fixed
+
+- *(moq-net)* resolve reordered track aliases ([#2262](https://github.com/moq-dev/moq/pull/2262))
+
+## [0.1.17](https://github.com/moq-dev/moq/compare/moq-net-v0.1.16...moq-net-v0.1.17) - 2026-07-12
+
+### Other
+
+- expose a Prometheus /metrics endpoint for node traffic ([#2172](https://github.com/moq-dev/moq/pull/2172))
+- Path memory sharing + 32 max parts enforcement ([#2156](https://github.com/moq-dev/moq/pull/2156))
+
+## [0.1.16](https://github.com/moq-dev/moq/compare/moq-net-v0.1.15...moq-net-v0.1.16) - 2026-07-09
+
+### Added
+
+- *(moq-net,js/net)* add moq-transport draft-19 (moqt-19) ([#2106](https://github.com/moq-dev/moq/pull/2106))
+
+## [0.1.15](https://github.com/moq-dev/moq/compare/moq-net-v0.1.14...moq-net-v0.1.15) - 2026-07-05
+
+### Fixed
+
+- moq-net wasm compatibility ([#2085](https://github.com/moq-dev/moq/pull/2085))
+
+### Other
+
+- Route subscribes through dynamic origins ([#2094](https://github.com/moq-dev/moq/pull/2094))
+- [codex] backport moq-wasm to main ([#2086](https://github.com/moq-dev/moq/pull/2086))
+
+## [0.1.14](https://github.com/moq-dev/moq/compare/moq-net-v0.1.13...moq-net-v0.1.14) - 2026-07-04
+
+### Added
+
+- *(moq-net)* hook up the rest of moq-lite-05 wire (TRACK_INFO, SUBSCRIBE_END, frame timestamps) ([#1963](https://github.com/moq-dev/moq/pull/1963))
+- *(moq-net)* moq-lite-05 SETUP message + PATH parameter ([#1954](https://github.com/moq-dev/moq/pull/1954))
+
+### Other
+
+- Avoid moq-net and hang release breakage ([#2077](https://github.com/moq-dev/moq/pull/2077))
+- [codex] Future-proof moq-net metadata structs ([#2046](https://github.com/moq-dev/moq/pull/2046))
+- track announcement byte usage in stats ([#1953](https://github.com/moq-dev/moq/pull/1953))
+
+## [0.1.13](https://github.com/moq-dev/moq/compare/moq-net-v0.1.12...moq-net-v0.1.13) - 2026-06-30
+
+### Added
+
+- *(moq-net)* add OriginProducer::dynamic + infallible OriginConsumer::request_broadcast ([#1913](https://github.com/moq-dev/moq/pull/1913))
+
+### Other
+
+- Backport moq-mux to main (adapted to main's moq-net, no wire/API breaks) ([#1918](https://github.com/moq-dev/moq/pull/1918))
+
+## [0.1.12](https://github.com/moq-dev/moq/compare/moq-net-v0.1.11...moq-net-v0.1.12) - 2026-06-23
+
+### Added
+
+- *(moq-net)* raise max frame size to 32 MiB to match the group cache cap ([#1816](https://github.com/moq-dev/moq/pull/1816))
+
+### Fixed
+
+- *(moq-net)* bound frame size in create_frame/append_frame ([#1882](https://github.com/moq-dev/moq/pull/1882))
+
+## [0.1.11](https://github.com/moq-dev/moq/compare/moq-net-v0.1.10...moq-net-v0.1.11) - 2026-06-16
+
+### Fixed
+
+- *(moq-net)* don't tear down session on unauthorized announce-interest ([#1717](https://github.com/moq-dev/moq/pull/1717))
+- *(moq-net)* release cached state when a producer is aborted or dropped ([#1715](https://github.com/moq-dev/moq/pull/1715))
+
+### Other
+
+- rework Producer::poll/wait to a read-only predicate that returns a Mut ([#1735](https://github.com/moq-dev/moq/pull/1735))
+
 ## [0.1.10](https://github.com/moq-dev/moq/compare/moq-net-v0.1.9...moq-net-v0.1.10) - 2026-06-10
 
 ### Added

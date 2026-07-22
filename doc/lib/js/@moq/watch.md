@@ -70,7 +70,11 @@ a real bundler (the examples below).
 - `paused`: Pause playback (boolean)
 - `muted`: Mute audio (boolean)
 - `volume`: Audio volume (0 to 1, default: 1)
-- `catalog-format`: Catalog format. One of `"hang"`, `"msf"` (see [MSF](/concept/standard/msf)), or `"manual"` (supply the catalog yourself). When omitted, the format is auto-detected from the broadcast `name` extension (`.hang` or `.msf`), falling back to `"hang"`.
+- `reload`: Wait for (re)announcement before subscribing (default: true). Ignored when the relay does not support broadcast discovery, which subscribes immediately instead of waiting forever.
+- `latency`: Latency target. `"real-time"` (default) derives it from RTT, or a number sets a fixed jitter buffer in ms. Collapses `latency-min` and `latency-max` to one value (minimize latency).
+- `latency-min`: Latency floor (the jitter/startup buffer). Same units as `latency`; leaves the ceiling untouched.
+- `latency-max`: Latency ceiling. `"real-time"` (default) minimizes latency; a number caps at that many ms. A ceiling above the floor enables [buffered playback](#buffered-playback): build up a buffer from future-dated frames instead of skipping ahead.
+- `catalog-format`: Catalog format. One of `"hang"`, `"hangz"` (the [DEFLATE-compressed](/concept/layer/hang#compression) `catalog.json.z` track), `"msf"` (see [MSF](/concept/standard/msf)), or `"manual"` (supply the catalog yourself). When omitted, the format is auto-detected from the broadcast `name` extension (`.hang` or `.msf`), falling back to `"hang"`. `"hangz"` is opt-in only and never auto-detected (it shares the `.hang` suffix).
 
 ## Catalog Formats
 
@@ -139,9 +143,109 @@ el.catalog = myCatalog;
 > `"msf"`) tears down the previous fetch loop, which clears `catalog`. Set the
 > catalog *after* switching to `"manual"`, not before.
 
+## Buffered playback
+
+Latency is a **range**, `[latency-min, latency-max]`. By default the range is
+collapsed (`latency` sets both to one value) and `@moq/watch` minimizes latency:
+it anchors playback to the earliest frame seen relative to its timestamp and skips
+ahead whenever the buffer grows past the target. That is right for live
+conferencing, but wrong for content written *faster than real-time* with
+timestamps in the future, such as a text-to-speech response streamed all at once.
+
+Open the range, by setting a `latency-max` above the floor, to anchor playback to
+the first frame received and play through at the encoded pace. The buffer is
+allowed to float anywhere between the floor and the ceiling without skipping:
+
+```html
+<moq-watch url="https://relay.example.com/anon" name="bot/tts.hang"
+    latency-min="100" latency-max="30000">
+    <canvas></canvas>
+</moq-watch>
+```
+
+In JavaScript, `latency` takes either a scalar (collapsed, minimize) or a range
+object. The `latencyMin` / `latencyMax` properties are read-modify-write sugar
+over the same `latency` value:
+
+```typescript
+const el = document.querySelector("moq-watch")!;
+el.latency = { min: 100, max: 30_000 }; // floor 100ms, ceiling 30s
+// equivalently, set the bounds independently:
+el.latencyMin = 100;     // floor: start after 100ms buffered
+el.latencyMax = 30_000;  // ceiling: never skip until 30s buffered
+```
+
+`latency-min` is the jitter/startup buffer (it can also be `"real-time"` for an
+adaptive floor). `latency-max` is the ceiling, and it has two forms:
+
+- a **number** (ms): buffer freely up to the cap, then skip ahead, so latency
+  stays at most that far behind the newest frame.
+- **`"real-time"`** (the default) or any value `<= latency-min`: collapsed, i.e.
+  today's minimize-latency behavior.
+
+The ceiling is always finite: the buffer is bounded by `latency-max` rather than
+growing without limit. The mechanism is the same in every case: the playhead is
+anchored on the first frame and only re-anchored (skipped forward) when keeping it
+would push latency past `latency-max`. Minimize is just the degenerate case where
+the ceiling equals the floor.
+
+The buffered lookahead is held cheaply. The decoded audio ring only holds the
+**floor** (`latency-min`) worth of PCM; everything above it stays upstream as
+encoded frames, and the decoder applies backpressure (stops decoding ahead) until
+the playhead nears each frame. So a large `latency-max` costs encoded bytes, not
+seconds of decoded PCM.
+
+At each new utterance, call `reset()` to flush the audio buffer and re-anchor
+playback to the next frame. The producer can interrupt by writing a new utterance
+(optionally on a new track) and the viewer calls `reset()` to drop whatever was
+still buffered:
+
+```typescript
+el.reset();
+```
+
+This removes the need to pace writes on the producer: emit the whole response as
+fast as possible with correct (future) timestamps, and `reset()` on interruption.
+
+> Set the range before the broadcast starts decoding; changing it mid-stream
+> takes effect on the next decoder.
+
+### Custom tracks and catalog sections
+
+A broadcast can carry arbitrary application tracks (for example a `meta.json`
+metadata track) alongside the media. An application advertises them in its own
+catalog section (the [catalog root](/concept/layer/hang#extensions) is a loose
+object, so unknown sections pass through to `broadcast.catalog`).
+`subscribeTrack(name, priority, consume)` follows the active broadcast across
+reconnects and runs `consume(track, effect)` each time it becomes active. Decode
+the payload yourself with `@moq/json`:
+
+```typescript
+import * as Json from "@moq/json";
+import { Signals } from "@moq/watch";
+
+// The app's own catalog section, read back from the loose catalog.
+const section = broadcast.catalog.peek()?.scte35;
+
+const scte35 = new Signals.Signal<{ splices: number[] } | undefined>(undefined);
+broadcast.subscribeTrack("scte35.json", 100, (track, effect) => {
+    const consumer = new Json.Snapshot.Consumer<{ splices: number[] }>(track);
+    effect.spawn(async () => {
+        for (;;) {
+            const next = await Promise.race([effect.cancel, consumer.next()]);
+            if (next === undefined) break;
+            scte35.set(next);
+        }
+    });
+});
+```
+
+The component exposes everything via its `broadcast` property
+(`el.broadcast.subscribeTrack(...)`).
+
 ## UI Overlay
 
-Import `@moq/watch/ui` for a Web Component overlay with buffering indicator, stats panel, and playback controls:
+Import `@moq/watch/ui` for a Web Component overlay with buffering indicator, unsupported-codec indicator, stats panel, and playback controls:
 
 ```html
 <script type="module">
@@ -164,13 +268,20 @@ The `<moq-watch-ui>` element automatically discovers the nested `<moq-watch>` an
 
 ```typescript
 import * as Watch from "@moq/watch";
+import { Signal } from "@moq/signals";
+
+// Inputs are read-only on the component, so keep a handle to anything you want to change later.
+const reload = new Signal(true);
 
 const broadcast = new Watch.Broadcast({
     connection,
     enabled: true,
     name: "alice.hang",
-    reload: true,
+    reload,
 });
+
+// Subscribe immediately instead of waiting for an announcement.
+reload.set(false);
 ```
 
 ## Related Packages

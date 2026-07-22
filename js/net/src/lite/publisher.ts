@@ -1,20 +1,51 @@
 import { type Dispose, Signal } from "@moq/signals";
-import type { Broadcast } from "../broadcast.ts";
-import type { Group } from "../group.ts";
+import type * as broadcast from "../broadcast.ts";
+import type * as group from "../group.ts";
 import * as Path from "../path.ts";
 import { type Stream, Writer } from "../stream.ts";
-import type { Track } from "../track.ts";
-import { error } from "../util/error.ts";
-import { Announce, AnnounceInit, type AnnounceInterest } from "./announce.ts";
+import { Timescale } from "../time.ts";
+import type * as track from "../track.ts";
+import { error, reason } from "../util/error.ts";
+import { AnnounceInit, AnnounceOk, type AnnounceRequest, encodeAnnounceBroadcast } from "./announce.ts";
+import { Datagram as DatagramMessage } from "./datagram.ts";
+import * as DatagramStream from "./datagram_stream.ts";
+import type { Fetch } from "./fetch.ts";
 import { Group as GroupMessage } from "./group.ts";
 import type { Origin } from "./origin.ts";
 import { Probe } from "./probe.ts";
-import { encodeSubscribeResponse, type Subscribe, SubscribeOk, SubscribeUpdate } from "./subscribe.ts";
-import { Version } from "./version.ts";
+import {
+	encodeSubscribeResponse,
+	type Subscribe,
+	SubscribeEnd,
+	SubscribeOk,
+	SubscribeStart,
+	SubscribeUpdate,
+} from "./subscribe.ts";
+import { TrackInfo as TrackInfoMessage, type Track as TrackMessage } from "./track.ts";
+import { hasAnnounceId, hasAnnounceOk, hasDatagrams, Version } from "./version.ts";
 
 const PROBE_INTERVAL = 100; // ms
 const PROBE_MAX_AGE = 10_000; // ms
 const PROBE_MAX_DELTA = 0.25;
+
+/** Map a signed delta to an unsigned zigzag varint value (mirrors Rust `VarInt::from_zigzag`). */
+function zigzag(delta: bigint): bigint {
+	return delta >= 0n ? delta << 1n : (-delta << 1n) - 1n;
+}
+
+// The TRACK stream, implicit SUBSCRIBE acceptance, and SUBSCRIBE_START/END are
+// all lite-05+.
+function supportsTrackStream(version: Version): boolean {
+	switch (version) {
+		case Version.DRAFT_01:
+		case Version.DRAFT_02:
+		case Version.DRAFT_03:
+		case Version.DRAFT_04:
+			return false;
+		default:
+			return true;
+	}
+}
 
 /**
  * Handles publishing broadcasts and managing their lifecycle.
@@ -33,9 +64,21 @@ export class Publisher {
 
 	#quic: WebTransport;
 
+	// The one writer for the outbound datagram stream (getWriter locks it), acquired once at
+	// construction when this version + transport carry datagrams, released in close(). Its
+	// presence is the gate: undefined means datagrams aren't served on this connection. All
+	// subscriptions share it, since a second getWriter on the same stream would throw.
+	#datagramWriter?: WritableStreamDefaultWriter<Uint8Array>;
+
 	// Our published broadcasts.
 	// It's a signal so we can live update any announce streams.
-	#broadcasts = new Signal<Map<Path.Valid, Broadcast> | undefined>(new Map());
+	#broadcasts = new Signal<Map<Path.Valid, broadcast.Producer> | undefined>(new Map());
+
+	// TRACK_INFO is immutable per track, so resolve it from the application once
+	// (via a throwaway subscribe whose info() resolves when the app calls accept)
+	// and reuse it for every later TRACK request of the same track. Keyed by
+	// `broadcast\0track`. A rejected lookup is evicted so a retry can re-probe.
+	#trackInfo = new Map<string, Promise<TrackInfoMessage>>();
 
 	/**
 	 * Creates a new Publisher instance.
@@ -49,20 +92,26 @@ export class Publisher {
 		this.#quic = quic;
 		this.version = version;
 		this.origin = origin;
+
+		// Grab the datagram writer up front when the transport carries datagrams (no group
+		// fallback, so it stays undefined otherwise). One writer for all subscriptions.
+		if (hasDatagrams(version)) {
+			this.#datagramWriter = DatagramStream.datagramWriter(quic);
+		}
 	}
 
 	/**
 	 * Publishes a broadcast with any associated tracks.
 	 * @param name - The broadcast to publish
 	 */
-	publish(path: Path.Valid, broadcast: Broadcast) {
+	publish(path: Path.Valid, broadcast: broadcast.Producer) {
 		this.#broadcasts.mutate((broadcasts) => {
 			if (!broadcasts) throw new Error("closed");
 			broadcasts.set(path, broadcast);
 		});
 
 		// Remove the broadcast from the lookup when it's closed.
-		void broadcast.closed.finally(() => {
+		void broadcast.closed.then(() => {
 			this.#broadcasts.mutate((broadcasts) => {
 				broadcasts?.delete(path);
 			});
@@ -76,7 +125,7 @@ export class Publisher {
 	 *
 	 * @internal
 	 */
-	async runAnnounce(msg: AnnounceInterest, stream: Stream) {
+	async runAnnounce(msg: AnnounceRequest, stream: Stream) {
 		console.debug(`announce: prefix=${msg.prefix}`);
 
 		// Send initial announcements
@@ -92,6 +141,11 @@ export class Publisher {
 			active.add(suffix);
 		}
 
+		// Lite06+: announce ids. Every active we send implicitly assigns the next
+		// per-stream ordinal; ended references the id instead of repeating the path.
+		let nextAnnounceId = 0n;
+		const announceIds = new Map<Path.Valid, bigint>();
+
 		switch (this.version) {
 			case Version.DRAFT_01:
 			case Version.DRAFT_02: {
@@ -99,20 +153,38 @@ export class Publisher {
 				await init.encode(stream.writer, this.version);
 				break;
 			}
-			default:
-				// Draft03+: send individual Announce messages for initial state.
+			default: {
+				if (!hasAnnounceOk(this.version)) {
+					// Draft03/04: send individual Announce messages, stamping our origin as a hop.
+					for (const suffix of active) {
+						await encodeAnnounceBroadcast(
+							stream.writer,
+							{ status: "active", suffix, hops: [this.origin] },
+							this.version,
+						);
+					}
+					break;
+				}
+
+				// Report our origin id once via AnnounceOk and the count of initial announces
+				// that follow; the subscriber stamps our origin onto each hop chain, so we omit it.
+				const ok = new AnnounceOk(this.origin, active.size);
+				await ok.encode(stream.writer, this.version);
 				for (const suffix of active) {
-					const wire = new Announce({ suffix, active: true, hops: [this.origin] });
-					await wire.encode(stream.writer, this.version);
+					if (hasAnnounceId(this.version)) {
+						announceIds.set(suffix, nextAnnounceId++);
+					}
+					await encodeAnnounceBroadcast(stream.writer, { status: "active", suffix, hops: [] }, this.version);
 				}
 				break;
+			}
 		}
 
 		// Wait for updates to the broadcasts.
 		for (;;) {
 			// TODO Make a better helper within Signals.
 			let dispose!: Dispose;
-			const changed = new Promise<Map<Path.Valid, Broadcast> | undefined>((resolve) => {
+			const changed = new Promise<Map<Path.Valid, broadcast.Producer> | undefined>((resolve) => {
 				dispose = this.#broadcasts.changed(resolve);
 			});
 
@@ -130,19 +202,29 @@ export class Publisher {
 				newActive.add(suffix);
 			}
 
-			// Announce any new broadcasts.
+			// Announce any new broadcasts. Lite05+ reports our origin once via AnnounceOk, so
+			// the subscriber stamps it onto each hop chain; older versions stamp it here.
 			for (const added of newActive.difference(active)) {
 				console.debug(`announce: broadcast=${added} active=true`);
-				const wire = new Announce({ suffix: added, active: true, hops: [this.origin] });
-				await wire.encode(stream.writer, this.version);
+				const hops = hasAnnounceOk(this.version) ? [] : [this.origin];
+				if (hasAnnounceId(this.version)) {
+					announceIds.set(added, nextAnnounceId++);
+				}
+				await encodeAnnounceBroadcast(stream.writer, { status: "active", suffix: added, hops }, this.version);
 			}
 
-			// Announce any removed broadcasts.
-			// Ended announces don't need hops — the peer matches on path only.
+			// Announce any removed broadcasts. Lite06+ retracts by announce id;
+			// older versions repeat the path (ended announces don't need hops).
 			for (const removed of active.difference(newActive)) {
 				console.debug(`announce: broadcast=${removed} active=false`);
-				const wire = new Announce({ suffix: removed, active: false });
-				await wire.encode(stream.writer, this.version);
+				if (hasAnnounceId(this.version)) {
+					const id = announceIds.get(removed);
+					announceIds.delete(removed);
+					if (id === undefined) continue; // never announced
+					await encodeAnnounceBroadcast(stream.writer, { status: "endedId", id }, this.version);
+				} else {
+					await encodeAnnounceBroadcast(stream.writer, { status: "ended", suffix: removed }, this.version);
+				}
 			}
 
 			// NOTE: This is kind of a hack that won't work with a rapid UNANNOUNCE/ANNOUNCE cycle.
@@ -167,15 +249,43 @@ export class Publisher {
 			return;
 		}
 
-		const track = broadcast.subscribe(msg.track, msg.priority);
+		const track = broadcast.subscribe(msg.track, { priority: msg.priority });
+
+		// The best-effort datagram loop, started once serving begins. It parks when the
+		// track finishes (recvDatagram returns undefined), so #runTrack alone ends the
+		// subscription; awaited during teardown so it doesn't outlive the subscription.
+		let datagrams: Promise<void> | undefined;
 
 		try {
-			const info = new SubscribeOk({ priority: msg.priority });
-			await encodeSubscribeResponse(stream.writer, { ok: info }, this.version);
+			let timescale: Timescale = Timescale.MILLI;
+
+			if (supportsTrackStream(this.version)) {
+				// Lite-05+ accepts implicitly: no SUBSCRIBE_OK (the immutable
+				// properties live in TRACK_INFO), and the resolved range arrives as
+				// SUBSCRIBE_START / SUBSCRIBE_END emitted from #runTrack.
+				//
+				// The timescale is an immutable property, so serving MUST use exactly
+				// what TRACK_INFO advertised. It comes from the producer's accept(), so
+				// they always agree. Awaiting info() also surfaces a rejected track
+				// (accept never called, track closed) as an error here, which resets the
+				// stream.
+				const info = await track.info();
+				timescale = info.timescale;
+			} else {
+				// Older drafts acknowledge with SUBSCRIBE_OK and stream frames verbatim.
+				const ok = new SubscribeOk({ priority: msg.priority });
+				await encodeSubscribeResponse(stream.writer, { ok }, this.version);
+			}
 
 			console.debug(`publish ok: broadcast=${msg.broadcast} track=${track.name}`);
 
-			const serving = this.#runTrack(msg.id, msg.broadcast, track, stream.writer);
+			const serving = this.#runTrack(msg.id, msg.broadcast, track, stream.writer, timescale);
+
+			// Serve datagrams concurrently with groups whenever the transport carries them
+			// (the writer exists iff so). No group fallback: otherwise they simply aren't sent.
+			if (this.#datagramWriter) {
+				datagrams = this.#runDatagrams(msg.id, track, timescale);
+			}
 
 			for (;;) {
 				const decode = SubscribeUpdate.decodeMaybe(stream.reader, this.version);
@@ -187,17 +297,57 @@ export class Publisher {
 					console.debug(
 						`subscribe update: broadcast=${msg.broadcast} track=${track.name} priority=${result.priority}`,
 					);
-					track.updatePriority(result.priority);
+					track.update({ priority: result.priority });
 				}
 			}
 
 			console.debug(`publish done: broadcast=${msg.broadcast} track=${track.name}`);
 			stream.close();
 			track.close();
+			// track.close ends the datagram loop; wait so it doesn't leak past teardown.
+			await datagrams;
 		} catch (err: unknown) {
 			const e = error(err);
-			console.warn(`publish error: broadcast=${msg.broadcast} track=${track.name} error=${e.message}`);
+			console.warn(`publish error: broadcast=${msg.broadcast} track=${track.name} error=${reason(e)}`);
 			track.close(e);
+			stream.abort(e);
+			await datagrams;
+		}
+	}
+
+	/**
+	 * Handles a FETCH stream by serving one group as bare frame records (lite-05+).
+	 *
+	 * @internal
+	 */
+	async runFetch(msg: Fetch, stream: Stream) {
+		if (!supportsTrackStream(this.version)) {
+			stream.writer.reset(new Error("fetch requires moq-lite-05 or newer"));
+			return;
+		}
+
+		const broadcast = this.#broadcasts.peek()?.get(msg.broadcast);
+		if (!broadcast) {
+			console.debug(`fetch unknown: broadcast=${msg.broadcast}`);
+			stream.writer.reset(new Error("not found"));
+			return;
+		}
+
+		let group: group.Consumer | undefined;
+		try {
+			// The timescale is immutable, so serve exactly what TRACK_INFO advertised.
+			const info = await this.#resolveTrackInfo(msg.broadcast, msg.track);
+			group = await broadcast.track(msg.track).fetchGroup(msg.group, { priority: msg.priority });
+			await this.#runFetchGroup(group, stream.writer, Timescale(info.timescale));
+			console.debug(`fetch done: broadcast=${msg.broadcast} track=${msg.track} group=${msg.group}`);
+			stream.close();
+			group.close();
+		} catch (err: unknown) {
+			const e = error(err);
+			console.warn(
+				`fetch error: broadcast=${msg.broadcast} track=${msg.track} group=${msg.group} error=${reason(e)}`,
+			);
+			group?.close(e);
 			stream.abort(e);
 		}
 	}
@@ -211,7 +361,17 @@ export class Publisher {
 	 *
 	 * @internal
 	 */
-	async #runTrack(sub: bigint, broadcast: Path.Valid, track: Track, stream: Writer) {
+	async #runTrack(sub: bigint, broadcast: Path.Valid, track: track.Subscriber, stream: Writer, timescale: Timescale) {
+		// Lite-05+ resolves the range on the subscribe stream: SUBSCRIBE_START once the
+		// first group is known, SUBSCRIBE_END when the track finishes.
+		const emitRange = supportsTrackStream(this.version);
+		let startSent = false;
+
+		// The exclusive end of the delivered range. recvGroup is arrival-ordered rather than
+		// sequence-ordered, so this tracks the max and not the last group seen. 0 is already
+		// the encoding for a track that produced no groups.
+		let end = 0;
+
 		try {
 			for (;;) {
 				const next = track.recvGroup();
@@ -221,7 +381,17 @@ export class Publisher {
 					break;
 				}
 
-				void this.#runGroup(sub, group);
+				if (emitRange && !startSent) {
+					startSent = true;
+					await encodeSubscribeResponse(stream, { start: new SubscribeStart(group.sequence) }, this.version);
+				}
+				end = Math.max(end, group.sequence + 1);
+
+				void this.#runGroup(sub, group, timescale);
+			}
+
+			if (emitRange) {
+				await encodeSubscribeResponse(stream, { end: new SubscribeEnd(end) }, this.version);
 			}
 
 			console.debug(`publish close: broadcast=${broadcast} track=${track.name}`);
@@ -229,9 +399,96 @@ export class Publisher {
 			stream.close();
 		} catch (err: unknown) {
 			const e = error(err);
-			console.warn(`publish error: broadcast=${broadcast} track=${track.name} error=${e.message}`);
+			console.warn(`publish error: broadcast=${broadcast} track=${track.name} error=${reason(e)}`);
 			track.close(e);
 			stream.reset(e);
+		}
+	}
+
+	/**
+	 * Answers a TRACK stream (0x6) with a single TRACK_INFO, then FINs.
+	 *
+	 * @internal
+	 */
+	async runTrackInfo(msg: TrackMessage, stream: Stream) {
+		try {
+			const info = await this.#resolveTrackInfo(msg.broadcast, msg.track);
+			await info.encode(stream.writer, this.version);
+			console.debug(`track info: broadcast=${msg.broadcast} track=${msg.track}`);
+			stream.close();
+		} catch (err) {
+			console.debug(`track unknown: broadcast=${msg.broadcast} track=${msg.track}`);
+			stream.writer.reset(error(err));
+		}
+	}
+
+	// Resolve (and cache) a track's immutable TRACK_INFO by asking the application.
+	// `broadcast.track(name).info()` triggers a TrackRequest the app answers with
+	// accept(TrackInfo); only the immutable properties are needed (not the groups).
+	// Cached because they're fixed for the track's lifetime. Rejects if the broadcast
+	// or track is unavailable.
+	#resolveTrackInfo(broadcast: Path.Valid, track: string): Promise<TrackInfoMessage> {
+		const key = `${broadcast}\0${track}`;
+		const cached = this.#trackInfo.get(key);
+		if (cached) return cached;
+
+		const pending = (async () => {
+			const published = this.#broadcasts.peek()?.get(broadcast);
+			if (!published) throw new Error("not found");
+
+			const info = await published.track(track).info();
+			return new TrackInfoMessage({
+				priority: info.priority,
+				ordered: info.ordered,
+				// Publisher Max Latency: the publisher's retention bound, advertised so
+				// relays re-serve with the same window.
+				latencyMax: info.latencyMax,
+				// Lite05 mandates per-frame timestamps. Advertise the track's timescale;
+				// `#runGroup` emits each frame converted to it.
+				timescale: info.timescale,
+			});
+		})();
+
+		// Don't poison the cache on failure: a later request may succeed.
+		pending.catch(() => this.#trackInfo.delete(key));
+		this.#trackInfo.set(key, pending);
+		return pending;
+	}
+
+	/**
+	 * Forwards a track's datagrams best-effort over QUIC datagrams (lite-05 §6.4), parallel to
+	 * its groups. Each datagram is dropped (there is no group fallback) if the encoded body
+	 * doesn't fit the transport's datagram limit or the send fails. Returns once the track
+	 * finishes; a failure never tears down the subscription.
+	 *
+	 * @internal
+	 */
+	async #runDatagrams(sub: bigint, track: track.Subscriber, timescale: Timescale) {
+		const writer = this.#datagramWriter;
+		if (!writer) return; // Only reached with a writer (see the #datagramWriter gate).
+		const maxSize = DatagramStream.maxDatagramSize(this.#quic);
+
+		try {
+			for (;;) {
+				const datagram = await track.recvDatagram();
+				if (!datagram) return; // Track finished; #runTrack tears the subscription down.
+
+				// Convert the timestamp to the track's advertised timescale, matching #runGroup.
+				const ts = Math.round(datagram.timestamp.as(timescale));
+				const body = new DatagramMessage(sub, datagram.sequence, ts, datagram.payload).encode();
+
+				// No group fallback: drop anything that doesn't fit a single datagram.
+				if (body.byteLength > maxSize) {
+					console.debug(`dropping oversize datagram: sub=${sub} size=${body.byteLength} max=${maxSize}`);
+					continue;
+				}
+
+				await writer.ready;
+				await writer.write(body);
+			}
+		} catch (err: unknown) {
+			// Best-effort: a datagram send failure stops sending but never fails the subscription.
+			console.debug(`datagram send stopped: sub=${sub} error=${reason(err)}`);
 		}
 	}
 
@@ -242,20 +499,49 @@ export class Publisher {
 	 *
 	 * @internal
 	 */
-	async #runGroup(sub: bigint, group: Group) {
+	// Serialize a fetched group's frames onto the FETCH stream as bare records: each a
+	// zigzag-delta timestamp (at the track's advertised timescale) followed by size + bytes.
+	async #runFetchGroup(group: group.Consumer, stream: Writer, timescale: Timescale) {
+		let prevTs = 0n;
+		for (;;) {
+			const frame = await Promise.race([group.readFrame(), stream.closed]);
+			if (!frame) break;
+
+			const ts = BigInt(Math.round(frame.timestamp.as(timescale)));
+			await stream.u62(zigzag(ts - prevTs));
+			prevTs = ts;
+
+			await stream.u53(frame.payload.byteLength);
+			await stream.write(frame.payload);
+		}
+	}
+
+	async #runGroup(sub: bigint, group: group.Consumer, timescale: Timescale) {
 		const msg = new GroupMessage(sub, group.sequence);
 		try {
 			const stream = await Writer.open(this.#quic);
-			await stream.u8(0); // stream type
+			await stream.u53(0); // stream type
 			await msg.encode(stream);
+
+			// Lite05+ prefixes every frame with a zigzag-delta timestamp at the track's
+			// advertised timescale; older drafts omit it.
+			const timestamps = supportsTrackStream(this.version);
+			let prevTs = 0n;
 
 			try {
 				for (;;) {
 					const frame = await Promise.race([group.readFrame(), stream.closed]);
 					if (!frame) break;
 
-					await stream.u53(frame.byteLength);
-					await stream.write(frame);
+					if (timestamps) {
+						// Convert each frame to the track's advertised timescale.
+						const ts = BigInt(Math.round(frame.timestamp.as(timescale)));
+						await stream.u62(zigzag(ts - prevTs));
+						prevTs = ts;
+					}
+
+					await stream.u53(frame.payload.byteLength);
+					await stream.write(frame.payload);
 				}
 
 				stream.close();
@@ -337,5 +623,9 @@ export class Publisher {
 			}
 			return undefined;
 		});
+
+		// Release the datagram writer's lock so the stream can be torn down.
+		this.#datagramWriter?.releaseLock();
+		this.#datagramWriter = undefined;
 	}
 }

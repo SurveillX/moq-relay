@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
@@ -21,9 +21,16 @@ static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 		.expect("spawn tokio runtime")
 });
 
-/// Process-wide pad id counter. Kept global (not per-session) so a pad created by a
-/// restarted session can't collide with one still being torn down by the previous one.
-static NEXT_PAD_ID: AtomicU64 = AtomicU64::new(0);
+/// Process-wide pad id counters, one per pad kind. Kept global (not per-session) so a pad
+/// created by a restarted session can't collide with one still being torn down by the
+/// previous one, and split per kind so the *first* video pad is reliably `video_0` and the
+/// first audio pad `audio_0`. That predictability matters because `gst-launch` links a
+/// source's sometimes-pads by name (`moqsrc name=s s.video_0 ! ...`); a single shared counter
+/// made the first pad's number depend on catalog arrival order (audio could claim `0`),
+/// silently breaking those pipelines. Counters only ever increment, so a mid-stream reshape
+/// still gets a fresh, collision-free id.
+static NEXT_VIDEO_PAD_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_AUDIO_PAD_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Default)]
 struct Settings {
@@ -246,12 +253,19 @@ impl MoqSrc {
 	}
 }
 
+/// The identity we reconcile a rendition on: a change to either field tears the pad down and
+/// recreates it. Caps cover codec/resolution; the container descriptor covers the wire framing
+/// (e.g. legacy -> cmaf).
+#[derive(Clone, PartialEq)]
+struct Shape {
+	caps: gst::Caps,
+	container: hang::catalog::Container,
+}
+
 /// A rendition we're currently serving, keyed in the session by moq track name.
 struct ActiveTrack {
-	/// The negotiated caps; a catalog update that changes them recreates the pad.
-	caps: gst::Caps,
-	/// The wire container; a change (e.g. legacy -> cmaf) also recreates the pad.
-	container: hang::catalog::Container,
+	/// Identity we diff against on each catalog update; a change recreates the pad.
+	shape: Shape,
 	/// Tells the pump to drop its pad and exit (set on shutdown or when reconcile
 	/// removes/replaces the rendition).
 	cancel: watch::Sender<bool>,
@@ -271,7 +285,7 @@ async fn run_session(
 
 	let origin = moq_net::Origin::random().produce();
 	let origin_consumer = origin.consume();
-	let client = config.init()?.with_consume(origin);
+	let client = config.init()?.with_subscriber(origin);
 
 	let _session = client.connect(settings.url.clone()).await?;
 
@@ -284,7 +298,10 @@ async fn run_session(
 		_ = shutdown.changed() => return Ok(()),
 	};
 
-	let catalog_track = broadcast.subscribe_track(&hang::catalog::Catalog::default_track())?;
+	let catalog_track = broadcast
+		.track(hang::catalog::Catalog::DEFAULT_NAME)?
+		.subscribe(hang::catalog::Catalog::default_subscription())
+		.await?;
 	let mut catalog_consumer = moq_mux::catalog::hang::Consumer::new(catalog_track);
 
 	// Follow the catalog for the whole session and reconcile our pumps against every update,
@@ -306,16 +323,8 @@ async fn run_session(
 		}
 
 		tokio::select! {
-			// Full session shutdown: cancel every pump, then wait for them all to drop
-			// their pads. Cancel all up front (pumps only exit on their own `cancel`), or
-			// the not-yet-cancelled ones would keep streaming while we await the rest.
-			_ = shutdown.changed() => {
-				for (_, track) in active.drain() {
-					let _ = track.cancel.send(true);
-				}
-				while pumps.join_next().await.is_some() {}
-				break;
-			}
+			// Full session shutdown: break to the drain below.
+			_ = shutdown.changed() => break,
 			// A pump finished; loop back so the `retain` above prunes its entry and the
 			// break condition sees the drained set.
 			_ = pumps.join_next(), if !pumps.is_empty() => {}
@@ -323,7 +332,14 @@ async fn run_session(
 			// returning None) while we wait for the remaining pumps to drain.
 			next = catalog_consumer.next(), if !catalog_closed => {
 				match next? {
-					Some(catalog) => reconcile(&catalog, &mut active, &mut pumps, &broadcast, &element)?,
+					// Race reconcile against shutdown. It awaits a per-rendition `subscribe`
+					// that only resolves once track info arrives, so a catalog naming a track
+					// the publisher never accepts would otherwise park here and make the whole
+					// session deaf to shutdown, leaking the connection and pads.
+					Some(catalog) => tokio::select! {
+						result = reconcile(&catalog, &mut active, &mut pumps, &broadcast, &element) => result?,
+						_ = shutdown.changed() => break,
+					},
 					// Catalog track closed. Don't cancel the pumps: let each reach its
 					// natural Ok(None) -> EOS end so downstream sees a clean EOS rather than a
 					// bare pad drop. We just stop reconciling and wait for them to drain.
@@ -333,77 +349,94 @@ async fn run_session(
 		}
 	}
 
+	// Shutdown, including a shutdown that interrupted a reconcile: cancel every pump, then
+	// wait for them all to drop their pads. Cancel all up front (pumps only exit on their own
+	// `cancel`), or the not-yet-cancelled ones would keep streaming while we await the rest.
+	// On the clean catalog-closed exit `active`/`pumps` are already drained, so this is a no-op.
+	for (_, track) in active.drain() {
+		let _ = track.cancel.send(true);
+	}
+	while pumps.join_next().await.is_some() {}
+
 	Ok(())
 }
 
 /// Bring the live set of pumps in line with `catalog`: spawn pumps for newly announced
 /// renditions, tear down ones that vanished, and recreate any whose caps or container changed.
-fn reconcile(
+async fn reconcile(
 	catalog: &moq_mux::catalog::hang::Catalog,
 	active: &mut HashMap<String, ActiveTrack>,
 	pumps: &mut tokio::task::JoinSet<()>,
-	broadcast: &moq_net::BroadcastConsumer,
+	broadcast: &moq_net::broadcast::Consumer,
 	element: &glib::WeakRef<super::MoqSrc>,
 ) -> Result<()> {
 	struct Desired {
 		kind: TrackKind,
-		caps: gst::Caps,
-		/// The hang container descriptor, kept for change detection against an [`ActiveTrack`].
-		container_hint: hang::catalog::Container,
-		/// The resolved wire container, moved into the pump when we spawn it.
-		container: moq_mux::catalog::hang::Container,
+		shape: Shape,
 	}
 
-	// Resolve caps and the wire container up front. A rendition we can't handle (unsupported
-	// codec, malformed CMAF init) is logged and skipped rather than failing the whole session,
-	// so one bad rendition in a catalog update can't tear down the others we're already serving.
-	let resolve = |kind, caps: Result<gst::Caps>, hint: &hang::catalog::Container| -> Result<Desired> {
-		Ok(Desired {
-			kind,
-			caps: caps?,
-			container: moq_mux::catalog::hang::Container::try_from(hint)?,
-			container_hint: hint.clone(),
-		})
-	};
-
+	// Build the desired shape for each rendition. This is deliberately cheap: caps come from the
+	// catalog config and the container is just the hang descriptor. We defer parsing the wire
+	// container (which re-parses the CMAF init) to spawn time below, so an unchanged rendition
+	// costs nothing here. A rendition whose caps we can't build (unsupported codec) is logged and
+	// skipped rather than failing the whole session, so one bad rendition can't tear down the
+	// others we're already serving.
 	let mut desired: HashMap<String, Desired> = HashMap::new();
-	for (name, config) in &catalog.video.renditions {
-		match resolve(TrackKind::Video, video_caps(config), &config.container) {
-			Ok(d) => {
-				desired.insert(name.clone(), d);
-			}
-			Err(err) => gst::warning!(CAT, "ignoring video rendition {name}: {err:?}"),
+	let mut insert = |name: &String, kind, caps: Result<gst::Caps>, container: &hang::catalog::Container| match caps {
+		Ok(caps) => {
+			let shape = Shape {
+				caps,
+				container: container.clone(),
+			};
+			desired.insert(name.clone(), Desired { kind, shape });
 		}
+		Err(err) => gst::warning!(CAT, "ignoring {kind:?} rendition {name}: {err:?}"),
+	};
+	for (name, config) in &catalog.video.renditions {
+		insert(name, TrackKind::Video, video_caps(config), &config.container);
 	}
 	for (name, config) in &catalog.audio.renditions {
-		match resolve(TrackKind::Audio, audio_caps(config), &config.container) {
-			Ok(d) => {
-				desired.insert(name.clone(), d);
-			}
-			Err(err) => gst::warning!(CAT, "ignoring audio rendition {name}: {err:?}"),
+		insert(name, TrackKind::Audio, audio_caps(config), &config.container);
+	}
+
+	// Pure set math: which active pads to tear down, which renditions to spawn.
+	let plan = plan_reconcile(
+		&desired
+			.iter()
+			.map(|(name, d)| (name.clone(), d.shape.clone()))
+			.collect(),
+		&active.iter().map(|(name, t)| (name.clone(), t.shape.clone())).collect(),
+	);
+
+	// Drop anything that disappeared or changed shape; each cancelled pump drops its own pad.
+	// Changed renditions also land in `plan.add`, so they respawn below under a fresh pad id.
+	for name in plan.remove {
+		if let Some(track) = active.remove(&name) {
+			let _ = track.cancel.send(true);
 		}
 	}
 
-	// Drop anything that disappeared or changed shape; survivors stay put, and the changed
-	// ones get respawned below under a fresh pad id. Each cancelled pump drops its own pad.
-	active.retain(|name, track| match desired.get(name) {
-		Some(d) if d.caps == track.caps && d.container_hint == track.container => true,
-		_ => {
-			let _ = track.cancel.send(true);
-			false
+	// Spawn pumps for new or changed renditions. The wire container is parsed here, lazily and
+	// only for renditions we're actually starting, since parsing a CMAF init is wasted work for
+	// renditions that didn't change. A parse failure (malformed init) skips just this rendition.
+	for name in plan.add {
+		let d = &desired[&name];
+		let container = match moq_mux::catalog::hang::Container::try_from(&d.shape.container) {
+			Ok(container) => container,
+			Err(err) => {
+				gst::warning!(CAT, "ignoring rendition {name}: {err:?}");
+				continue;
+			}
+		};
+
+		let id = match d.kind {
+			TrackKind::Video => &NEXT_VIDEO_PAD_ID,
+			TrackKind::Audio => &NEXT_AUDIO_PAD_ID,
 		}
-	});
+		.fetch_add(1, Ordering::Relaxed);
 
-	// Spawn pumps for the renditions we aren't already serving.
-	for (name, d) in desired {
-		if active.contains_key(&name) {
-			continue;
-		}
-
-		let id = NEXT_PAD_ID.fetch_add(1, Ordering::Relaxed);
-
-		let track_consumer = broadcast.subscribe_track(&moq_net::Track::new(&name))?;
-		let track = moq_mux::container::Consumer::new(track_consumer, d.container).with_latency(Duration::from_secs(1));
+		let track_subscriber = broadcast.track(&name)?.subscribe(None).await?;
+		let track = moq_mux::container::Consumer::new(track_subscriber, container).with_latency(Duration::from_secs(1));
 
 		let descriptor = TrackDescriptor {
 			kind: d.kind,
@@ -412,15 +445,14 @@ fn reconcile(
 		};
 		let (cancel_tx, cancel_rx) = watch::channel(false);
 		let task = pumps.spawn_on(
-			run_pump(element.clone(), descriptor, d.caps.clone(), track, cancel_rx),
+			run_pump(element.clone(), descriptor, d.shape.caps.clone(), track, cancel_rx),
 			RUNTIME.handle(),
 		);
 
 		active.insert(
 			name,
 			ActiveTrack {
-				caps: d.caps,
-				container: d.container_hint,
+				shape: d.shape.clone(),
 				cancel: cancel_tx,
 				task,
 			},
@@ -430,10 +462,34 @@ fn reconcile(
 	Ok(())
 }
 
+/// Tear-down / spawn decisions for one catalog update, computed purely from the desired and
+/// active rendition sets. A name present in both with an equal shape is left untouched; a name
+/// whose shape changed lands in both lists (cancel the old pump, spawn a fresh one).
+struct ReconcilePlan {
+	remove: Vec<String>,
+	add: Vec<String>,
+}
+
+fn plan_reconcile<S: PartialEq>(desired: &HashMap<String, S>, active: &HashMap<String, S>) -> ReconcilePlan {
+	let remove = active
+		.iter()
+		.filter(|(name, shape)| desired.get(*name) != Some(*shape))
+		.map(|(name, _)| name.clone())
+		.collect();
+	let add = desired
+		.iter()
+		.filter(|(name, shape)| active.get(*name) != Some(*shape))
+		.map(|(name, _)| name.clone())
+		.collect();
+	ReconcilePlan { remove, add }
+}
+
 /// Identifies a pump's pad. Pads are named `video_<id>` / `audio_<id>` from a
-/// process-unique counter (matching the `%u` templates) rather than after the
-/// track name, so a rendition can be torn down and recreated (when its
-/// codec/resolution changes mid-stream) without two pads ever sharing a name.
+/// per-kind, process-unique counter (matching the `%u` templates) rather than after
+/// the track name, so a rendition can be torn down and recreated (when its
+/// codec/resolution changes mid-stream) without two pads ever sharing a name. The
+/// first pad of each kind is `video_0` / `audio_0`, so `gst-launch` can link them by
+/// name regardless of which rendition the catalog announces first.
 struct TrackDescriptor {
 	kind: TrackKind,
 	name: String,
@@ -471,12 +527,16 @@ async fn run_pump(
 			frame = track.read() => match frame {
 				Ok(Some(frame)) => {
 					let buffer = build_buffer(frame, &mut reference_ts, descriptor.kind);
-					if pad.push(buffer).is_err() {
+					// pad.push() blocks until downstream accepts the buffer (full queues, a
+					// clock-synced sink). block_in_place hands our sibling tasks to another
+					// worker so a stalled downstream can't pin a runtime thread and starve
+					// the session loop or other pumps.
+					if tokio::task::block_in_place(|| pad.push(buffer)).is_err() {
 						break;
 					}
 				}
 				Ok(None) => {
-					let _ = pad.push_event(gst::event::Eos::builder().build());
+					let _ = tokio::task::block_in_place(|| pad.push_event(gst::event::Eos::builder().build()));
 					break;
 				}
 				Err(err) => {
@@ -523,7 +583,7 @@ fn create_pad(
 /// Wrap a decoded frame in a gst buffer, assigning a pts relative to the track's first frame.
 fn build_buffer(
 	frame: moq_mux::container::Frame,
-	reference_ts: &mut Option<moq_mux::container::Timestamp>,
+	reference_ts: &mut Option<moq_net::Timestamp>,
 	kind: TrackKind,
 ) -> gst::Buffer {
 	let mut buffer = gst::Buffer::from_slice(frame.payload);
@@ -555,7 +615,7 @@ fn build_buffer(
 /// Frames arrive in decode order, so a B-frame's presentation timestamp can fall before
 /// the reference. `Timestamp` subtraction panics on underflow, so clamp to zero rather
 /// than crash the pump (which would leak its pad).
-fn relative_pts(timestamp: moq_mux::container::Timestamp, reference: moq_mux::container::Timestamp) -> gst::ClockTime {
+fn relative_pts(timestamp: moq_net::Timestamp, reference: moq_net::Timestamp) -> gst::ClockTime {
 	match timestamp.checked_sub(reference) {
 		Ok(delta) => gst::ClockTime::from_nseconds(Duration::from(delta).as_nanos() as u64),
 		Err(_) => gst::ClockTime::ZERO,
@@ -636,6 +696,12 @@ fn audio_caps(config: &hang::catalog::AudioConfig) -> Result<gst::Caps> {
 			}
 			builder.build()
 		}
+		hang::catalog::AudioCodec::Mp3 => gst::Caps::builder("audio/mpeg")
+			.field("mpegversion", 1)
+			.field("layer", 3)
+			.field("rate", config.sample_rate)
+			.field("channels", config.channel_count)
+			.build(),
 		other => bail!("unsupported audio codec: {other:?}"),
 	};
 	Ok(caps)
@@ -643,8 +709,56 @@ fn audio_caps(config: &hang::catalog::AudioConfig) -> Result<gst::Caps> {
 
 #[cfg(test)]
 mod tests {
-	use super::relative_pts;
-	use moq_mux::container::Timestamp;
+	use super::{plan_reconcile, relative_pts};
+	use moq_net::Timestamp;
+	use std::collections::HashMap;
+
+	// The shape type is generic, so the set math can be exercised with a plain integer standing
+	// in for (caps, container): equal value == unchanged rendition, different value == reshape.
+	fn renditions(pairs: &[(&str, u32)]) -> HashMap<String, u32> {
+		pairs.iter().map(|(name, shape)| (name.to_string(), *shape)).collect()
+	}
+
+	fn sorted(mut names: Vec<String>) -> Vec<String> {
+		names.sort();
+		names
+	}
+
+	#[test]
+	fn plan_reconcile_diffs_by_name_and_shape() {
+		// keep: same shape (untouched). gone: removed. added: new. changed: same name, new
+		// shape, so it must be both torn down and respawned.
+		let active = renditions(&[("keep", 1), ("gone", 1), ("changed", 1)]);
+		let desired = renditions(&[("keep", 1), ("changed", 2), ("added", 9)]);
+
+		let plan = plan_reconcile(&desired, &active);
+		assert_eq!(sorted(plan.remove), vec!["changed", "gone"]);
+		assert_eq!(sorted(plan.add), vec!["added", "changed"]);
+	}
+
+	#[test]
+	fn plan_reconcile_noops_on_identical_sets() {
+		let set = renditions(&[("a", 1), ("b", 2)]);
+		let plan = plan_reconcile(&set, &set);
+		assert!(plan.remove.is_empty());
+		assert!(plan.add.is_empty());
+	}
+
+	#[test]
+	fn plan_reconcile_empty_desired_removes_all() {
+		let active = renditions(&[("a", 1), ("b", 2)]);
+		let plan = plan_reconcile(&HashMap::new(), &active);
+		assert_eq!(sorted(plan.remove), vec!["a", "b"]);
+		assert!(plan.add.is_empty());
+	}
+
+	#[test]
+	fn plan_reconcile_empty_active_adds_all() {
+		let desired = renditions(&[("a", 1), ("b", 2)]);
+		let plan = plan_reconcile(&desired, &HashMap::new());
+		assert!(plan.remove.is_empty());
+		assert_eq!(sorted(plan.add), vec!["a", "b"]);
+	}
 
 	#[test]
 	fn relative_pts_clamps_backwards_timestamps() {

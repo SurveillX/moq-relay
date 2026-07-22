@@ -1,6 +1,7 @@
-import type { Announced } from "../announced.ts";
-import type { Broadcast } from "../broadcast.ts";
+import type * as announce from "../announced.ts";
+import type * as broadcast from "../broadcast.ts";
 import type { Established } from "../connection/established.ts";
+import { type Transport, transportOf } from "../connection/transport.ts";
 import * as Path from "../path.ts";
 import { type Reader, Readers, type Stream } from "../stream.ts";
 import { ControlStreamAdapter, NativeSession, type Session } from "./adapter.ts";
@@ -26,6 +27,12 @@ export class Connection implements Established {
 
 	// The negotiated protocol version.
 	readonly version: string;
+
+	// The wire transport this session runs over.
+	readonly transport: Transport;
+
+	/** Whether the relay supports broadcast discovery; see {@link Established.discovery}. */
+	readonly discovery: boolean;
 
 	// The established WebTransport session.
 	#quic: WebTransport;
@@ -58,24 +65,31 @@ export class Connection implements Established {
 		control,
 		maxRequestId,
 		version,
+		client,
+		discovery = true,
 	}: {
 		url: URL;
 		quic: WebTransport;
 		control: Stream;
 		maxRequestId: bigint;
 		version: IetfVersion;
+		/** Whether this peer initiated the session, selecting the even request-ID space. */
+		client: boolean;
+		discovery?: boolean;
 	}) {
 		this.url = url;
+		this.discovery = discovery;
 		this.version = versionName(version);
+		this.transport = transportOf(quic);
 		this.#quic = quic;
 
 		// Two-path dispatch: v14-v16 uses adapter, v17+ uses native bidi streams
-		if (version === Version.DRAFT_17 || version === Version.DRAFT_18) {
-			this.#session = new NativeSession(quic, version);
+		if (version >= Version.DRAFT_17) {
+			this.#session = new NativeSession(quic, version, client);
 			// v17+: control/setup stream only carries GoAway
 			void this.#runGoAway(control, version);
 		} else {
-			const adapter = new ControlStreamAdapter(quic, control, version, maxRequestId);
+			const adapter = new ControlStreamAdapter(quic, control, version, maxRequestId, client);
 			this.#session = adapter;
 			// Start the adapter read loop (routes control messages to virtual streams)
 			void adapter.run().catch((err: unknown) => {
@@ -98,7 +112,7 @@ export class Connection implements Established {
 
 		this.#closed = true;
 
-		this.#session.close?.();
+		this.#session.close();
 
 		try {
 			this.#quic.close();
@@ -124,8 +138,8 @@ export class Connection implements Established {
 	 * @param name - The broadcast path to publish
 	 * @param broadcast - The broadcast to publish
 	 */
-	publish(path: Path.Valid, broadcast: Broadcast) {
-		this.#publisher.publish(path, broadcast);
+	publish(path: Path.Valid, producer: broadcast.Producer) {
+		this.#publisher.publish(path, producer);
 	}
 
 	/**
@@ -133,7 +147,7 @@ export class Connection implements Established {
 	 * @param prefix - The prefix for announcements
 	 * @returns An Announced instance
 	 */
-	announced(prefix = Path.empty()): Announced {
+	announced(prefix = Path.empty()): announce.Consumer {
 		return this.#subscriber.announced(prefix);
 	}
 
@@ -146,8 +160,8 @@ export class Connection implements Established {
 	 * @param broadcast - The path of the broadcast to consume
 	 * @returns A Broadcast instance
 	 */
-	consume(broadcast: Path.Valid): Broadcast {
-		return this.#subscriber.consume(broadcast);
+	consume(path: Path.Valid): broadcast.Consumer {
+		return this.#subscriber.consume(path);
 	}
 
 	/**
@@ -166,7 +180,7 @@ export class Connection implements Established {
 	}
 
 	/**
-	 * Unified bidi stream dispatch — reads typeId and routes to handler.
+	 * Unified bidi stream dispatch. Reads typeId and routes to handler.
 	 * Matches the lite module's runBidi pattern.
 	 */
 	async #runBidi(stream: Stream) {

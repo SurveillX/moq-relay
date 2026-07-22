@@ -14,6 +14,11 @@
 //!   the JSON manifest listing every track and how to decode it.
 //! - [`import`](mod@import) is the front door for callers who only have
 //!   a format string. It picks the right concrete importer for you.
+//! - [`select`] picks which renditions of a broadcast to keep, on either
+//!   the import or the consume side.
+//! - [`timeline`](mod@timeline) publishes the broadcast's group index: one
+//!   record per media group mapping it to its start timestamp, so consumers
+//!   can seek or build playlists without downloading media.
 
 pub mod catalog;
 mod clock;
@@ -21,6 +26,15 @@ pub mod codec;
 pub mod container;
 mod error;
 pub mod import;
+pub mod select;
+mod source;
+pub mod timeline;
 
 pub use clock::Clock;
 pub use error::*;
+pub use source::Source;
+
+/// Re-export of the [`mp4_atom`] crate, whose types appear in the public CMAF
+/// surface ([`container::fmp4`]). A major version bump of `mp4_atom` is a
+/// breaking change for moq-mux.
+pub use mp4_atom;

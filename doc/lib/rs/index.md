@@ -50,7 +50,7 @@ Media muxers and demuxers for importing existing formats into MoQ.
 **Features:**
 
 - fMP4/CMAF import
-- HLS playlist import
+- MPEG-TS and FLV import/export
 - H.264/H.265 Annex B parsing
 - AAC and Opus codec support
 
@@ -122,18 +122,20 @@ cargo install moq-cli
 **Usage:**
 
 ```bash
-# Publish a video file
-moq-cli publish video.mp4
+# Publish a video file (remux to MPEG-TS and pipe it in)
+ffmpeg -i input.mp4 -c copy -f mpegts - | \
+    moq --client-connect https://relay.example.com/anon --broadcast my-stream import ts
 
 # Publish from FFmpeg
-ffmpeg -i input.mp4 -f mpegts - | moq-cli publish -
+ffmpeg -i input.mp4 -f mpegts - | \
+    moq --client-connect https://relay.example.com/anon --broadcast my-stream import ts
 ```
 
 [Learn more](/bin/cli)
 
-### moq-token-cli
+### moq-token CLI
 
-Command-line tool for JWT token management (binary name: `moq-token-cli`).
+Command-line tool for JWT token management (binary name: `moq-token`).
 
 **Installation:**
 
@@ -145,10 +147,10 @@ cargo install moq-token-cli
 
 ```bash
 # Generate a key
-moq-token-cli --key root.jwk generate
+moq-token generate --out root.jwk
 
 # Sign a token
-moq-token-cli --key root.jwk sign \
+moq-token sign --key root.jwk \
   --root "rooms/123" \
   --publish "alice" \
   --expires 1735689600
@@ -241,7 +243,7 @@ into the session before connecting:
 // Subscribe: wait for broadcasts to be announced.
 let origin = moq_net::Origin::new().produce();
 let mut consumer = origin.consume();
-let session = client.with_consume(origin).connect(url).await?;
+let session = client.with_subscriber(origin).connect(url).await?;
 
 while let Some((path, broadcast)) = consumer.announced().await {
     // ... subscribe to tracks on each broadcast ...

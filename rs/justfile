@@ -27,6 +27,7 @@ check *args:
 # force-run everything. `cargo publish --dry-run` lives in release-rs.yml.
 #
 # `cargo deny` runs here (not in `check`) so the inner-loop stays fast
+
 # and devs aren't blocked by a fresh upstream advisory mid-edit.
 ci FILES="":
     #!/usr/bin/env bash
@@ -35,20 +36,37 @@ ci FILES="":
     	echo "rs: no Rust changes; skipping."
     	exit 0
     fi
-    just check --workspace
-    cargo check --workspace --no-default-features
-    cargo check --workspace --all-features
+    # Hygiene (non-compiling) + cargo-deny (hits the network, so it couldn't run
+    # in the old Nix sandbox; runs fine here).
+    cargo fmt --all --check
+    cargo sort --workspace --check --no-format
+    cargo shear
     cargo deny check --show-stats
-    just rs test --all-features
-    just build
 
-# Auto-fix clippy/format/shear/sort, then sweep stale target/.
+    # Compiles. The all-features clippy / doc / test run as plain cargo (flake.nix
+    # `checks` is unwired). Each full-workspace compile below is expensive, so we
+    # run the minimum set that still covers every feature edge:
+    #   - clippy --all-targets --all-features is the gate and a superset of a plain
+    #     `cargo check --all-targets` (default features), so that redundant check
+    #     pass is intentionally omitted -- one fewer full workspace compile.
+    #   - --no-default-features stays: it's the only pass that exercises code behind
+    #     `#[cfg(not(feature = ...))]`, which the all-features run never compiles.
+    # (Local devs still get the full cargo loop via `just rs check`.)
+    cargo check --workspace --no-default-features
+    cargo clippy --workspace --all-targets --all-features -- -D warnings
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+    # nextest compiles + runs the test binaries with real parallelism (faster than
+    # `cargo test`'s serial harness). It does not build or run
+    # doctests, so the `/// ```` examples are no longer compile-checked in CI -- an
+    # accepted trade for speed (they still render in `cargo doc` output).
+    cargo nextest run --workspace --all-targets --all-features
+
+# Auto-fix clippy/format/shear/sort.
 fix:
     cargo clippy --fix --allow-staged --allow-dirty --all-targets
     cargo fmt --all
     cargo shear --fix
     cargo sort --workspace --no-format
-    if command -v cargo-sweep >/dev/null 2>&1; then cargo sweep --time 3; fi
 
 test *args:
     cargo test --all-targets {{ args }}
@@ -84,6 +102,7 @@ update:
 #
 # Examples:
 #   just rs package moq-relay deb
+
 # just rs package moq-cli rpm
 package crate packager:
     #!/usr/bin/env bash
@@ -91,7 +110,7 @@ package crate packager:
     case "{{ crate }}" in
     	moq-relay)      bin=moq-relay  ;;
     	moq-cli)        bin=moq        ;;
-    	moq-token-cli)  bin=moq-token-cli ;;
+        moq-token-cli)  bin=moq-token  ;;
     	*) echo "Unknown crate: {{ crate }} (use moq-relay, moq-cli, or moq-token-cli)" >&2; exit 1 ;;
     esac
     case "{{ packager }}" in

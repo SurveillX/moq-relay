@@ -30,6 +30,21 @@ Both elements support the following properties:
 For `http://` URLs, `moq-native` automatically fetches the server's certificate fingerprint from `/certificate.sha256` and verifies TLS against it. You don't need `tls-disable-verify` for local development.
 :::
 
+`moqsink` additionally exposes these read-only properties for monitoring. Each emits a `notify`
+signal when it changes, so you can poll it via `g_object_get` or connect to `notify::<property>`:
+
+| Property                 | Type   | Description                                                  |
+| ------------------------ | ------ | ----------------------------------------------------------- |
+| `status`                 | enum   | Publish connection lifecycle: `disconnected` (retrying), `connected`, or `failed` (gave up) |
+| `connected`              | bool   | Whether the publish session is currently connected (`status == connected`) |
+| `moq-version`            | string | The negotiated MoQ protocol version; null when disconnected |
+| `estimated-send-bitrate` | uint64 | Estimated send bitrate in bits per second (congestion controller); 0 when unavailable |
+| `estimated-recv-bitrate` | uint64 | Estimated receive bitrate in bits per second; 0 when unavailable |
+
+`status` distinguishes a transient drop (`disconnected`, the reconnect loop is still retrying) from a
+permanent give-up (`failed`, a non-retryable error such as an auth rejection), which a bare
+`connected` bool cannot.
+
 ## Prerequisites
 
 The plugin requires GStreamer development libraries. It is **not** built by default since most users don't have them installed.
@@ -58,11 +73,15 @@ Lists `moqsink` and `moqsrc`. As a one-liner: `nix run github:moq-dev/moq#moq-gs
 
 ```bash
 nix shell github:moq-dev/moq#moq-gst --command gst-launch-1.0 -v -e \
-  moqsrc url=https://cdn.moq.dev/demo broadcast=bbb.hang \
-  ! decodebin3 ! videoconvert ! autovideosink
+  moqsrc name=s url=https://cdn.moq.dev/demo broadcast=bbb.hang \
+  s.video_0 ! queue ! decodebin3 ! videoconvert ! autovideosink \
+  s.audio_0 ! queue ! decodebin3 ! audioconvert ! autoaudiosink
 ```
 
-Audio-only variant: swap the tail for `! decodebin3 ! audioconvert ! autoaudiosink`.
+`bbb.hang` carries both video and audio, so each is linked by pad name (`video_0` /
+`audio_0`). For video only, drop the `s.audio_0` branch; the audio pad simply stays
+unlinked. The terse `moqsrc ! decodebin3 ! ...` form links just the first pad GStreamer
+offers, which on a multi-track broadcast may be the audio one, so prefer naming the pad.
 
 ### Publish your own broadcast
 
@@ -100,11 +119,11 @@ nix shell github:moq-dev/moq#moq-gst --command gst-launch-1.0 -v -e \
   multifilesrc location=bbb.mp4 loop=true ! parsebin name=parse \
     parse. ! queue ! identity sync=true ! mux.sink_0 \
     parse. ! queue ! identity sync=true ! mux.sink_1 \
-    moqsink name=mux url=http://localhost:4443/anon broadcast=bbb.hang
+    moqsink name=mux url=http://localhost:4443 broadcast=bbb.hang
 
 # Terminal 3: subscribe.
 nix shell github:moq-dev/moq#moq-gst --command gst-launch-1.0 -v -e \
-  moqsrc url=http://localhost:4443/anon broadcast=bbb.hang \
+  moqsrc url=http://localhost:4443 broadcast=bbb.hang \
   ! decodebin3 ! videoconvert ! autovideosink
 ```
 
@@ -151,7 +170,7 @@ gst-launch-1.0 -v -e \
   multifilesrc location=demo/pub/media/bbb.mp4 loop=true ! parsebin name=parse \
     parse. ! queue ! identity sync=true ! mux.sink_0 \
     parse. ! queue ! identity sync=true ! mux.sink_1 \
-    moqsink name=mux url="http://localhost:4443/anon" broadcast="bbb"
+    moqsink name=mux url="http://localhost:4443" broadcast="bbb"
 ```
 
 ::: tip
@@ -181,9 +200,25 @@ Or directly:
 export GST_PLUGIN_PATH_1_0="$PWD/target/debug${GST_PLUGIN_PATH_1_0:+:$GST_PLUGIN_PATH_1_0}"
 
 gst-launch-1.0 -v -e \
-  moqsrc url="http://localhost:4443/anon" broadcast="bbb" \
+  moqsrc url="http://localhost:4443" broadcast="bbb" \
     ! decodebin3 ! videoconvert ! autovideosink
 ```
+
+::: warning
+`moqsrc` exposes one source pad per rendition: `video_0`, `audio_0`, and so on
+(see [moqsrc pads](#moqsrc-subscribe)). The single-branch `moqsrc ! decodebin3 ...`
+above only links the *first* pad GStreamer offers, so on a broadcast with both video
+and audio it may pick up the audio pad and a video-only sink chain then renders nothing.
+Link the pad you want by name, and route the rest to a sink so they don't stall:
+
+```bash
+gst-launch-1.0 -v -e moqsrc name=s url="http://localhost:4443" broadcast="bbb" \
+  s.video_0 ! queue ! decodebin3 ! videoconvert ! autovideosink \
+  s.audio_0 ! queue ! decodebin3 ! audioconvert ! autoaudiosink
+```
+
+The first pad of each kind is always `video_0` / `audio_0` regardless of catalog order.
+:::
 
 ## Supported Codecs
 
@@ -197,11 +232,19 @@ gst-launch-1.0 -v -e \
 | Video | VP8   | `video/x-vp8`         |
 | Video | VP9   | `video/x-vp9`         |
 | Audio | AAC   | `audio/mpeg` (v4)     |
+| Audio | MP3   | `audio/mpeg` (v1/v2, layer 3) |
 | Audio | Opus  | `audio/x-opus`        |
 
 ### moqsrc (subscribe)
 
 Outputs the same caps based on the catalog, compatible with `decodebin3`.
+
+One source pad is created per rendition, named after its kind: `video_0`, `video_1`,
+`audio_0`, and so on. The first pad of each kind is always numbered `0`, so a
+`gst-launch` pipeline can link the stream it wants by name (`moqsrc name=s s.video_0 ! ...`)
+no matter which rendition the catalog announces first. Pads appear once their rendition
+shows up in the catalog (sometimes-pads), so an application links them from a
+`pad-added` handler.
 
 ## Debugging
 

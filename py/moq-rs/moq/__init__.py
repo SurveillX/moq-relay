@@ -3,18 +3,43 @@
 Real-time pub/sub with built-in caching, fan-out, and prioritization.
 """
 
-from moq_ffi import Container
-from moq_ffi import MoqSession as Session
+from moq_ffi import MoqError as Error
 
-from .client import Client
-from .origin import Announced, AnnouncedBroadcast, Announcement, OriginConsumer, OriginProducer
-from .publish import AudioProducer, BroadcastProducer, GroupProducer, MediaProducer, TrackProducer
+from .client import Client, connect
+from .errors import is_auth, is_shutdown
+from .log import log_level
+from .origin import (
+    Announced,
+    AnnouncedBroadcast,
+    Announcement,
+    BroadcastRequest,
+    OriginConsumer,
+    OriginDynamic,
+    OriginProducer,
+)
+from .publish import (
+    AudioProducer,
+    BroadcastDynamic,
+    BroadcastProducer,
+    GroupProducer,
+    GroupRequest,
+    JsonSnapshotProducer,
+    JsonStreamProducer,
+    MediaProducer,
+    MediaStreamProducer,
+    TrackDynamic,
+    TrackProducer,
+    TrackRequest,
+)
 from .server import Request, Server, Transport
+from .session import Session
 from .subscribe import (
     AudioConsumer,
     BroadcastConsumer,
     CatalogConsumer,
     GroupConsumer,
+    JsonSnapshotConsumer,
+    JsonStreamConsumer,
     MediaConsumer,
     TrackConsumer,
 )
@@ -27,9 +52,18 @@ from .types import (
     AudioFormat,
     AudioFrame,
     Catalog,
+    ConnectionStats,
+    Container,
+    Datagram,
     Dimensions,
+    FetchGroupOptions,
     Frame,
+    MediaFrame,
+    Route,
+    Subscription,
+    TrackInfo,
     Video,
+    VideoHint,
 )
 
 __all__ = [
@@ -46,24 +80,48 @@ __all__ = [
     "AudioFrame",
     "AudioProducer",
     "BroadcastConsumer",
+    "BroadcastDynamic",
     "BroadcastProducer",
+    "BroadcastRequest",
     "Catalog",
     "CatalogConsumer",
     "Client",
+    "ConnectionStats",
     "Container",
+    "Datagram",
     "Dimensions",
+    "Error",
     "Frame",
+    "MediaFrame",
+    "FetchGroupOptions",
     "GroupConsumer",
+    "GroupRequest",
     "GroupProducer",
+    "JsonSnapshotConsumer",
+    "JsonSnapshotProducer",
+    "JsonStreamConsumer",
+    "JsonStreamProducer",
     "MediaConsumer",
     "MediaProducer",
+    "MediaStreamProducer",
     "OriginConsumer",
+    "OriginDynamic",
     "OriginProducer",
     "Request",
+    "Route",
     "Server",
     "Session",
+    "Subscription",
     "TrackConsumer",
+    "TrackDynamic",
+    "TrackInfo",
     "TrackProducer",
+    "TrackRequest",
     "Transport",
     "Video",
+    "VideoHint",
+    "connect",
+    "is_auth",
+    "is_shutdown",
+    "log_level",
 ]

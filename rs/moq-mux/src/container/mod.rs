@@ -19,8 +19,8 @@ pub(crate) mod jitter;
 mod producer;
 mod source;
 
+pub mod flv;
 pub mod fmp4;
-pub mod hls;
 pub mod legacy;
 pub mod loc;
 pub mod mkv;
@@ -28,11 +28,7 @@ pub mod ts;
 
 pub use consumer::Consumer;
 pub use producer::Producer;
-pub(crate) use source::{CatalogSource, ExportSource};
-
-/// Microsecond presentation timestamp, the canonical timebase for media
-/// frames in moq-mux.
-pub type Timestamp = moq_net::Timescale<1_000_000>;
+pub(crate) use source::ExportSource;
 
 /// A decoded media frame: timestamp, payload bytes, keyframe flag.
 ///
@@ -43,10 +39,22 @@ pub type Timestamp = moq_net::Timescale<1_000_000>;
 pub struct Frame {
 	/// Presentation timestamp.
 	///
-	/// Microsecond precision. Frames within a track must be in *decode*
-	/// order, not display order. B-frames may have non-monotonic
-	/// presentation timestamps.
-	pub timestamp: Timestamp,
+	/// Each container picks its own native scale: fmp4 uses the source
+	/// `mdhd.timescale`, mkv uses nanoseconds, legacy is fixed at microseconds.
+	/// LOC defaults to microseconds but a decoded frame keeps whatever per-frame
+	/// timescale the wire carried, so an exporter can re-emit without forcing
+	/// micros. Frames within a track must be in *decode* order, not display
+	/// order. B-frames may have non-monotonic presentation timestamps.
+	pub timestamp: moq_net::Timestamp,
+
+	/// Sample duration in the frame's own scale, when the container reports it.
+	///
+	/// CMAF carries a per-sample duration (trun sample-duration); containers
+	/// that don't (Legacy, LOC) leave this `None`. The [`Consumer`] adds it to
+	/// `timestamp` to learn how far a group has presented, so it can advance to
+	/// a newer group as soon as the gap is covered instead of waiting out the
+	/// latency budget.
+	pub duration: Option<moq_net::Timestamp>,
 
 	/// Encoded codec payload.
 	pub payload: Bytes,
@@ -61,6 +69,16 @@ pub struct Frame {
 	pub keyframe: bool,
 }
 
+/// A non-keyframe frame arrived with no open group.
+///
+/// A track must open with a keyframe (and so must the frame after
+/// [`cut`](Producer::cut) / [`seek`](Producer::seek)).
+/// [`Producer::write`] returns this so a caller joining mid-stream can skip
+/// frames until the first keyframe instead of treating it as fatal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("missing keyframe: a group must open on a keyframe")]
+pub struct MissingKeyframe;
+
 /// Encode and decode media frames over a moq-lite group.
 ///
 /// Implementors decide how many [`Frame`]s map onto one moq-lite frame:
@@ -68,11 +86,12 @@ pub struct Frame {
 /// pack many samples into a single moof+mdat fragment.
 pub trait Container {
 	/// Container-specific error. Must be convertible from [`moq_net::Error`]
-	/// so the IO layer's errors propagate cleanly.
-	type Error: std::error::Error + Send + Sync + Unpin + From<moq_net::Error>;
+	/// (so IO errors propagate) and [`MissingKeyframe`] (so the producer can
+	/// reject a group that doesn't open on a keyframe).
+	type Error: std::error::Error + Send + Sync + Unpin + From<moq_net::Error> + From<MissingKeyframe>;
 
 	/// Encode one or more frames into a single moq-lite frame appended to `group`.
-	fn write(&self, group: &mut moq_net::GroupProducer, frames: &[Frame]) -> Result<(), Self::Error>;
+	fn write(&self, group: &mut moq_net::group::Producer, frames: &[Frame]) -> Result<(), Self::Error>;
 
 	/// Poll the next moq-lite frame from `group` and decode it into media
 	/// frames. Returns `Ok(None)` when the group has ended. A single call
@@ -80,14 +99,14 @@ pub trait Container {
 	/// fragment).
 	fn poll_read(
 		&self,
-		group: &mut moq_net::GroupConsumer,
+		group: &mut moq_net::group::Consumer,
 		waiter: &kio::Waiter,
 	) -> Poll<Result<Option<Vec<Frame>>, Self::Error>>;
 
 	/// Async wrapper around [`Self::poll_read`].
 	fn read(
 		&self,
-		group: &mut moq_net::GroupConsumer,
+		group: &mut moq_net::group::Consumer,
 	) -> impl std::future::Future<Output = Result<Option<Vec<Frame>>, Self::Error>>
 	where
 		Self: Sync,

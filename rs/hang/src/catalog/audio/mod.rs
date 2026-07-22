@@ -9,17 +9,23 @@ use std::collections::{BTreeMap, btree_map};
 use bytes::Bytes;
 
 use serde::{Deserialize, Serialize};
-use serde_with::{DisplayFromStr, hex::Hex};
+use serde_with::{DisplayFromStr, DurationMilliSeconds, hex::Hex};
 
 use crate::catalog::Container;
 
 /// Information about an audio track in the catalog.
 ///
 /// This struct contains a map of renditions (different quality/codec options)
+///
+/// Marked `#[non_exhaustive]` so additional optional fields can be added without
+/// bumping the major version. External callers start from [`Audio::default`] and
+/// fill in what they need ([`insert`](Self::insert) for renditions); struct-literal
+/// construction (with or without `..base`) is not available outside this crate.
 #[serde_with::serde_as]
 #[serde_with::skip_serializing_none]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Audio {
 	/// A map of track name to rendition configuration.
 	/// This is not an array so it will work with JSON Merge Patch.
@@ -61,6 +67,12 @@ impl Audio {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct AudioConfig {
+	/// Optional reference to another broadcast that publishes this track, expressed
+	/// relative to the broadcast that served this catalog (e.g. `../source`). If unset,
+	/// the track lives in the same broadcast as the catalog.
+	#[serde(default)]
+	pub broadcast: Option<moq_net::PathRelativeOwned>,
+
 	// The codec, see the registry for details:
 	// https://w3c.github.io/webcodecs/codec_registry.html
 	#[serde_as(as = "DisplayFromStr")]
@@ -92,10 +104,18 @@ pub struct AudioConfig {
 	/// The player's jitter buffer should be larger than this value.
 	/// If not provided, the player should assume each frame is flushed immediately.
 	///
+	/// Serialized as an integer number of milliseconds (sub-ms precision is truncated).
+	///
 	/// NOTE: The audio "frame" duration depends on the codec, sample rate, etc.
 	/// ex: AAC often uses 1024 samples per frame, so at 44100Hz, this would be 1024/44100 = 23ms
+	#[serde_as(as = "Option<DurationMilliSeconds<u64>>")]
 	#[serde(default)]
-	pub jitter: Option<moq_net::Time>,
+	pub jitter: Option<std::time::Duration>,
+
+	/// The companion timeline track indexing this rendition's groups, if the publisher
+	/// offers one. See [`Timeline`](crate::catalog::Timeline).
+	#[serde(default)]
+	pub timeline: Option<crate::catalog::Timeline>,
 }
 
 impl AudioConfig {
@@ -107,6 +127,7 @@ impl AudioConfig {
 	/// since the type is `#[non_exhaustive]`.
 	pub fn new(codec: impl Into<AudioCodec>, sample_rate: u32, channel_count: u32) -> Self {
 		Self {
+			broadcast: None,
 			codec: codec.into(),
 			sample_rate,
 			channel_count,
@@ -114,6 +135,7 @@ impl AudioConfig {
 			description: None,
 			container: Container::default(),
 			jitter: None,
+			timeline: None,
 		}
 	}
 }

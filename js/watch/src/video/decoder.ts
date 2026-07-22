@@ -3,18 +3,45 @@ import * as Container from "@moq/hang/container";
 import * as Util from "@moq/hang/util";
 import type * as Moq from "@moq/net";
 import { Time } from "@moq/net";
-import { Effect, type Getter, Signal } from "@moq/signals";
-import type { BufferedRanges } from "../backend";
+import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import { base64ToBytes } from "../base64";
-import type { Backend, Stats } from "./backend";
+
+import type { Sync } from "../sync";
 import type { Source } from "./source";
 
 // The amount of time to wait before considering the video to be buffering.
-const BUFFERING = 500 as Time.Milli;
-const SWITCH = 100 as Time.Milli;
+const BUFFERING = Time.Milli(500);
+const SWITCH = Time.Milli(100);
 
-export type DecoderProps = {
-	enabled?: boolean | Signal<boolean>;
+export type DecoderInput = {
+	// Whether to download the video track. Wired from the renderer's output by the parent.
+	enabled: Getter<boolean>;
+};
+
+/** Cumulative video statistics since the decoder started. */
+export interface Stats {
+	/** Number of decoded frames. */
+	frameCount: number;
+
+	/** Number of encoded bytes received. */
+	bytesReceived: number;
+}
+
+type DecoderOutput = {
+	// The current frame to render.
+	frame: Signal<VideoFrame | undefined>;
+
+	// The timestamp of the current frame.
+	timestamp: Signal<Time.Milli | undefined>;
+
+	// The display size of the video in pixels, ideally sourced from the catalog.
+	display: Signal<{ width: number; height: number } | undefined>;
+
+	stalled: Signal<boolean>;
+	stats: Signal<Stats | undefined>;
+
+	// Combined buffered ranges (network jitter + decode buffer)
+	buffered: Signal<Container.BufferedRanges>;
 };
 
 // The types in VideoDecoderConfig that cause a hard reload.
@@ -22,50 +49,42 @@ export type DecoderProps = {
 // This way we can keep the current subscription active.
 type RequiredDecoderConfig = Omit<Catalog.VideoConfig, "codedWidth" | "codedHeight">;
 
-export class Decoder implements Backend {
-	enabled: Signal<boolean>; // Don't download any longer
-	source: Source;
+/** Downloads video from a track and decodes it into {@link VideoFrame}s with WebCodecs. */
+export class Decoder {
+	readonly in: Readonlys<DecoderInput>;
+	readonly source: Source;
+	readonly sync: Sync;
+
+	readonly #out: DecoderOutput = {
+		frame: new Signal<VideoFrame | undefined>(undefined),
+		timestamp: new Signal<Time.Milli | undefined>(undefined),
+		display: new Signal<{ width: number; height: number } | undefined>(undefined),
+		stalled: new Signal<boolean>(false),
+		stats: new Signal<Stats | undefined>(undefined),
+		buffered: new Signal<Container.BufferedRanges>([]),
+	};
+	readonly out = readonlys(this.#out);
 
 	// The current track running, held so we can cancel it when the new track is ready.
 	#active = new Signal<DecoderTrack | undefined>(undefined);
 
-	// Expose the current frame to render as a signal
-	#frame = new Signal<VideoFrame | undefined>(undefined);
-	readonly frame: Getter<VideoFrame | undefined> = this.#frame;
-
-	// The timestamp of the current frame.
-	#timestamp = new Signal<Time.Milli | undefined>(undefined);
-	readonly timestamp: Getter<Time.Milli | undefined> = this.#timestamp;
-
-	// The display size of the video in pixels, ideally sourced from the catalog.
-	#display = new Signal<{ width: number; height: number } | undefined>(undefined);
-	readonly display: Getter<{ width: number; height: number } | undefined> = this.#display;
-
-	#stalled = new Signal<boolean>(false);
-	readonly stalled: Getter<boolean> = this.#stalled;
-
-	#stats = new Signal<Stats | undefined>(undefined);
-	readonly stats: Getter<Stats | undefined> = this.#stats;
-
-	// Combined buffered ranges (network jitter + decode buffer)
-	#buffered = new Signal<BufferedRanges>([]);
-	readonly buffered: Getter<BufferedRanges> = this.#buffered;
-
 	#signals = new Effect();
 
 	#clearCurrentFrame(): void {
-		this.#frame.update((prev) => {
+		this.#out.frame.update((prev) => {
 			prev?.close();
 			return undefined;
 		});
-		this.#timestamp.set(undefined);
+		this.#out.timestamp.set(undefined);
 	}
 
-	constructor(source: Source, props?: DecoderProps) {
-		this.enabled = Signal.from(props?.enabled ?? false);
+	constructor(source: Source, sync: Sync, props?: Inputs<DecoderInput>) {
+		this.in = {
+			enabled: getter(props?.enabled ?? false),
+		};
 
 		this.source = source;
-		this.source.supported.set(supported); // super hacky
+		this.sync = sync;
 
 		this.#signals.run(this.#runPending.bind(this));
 		this.#signals.run(this.#runActive.bind(this));
@@ -74,31 +93,38 @@ export class Decoder implements Backend {
 	}
 
 	#runPending(effect: Effect): void {
-		const values = effect.getAll([this.enabled, this.source.broadcast, this.source.track, this.source.config]);
+		const values = effect.getAll([
+			this.in.enabled,
+			this.source.in.broadcast,
+			this.source.out.track,
+			this.source.out.config,
+		]);
 		if (!values) {
 			// Close the active track when disabled (e.g. paused or not visible).
 			// The pending cleanup won't do this because it was already promoted to #active.
 			this.#active.set(undefined);
 			return;
 		}
-		const [_, source, track, config] = values;
+		const [_, broadcast, track, config] = values;
 
-		const broadcast: Moq.Broadcast | undefined = effect.get(source.active);
-		if (!broadcast) {
+		// Honor a per-rendition `broadcast` override: subscribe on the resolved source
+		// broadcast instead of the catalog's own broadcast.
+		const active: Moq.Broadcast.Consumer | undefined = broadcast.relativeBroadcast(effect, config.broadcast);
+		if (!active) {
 			// Going offline should clear the last rendered frame.
 			this.#active.set(undefined);
 			this.#clearCurrentFrame();
-			this.#buffered.set([]);
+			this.#out.buffered.set([]);
 			return;
 		}
 
 		// Start a new pending effect.
 		let pending: DecoderTrack | undefined = new DecoderTrack({
-			source: this.source,
-			broadcast,
+			sync: this.sync,
+			broadcast: active,
 			track,
 			config,
-			stats: this.#stats,
+			stats: this.#out.stats,
 		});
 
 		effect.cleanup(() => pending?.close());
@@ -106,10 +132,10 @@ export class Decoder implements Backend {
 		effect.run((effect) => {
 			if (!pending) return;
 
-			const active = effect.get(this.#active);
-			if (active) {
+			const current = effect.get(this.#active);
+			if (current) {
 				const pendingTimestamp = effect.get(pending.timestamp);
-				const activeTimestamp = effect.get(active.timestamp);
+				const activeTimestamp = effect.get(current.timestamp);
 
 				// Switch to the new track if it's ready and we've caught up enough.
 				if (!pendingTimestamp) return;
@@ -130,7 +156,7 @@ export class Decoder implements Backend {
 		const active = effect.get(this.#active);
 		if (!active) {
 			// Clear stale data when disabled (e.g. paused or not visible).
-			this.#buffered.set([]);
+			this.#out.buffered.set([]);
 			return;
 		}
 
@@ -140,51 +166,51 @@ export class Decoder implements Backend {
 		// proxy() would share the same reference, allowing the source to close our frame.
 		effect.run((inner) => {
 			const frame = inner.get(active.frame);
-			this.#frame.update((prev) => {
+			this.#out.frame.update((prev) => {
 				prev?.close();
 				return frame?.clone();
 			});
 		});
-		effect.proxy(this.#timestamp, active.timestamp);
-		effect.proxy(this.#buffered, active.buffered);
+		effect.proxy(this.#out.timestamp, active.timestamp);
+		effect.proxy(this.#out.buffered, active.buffered);
 	}
 
 	#runDisplay(effect: Effect): void {
-		const catalog = effect.get(this.source.catalog);
+		const catalog = effect.get(this.source.out.catalog);
 		if (!catalog) return;
 
 		const display = catalog.display;
 		if (display) {
-			effect.set(this.#display, {
+			effect.set(this.#out.display, {
 				width: display.width,
 				height: display.height,
 			});
 			return;
 		}
 
-		const frame = effect.get(this.frame);
+		const frame = effect.get(this.#out.frame);
 		if (!frame) return;
 
-		effect.set(this.#display, {
+		effect.set(this.#out.display, {
 			width: frame.displayWidth,
 			height: frame.displayHeight,
 		});
 	}
 
 	#runBuffering(effect: Effect): void {
-		const enabled = effect.get(this.enabled);
+		const enabled = effect.get(this.in.enabled);
 		if (!enabled) return;
 
-		const frame = effect.get(this.frame);
+		const frame = effect.get(this.#out.frame);
 		if (!frame) {
-			this.#stalled.set(true);
+			this.#out.stalled.set(true);
 			return;
 		}
 
-		this.#stalled.set(false);
+		this.#out.stalled.set(false);
 
 		effect.timer(() => {
-			this.#stalled.set(true);
+			this.#out.stalled.set(true);
 		}, BUFFERING);
 	}
 
@@ -193,11 +219,14 @@ export class Decoder implements Backend {
 
 		this.#signals.close();
 	}
+
+	// Whether the WebCodecs video decoder can play this config.
+	static supported = supported;
 }
 
 interface DecoderTrackProps {
-	source: Source;
-	broadcast: Moq.Broadcast;
+	sync: Sync;
+	broadcast: Moq.Broadcast.Consumer;
 	track: string;
 	config: Catalog.VideoConfig;
 
@@ -205,8 +234,8 @@ interface DecoderTrackProps {
 }
 
 class DecoderTrack {
-	source: Source;
-	broadcast: Moq.Broadcast;
+	sync: Sync;
+	broadcast: Moq.Broadcast.Consumer;
 	track: string;
 	config: RequiredDecoderConfig;
 	stats: Signal<Stats | undefined>;
@@ -215,33 +244,41 @@ class DecoderTrack {
 	frame = new Signal<VideoFrame | undefined>(undefined);
 
 	// Network jitter + decode buffer.
-	buffered = new Signal<BufferedRanges>([]);
+	buffered = new Signal<Container.BufferedRanges>([]);
 
 	// Decoded frames waiting to be rendered.
-	#buffered = new Signal<BufferedRanges>([]);
+	#buffered = new Signal<Container.BufferedRanges>([]);
 
-	signals = new Effect();
+	// The last discontinuity count seen from the container consumer; doubles as a generation
+	// so in-flight decodes from before a rewind can be dropped on output.
+	#discontinuity = 0;
+
+	#signals = new Effect();
 
 	constructor(props: DecoderTrackProps) {
 		// Remove the codedWidth/Height from the config to avoid a hard reload if nothing else has changed.
 		const { codedWidth: _, codedHeight: __, ...requiredConfig } = props.config;
 
-		this.source = props.source;
+		this.sync = props.sync;
 		this.broadcast = props.broadcast;
 		this.track = props.track;
 		this.config = requiredConfig;
 		this.stats = props.stats;
 
-		this.signals.run(this.#run.bind(this));
+		this.#signals.run(this.#run.bind(this));
 	}
 
 	#run(effect: Effect): void {
-		const sub = this.broadcast.subscribe(this.track, Catalog.PRIORITY.video);
+		const sub = this.broadcast.track(this.track).subscribe({ priority: Catalog.PRIORITY.video });
 		effect.cleanup(() => sub.close());
 
 		const decoder = new VideoDecoder({
 			output: async (frame: VideoFrame) => {
 				try {
+					// The generation this frame was decoded in. If a rewind bumps it while we wait
+					// below, this frame belongs to the reneged timeline and must be dropped.
+					const generation = this.#discontinuity;
+
 					const timestamp = Time.Milli.fromMicro(frame.timestamp as Time.Micro);
 					if (timestamp < (this.timestamp.peek() ?? 0)) {
 						// Late frame, don't render it.
@@ -253,9 +290,10 @@ class DecoderTrack {
 						this.frame.set(frame.clone());
 					}
 
-					const wait = this.source.sync.wait(timestamp).then(() => true);
+					const wait = this.sync.wait(timestamp).then(() => true);
 					const ok = await Promise.race([wait, effect.cancel]);
 					if (!ok) return;
+					if (generation !== this.#discontinuity) return; // a rewind happened while waiting
 
 					if (timestamp < (this.timestamp.peek() ?? 0)) {
 						// Late frame, don't render it.
@@ -294,13 +332,13 @@ class DecoderTrack {
 		}
 	}
 
-	#runLegacy(effect: Effect, sub: Moq.Track, decoder: VideoDecoder): void {
+	#runLegacy(effect: Effect, sub: Moq.Track.Subscriber, decoder: VideoDecoder): void {
 		const format =
 			this.config.container.kind === "loc" ? new Container.Loc.Format() : new Container.Legacy.Format();
 		// Create consumer that reorders groups/frames up to the provided latency.
 		const consumer = new Container.Consumer(sub, {
 			format,
-			latency: this.source.sync.buffer,
+			latency: this.sync.out.buffer,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -326,6 +364,9 @@ class DecoderTrack {
 				const next = await consumer.next();
 				if (!next) break;
 
+				// Publisher rewound: flush queued/in-flight video and re-anchor before decoding.
+				if (this.#onDiscontinuity(next.discontinuity)) previous = undefined;
+
 				const { frame, group } = next;
 
 				if (!frame) {
@@ -338,18 +379,18 @@ class DecoderTrack {
 
 				// Mark that we received this frame right now.
 				const timestamp = Time.Milli.fromMicro(frame.timestamp as Time.Micro);
-				this.source.sync.received(timestamp, "video");
+				this.sync.received(timestamp, "video");
 
 				const chunk = new EncodedVideoChunk({
 					type: frame.keyframe ? "key" : "delta",
-					data: frame.data,
+					data: frame.payload,
 					timestamp: frame.timestamp,
 				});
 
 				// Track both frame count and bytes received for stats in the UI
 				this.stats.update((current) => ({
 					frameCount: (current?.frameCount ?? 0) + 1,
-					bytesReceived: (current?.bytesReceived ?? 0) + frame.data.byteLength,
+					bytesReceived: (current?.bytesReceived ?? 0) + frame.payload.byteLength,
 				}));
 
 				// Track decode buffer: frames sent to decoder but not yet rendered
@@ -371,7 +412,7 @@ class DecoderTrack {
 		});
 	}
 
-	#runCmaf(effect: Effect, sub: Moq.Track, decoder: VideoDecoder): void {
+	#runCmaf(effect: Effect, sub: Moq.Track.Subscriber, decoder: VideoDecoder): void {
 		if (this.config.container.kind !== "cmaf") return;
 
 		const initSegment = base64ToBytes(this.config.container.init);
@@ -380,7 +421,7 @@ class DecoderTrack {
 
 		const consumer = new Container.Consumer(sub, {
 			format: new Container.Cmaf.Format(init),
-			latency: this.source.sync.buffer,
+			latency: this.sync.out.buffer,
 		});
 		effect.cleanup(() => consumer.close());
 
@@ -407,6 +448,9 @@ class DecoderTrack {
 				const next = await consumer.next();
 				if (!next) break;
 
+				// Publisher rewound: flush queued/in-flight video and re-anchor before decoding.
+				if (this.#onDiscontinuity(next.discontinuity)) previous = undefined;
+
 				const { frame, group } = next;
 
 				if (!frame) {
@@ -418,12 +462,12 @@ class DecoderTrack {
 
 				// Mark that we received this frame right now.
 				const timestamp = Time.Milli.fromMicro(frame.timestamp);
-				this.source.sync.received(timestamp, "video");
+				this.sync.received(timestamp, "video");
 
 				// Track stats
 				this.stats.update((current) => ({
 					frameCount: (current?.frameCount ?? 0) + 1,
-					bytesReceived: (current?.bytesReceived ?? 0) + frame.data.byteLength,
+					bytesReceived: (current?.bytesReceived ?? 0) + frame.payload.byteLength,
 				}));
 
 				// Track decode buffer
@@ -444,12 +488,28 @@ class DecoderTrack {
 				decoder.decode(
 					new EncodedVideoChunk({
 						type: frame.keyframe ? "key" : "delta",
-						data: frame.data,
+						data: frame.payload,
 						timestamp: frame.timestamp,
 					}),
 				);
 			}
 		});
+	}
+
+	// React to the container consumer's discontinuity counter. On a change the publisher has
+	// rewound the timeline, so drop what's queued downstream and re-anchor the shared clock
+	// before the new utterance. Clearing `timestamp` is load-bearing: otherwise its stale high
+	// value would late-reject the rewound (lower-timestamp) frames at the output guard. Bumping
+	// the generation drops in-flight decodes on output. The held frame is left in place so the
+	// last picture shows until the new keyframe renders, instead of flashing empty. Returns true
+	// if a rewind was handled.
+	#onDiscontinuity(count: number): boolean {
+		if (count === this.#discontinuity) return false;
+		this.#discontinuity = count;
+		this.timestamp.set(undefined);
+		this.#buffered.set([]);
+		this.sync.reset();
+		return true;
 	}
 
 	// Add a range to the decode buffer (decoded, waiting to render)
@@ -485,7 +545,7 @@ class DecoderTrack {
 	}
 
 	close(): void {
-		this.signals.close();
+		this.#signals.close();
 
 		this.frame.update((prev) => {
 			prev?.close();

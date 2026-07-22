@@ -37,6 +37,12 @@ The binary will be in `target/release/moq-relay`.
 cargo install moq-relay
 ```
 
+### Using winget (Windows)
+
+```powershell
+winget install moq-dev.moq-relay
+```
+
 ### Using Nix
 
 ```bash
@@ -51,7 +57,7 @@ nix build github:moq-dev/moq#moq-relay
 
 ```bash
 docker pull moqdev/moq-relay
-docker run -p 4443:4443/udp -v "$(pwd)/relay.toml:/app/relay.toml:ro" moqdev/moq-relay -- --config /app/relay.toml
+docker run -p 4443:4443/udp -v "$(pwd)/relay.toml:/app/relay.toml:ro" moqdev/moq-relay -- /app/relay.toml
 ```
 
 Multi-arch images (`linux/amd64` and `linux/arm64`) are published to [Docker Hub](https://hub.docker.com/r/moqdev/moq-relay).
@@ -64,7 +70,7 @@ Create a `relay.toml` configuration file:
 [server]
 bind = "[::]:4443"  # Listen on all interfaces, port 4443
 
-[tls]
+[server.tls]
 cert = "/path/to/cert.pem"  # TLS certificate
 key = "/path/to/key.pem"    # TLS private key
 
@@ -77,11 +83,7 @@ See [localhost.toml](https://github.com/moq-dev/moq/blob/main/demo/relay/localho
 
 ## Running
 
-```bash
-moq-relay --config relay.toml
-```
-
-Or with the config path as the only argument:
+Pass the config path as the only positional argument:
 
 ```bash
 moq-relay relay.toml
@@ -107,7 +109,7 @@ sudo certbot certonly --standalone -d relay.example.com
 Update `relay.toml`:
 
 ```toml
-[tls]
+[server.tls]
 cert = "/etc/letsencrypt/live/relay.example.com/fullchain.pem"
 key = "/etc/letsencrypt/live/relay.example.com/privkey.pem"
 ```

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3](https://github.com/moq-dev/moq/compare/moq-token-v0.6.2...moq-token-v0.6.3) - 2026-07-18
+
+### Other
+
+- *(deps)* bump the cargo group across 1 directory with 3 updates ([#2273](https://github.com/moq-dev/moq/pull/2273))
+
+## [0.6.2](https://github.com/moq-dev/moq/compare/moq-token-v0.6.1...moq-token-v0.6.2) - 2026-07-05
+
+### Other
+
+- *(deps)* bump the cargo group with 9 updates ([#2098](https://github.com/moq-dev/moq/pull/2098))
+
+## [0.6.1](https://github.com/moq-dev/moq/compare/moq-token-v0.6.0...moq-token-v0.6.1) - 2026-07-04
+
+### Other
+
+- *(rs)* upgrade reqwest 0.12 -> 0.13 across the workspace ([#1972](https://github.com/moq-dev/moq/pull/1972))
+
 ## [0.6.0](https://github.com/moq-dev/moq/compare/moq-token-v0.5.17...moq-token-v0.6.0) - 2026-05-07
 
 ### Other

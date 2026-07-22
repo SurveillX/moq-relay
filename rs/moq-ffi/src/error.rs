@@ -13,7 +13,10 @@ pub enum MoqError {
 	Mux(#[from] moq_mux::Error),
 
 	#[error(transparent)]
-	Audio(#[from] moq_audio::AudioError),
+	JsonTrack(#[from] moq_json::Error),
+
+	#[error(transparent)]
+	Audio(#[from] moq_audio::Error),
 
 	#[error(transparent)]
 	Url(#[from] url::ParseError),
@@ -26,6 +29,9 @@ pub enum MoqError {
 
 	#[error(transparent)]
 	Task(#[from] tokio::task::JoinError),
+
+	#[error("json: {0}")]
+	Json(#[from] serde_json::Error),
 
 	#[error("cancelled")]
 	Cancelled,
@@ -50,6 +56,21 @@ pub enum MoqError {
 
 	#[error("unauthorized")]
 	Unauthorized,
+
+	#[error("forbidden")]
+	Forbidden,
+
+	/// The requested track or group is not available.
+	#[error("not found")]
+	NotFound,
+
+	/// The requested operation is not supported.
+	#[error("unsupported")]
+	Unsupported,
+
+	/// A route carried an invalid hop id or too many hops.
+	#[error("invalid route: {0}")]
+	InvalidRoute(String),
 
 	#[error("log: {0}")]
 	Log(String),

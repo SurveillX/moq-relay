@@ -1,4 +1,9 @@
-import { Signal } from "@moq/signals";
+/**
+ * Broadcast announcement streams: which broadcast paths are available under a prefix.
+ *
+ * @module
+ */
+import { type GetPromise, Once, Signal } from "@moq/signals";
 import * as Path from "./path.js";
 
 /**
@@ -6,73 +11,118 @@ import * as Path from "./path.js";
  *
  * @public
  */
-export interface AnnouncedEntry {
+export interface Event {
+	/** Broadcast path relative to the prefix passed to `announced()`. */
 	path: Path.Valid;
+	/** True when the broadcast is available, false when it was removed. */
 	active: boolean;
 }
 
-export class AnnouncedState {
-	queue = new Signal<AnnouncedEntry[]>([]);
-	closed = new Signal<boolean | Error>(false);
+/** Reactive backing state shared by announcement producers and consumers. */
+class AnnounceState {
+	queue = new Signal<Event[]>([]);
+	closed = new Once<Error | null>();
+}
+
+// Once.set throws on a second settle, and both ends of a stream can close independently.
+function closeState(state: AnnounceState, abort?: Error) {
+	if (state.closed.peek() !== undefined) return;
+	state.closed.set(abort ?? null);
+	state.queue.mutate((queue) => {
+		queue.length = 0;
+	});
 }
 
 /**
- * Handles writing announcements to the announcement queue.
+ * The write side of an announcement stream.
  *
  * @public
  */
-export class Announced {
-	state = new AnnouncedState();
+export class Producer {
+	/** Path prefix this stream is scoped to. */
 	prefix: Path.Valid;
 
-	readonly closed: Promise<Error | undefined>;
+	#state = new AnnounceState();
 
 	constructor(prefix = Path.empty()) {
 		this.prefix = prefix;
-		this.closed = new Promise((resolve) => {
-			const dispose = this.state.closed.subscribe((closed) => {
-				if (!closed) return;
-				resolve(closed instanceof Error ? closed : undefined);
-				dispose();
-			});
-		});
 	}
 
 	/**
-	 * Writes an announcement to the queue.
-	 * @param announcement - The announcement to write
+	 * Settles once the stream closes: `null` on a clean close, or the abort {@link Error}.
+	 * Peek it synchronously (`undefined` while open), observe it reactively, or `await` it.
 	 */
-	append(announcement: AnnouncedEntry) {
-		if (this.state.closed.peek()) throw new Error("announced is closed");
-		this.state.queue.mutate((queue) => {
-			queue.push(announcement);
+	get closed(): GetPromise<Error | null> {
+		return this.#state.closed;
+	}
+
+	/** A read handle for this announcement stream. */
+	consume(): Consumer {
+		return makeConsumer(this.prefix, this.#state);
+	}
+
+	/** Writes an announcement to the queue. */
+	append(event: Event) {
+		if (this.#state.closed.peek() !== undefined) throw new Error("announcements are closed");
+		this.#state.queue.mutate((queue) => {
+			queue.push(event);
 		});
 	}
 
-	/**
-	 * Closes the writer.
-	 * @param abort - If provided, throw this exception instead of returning undefined.
-	 */
+	/** Closes the writer. Idempotent. */
 	close(abort?: Error) {
-		this.state.closed.set(abort ?? true);
-		this.state.queue.mutate((queue) => {
-			queue.length = 0;
-		});
+		closeState(this.#state, abort);
+	}
+}
+
+// Constructs a Consumer from within this module without exposing a public constructor
+// that would leak the unexported AnnounceState. Assigned in the class's static block.
+let makeConsumer: (prefix: Path.Valid, state: AnnounceState) => Consumer;
+
+/**
+ * The read side of an announcement stream.
+ *
+ * Created internally: obtain one from {@link Producer.consume} or the connection's
+ * `announced(prefix)`.
+ *
+ * @public
+ */
+export class Consumer {
+	/** Path prefix this stream is scoped to. */
+	prefix: Path.Valid;
+
+	#state: AnnounceState;
+
+	private constructor(prefix: Path.Valid, state: AnnounceState) {
+		this.prefix = prefix;
+		this.#state = state;
 	}
 
-	/**
-	 * Returns the next announcement.
-	 */
-	async next(): Promise<AnnouncedEntry | undefined> {
+	/** Settles once the stream closes; see {@link Producer.closed}. */
+	get closed(): GetPromise<Error | null> {
+		return this.#state.closed;
+	}
+
+	static {
+		makeConsumer = (prefix, state) => new Consumer(prefix, state);
+	}
+
+	/** Returns the next announcement. */
+	async next(): Promise<Event | undefined> {
 		for (;;) {
-			const announce = this.state.queue.peek().shift();
+			const announce = this.#state.queue.peek().shift();
 			if (announce) return announce;
 
-			const closed = this.state.closed.peek();
+			const closed = this.#state.closed.peek();
 			if (closed instanceof Error) throw closed;
-			if (closed) return undefined;
+			if (closed !== undefined) return undefined;
 
-			await Signal.race(this.state.queue, this.state.closed);
+			await Signal.race(this.#state.queue, this.#state.closed);
 		}
+	}
+
+	/** Closes the reader. Idempotent. */
+	close(abort?: Error) {
+		closeState(this.#state, abort);
 	}
 }

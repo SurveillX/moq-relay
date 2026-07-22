@@ -55,7 +55,10 @@
             "rust-src"
             "rust-analyzer"
           ];
-          targets = pkgs.lib.optionals pkgs.stdenv.isDarwin [
+          targets = [
+            "wasm32-unknown-unknown"
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
             "x86_64-apple-darwin"
             "aarch64-apple-darwin"
           ];
@@ -70,6 +73,13 @@
           gst_all_1.gst-plugins-bad
         ];
 
+        tsduck = pkgs.tsduck.overrideAttrs (
+          old:
+          pkgs.lib.optionalAttrs pkgs.stdenv.isDarwin {
+            makeFlags = old.makeFlags ++ [ "CXXFLAGS_WARNINGS=" ];
+          }
+        );
+
         # Rust dependencies
         rustDeps =
           with pkgs;
@@ -79,16 +89,26 @@
             git
             cmake
             pkg-config
+            # Sets LIBCLANG_PATH + BINDGEN_EXTRA_CLANG_ARGS so ffmpeg-sys-next's
+            # bindgen finds libc headers (<errno.h>) on hosts without system
+            # headers in /usr/include, e.g. the self-hosted runner.
+            rustPlatform.bindgenHook
             glib
             libressl
             ffmpeg
             curl
+            # MPEG-TS validation (tsp, tsanalyze) for the ts-compliance harness.
+            tsduck
             cargo-sort
             cargo-shear
             cargo-edit
-            cargo-sweep
             cargo-semver-checks
             cargo-deny
+            cargo-nextest
+            # Browser/WASM bindings (rs/moq-wasm -> @moq/wasm via `just wasm`).
+            # wasm-bindgen-cli must match the `wasm-bindgen` crate version (the
+            # crate is pinned to nixpkgs' CLI version); bump both together.
+            wasm-bindgen-cli
           ]
           ++ gstreamerDeps
           ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [
@@ -97,6 +117,18 @@
             # cpal's `alsa-sys` (moq-audio `capture` feature) links libasound on
             # Linux via pkg-config; macOS uses CoreAudio, so no dep there.
             pkgs.alsa-lib
+            # moq-video's VAAPI backend (always-on for Linux): moq-vaapi links
+            # libva via pkg-config at build time and the resulting binary carries
+            # NEEDED libva.so.2 / libva-drm.so.2, so libva must be present both to
+            # build and to run vaapi in the devShell. macOS has no VAAPI. (See
+            # #1837: if moq-vaapi switches to dlopen'ing libva, this stays needed
+            # only to run it, and a libva-less build/host would fall back cleanly.)
+            pkgs.libva
+            # moq-video's `pipewire` screen-capture feature: the pipewire crate
+            # links libpipewire-0.3 via pkg-config and generates bindings at build
+            # time (bindgenHook above provides libclang). Linux-only; macOS uses
+            # ScreenCaptureKit.
+            pkgs.pipewire
           ];
 
         # JavaScript dependencies
@@ -104,6 +136,9 @@
           bun
           # Only for NPM publishing
           nodejs_24
+          # JSR publishing. We call `deno publish` directly instead of `bunx jsr`
+          # so the release doesn't race on a runtime binary download.
+          deno
         ];
 
         # Python dependencies
@@ -115,6 +150,16 @@
         # CDN/deployment dependencies
         cdnDeps = with pkgs; [
           opentofu
+        ];
+
+        # IETF Internet-Draft tooling (drafts/justfile). kramdown-rfc renders
+        # the kramdown-rfc markdown to RFC XML; xml2rfc produces the txt/html;
+        # mmark covers any mmark-format drafts; libxml2 provides xmllint.
+        draftsDeps = with pkgs; [
+          rubyPackages.kramdown-rfc2629
+          xml2rfc
+          mmark
+          libxml2
         ];
 
         # Tools for producing .deb/.rpm artifacts. Cross-platform so that
@@ -145,6 +190,12 @@
             gzip
           ];
 
+        # Developer workflow tooling not needed for builds: the GitHub CLI
+        # for opening/reviewing PRs from the dev shell.
+        devTools = with pkgs; [
+          gh
+        ];
+
         # Linters / formatters required by `just ci`; `just check` and
         # `just fix` guard each tool with `command -v` so they skip
         # silently when the binary isn't on $PATH.
@@ -156,6 +207,31 @@
           nixfmt
         ];
 
+        # Kotlin wrapper (kt/) toolchain so `just kt check` actually compiles
+        # the wrapper and runs :moq:jvmTest instead of silently skipping.
+        # Pinned to gradle 8.x (Kotlin 2.0.21's Gradle plugin predates Gradle
+        # 9) and JDK 17 (the wrapper's jvmTarget). Cross-platform: the kt check
+        # builds moq-ffi for the host and runs on both Linux and macOS.
+        ktDeps = with pkgs; [
+          jdk17
+          gradle_8
+        ];
+
+        # Dependencies for building the OBS plugin (`just obs build`).
+        # Linux-only: nixpkgs marks obs-studio broken on Darwin, so macOS
+        # and Windows fetch libobs/Qt6 via the OBS buildspec instead (see
+        # cpp/obs/buildspec.json and doc/bin/obs.md). ffmpeg + cmake come from
+        # rustDeps. clang-tools/gersemi back `just obs check`.
+        obsDeps =
+          with pkgs;
+          lib.optionals (!stdenv.isDarwin) [
+            obs-studio
+            qt6.qtbase
+            ninja
+            clang-tools
+            gersemi
+          ];
+
         # Apply our overlay to get the package definitions
         overlayPkgs = pkgs.extend self.overlays.default;
       in
@@ -166,7 +242,7 @@
             paths = [
               moq-relay
               moq-cli
-              moq-token-cli
+              moq-token
             ];
           };
 
@@ -174,6 +250,8 @@
           inherit (overlayPkgs)
             moq-relay
             moq-cli
+            moq-bench
+            moq-token
             moq-token-cli
             moq-boy
             libmoq
@@ -196,6 +274,8 @@
           inherit (overlayPkgs)
             moq-relay-x86_64-apple-darwin
             moq-cli-x86_64-apple-darwin
+            moq-bench-x86_64-apple-darwin
+            moq-token-x86_64-apple-darwin
             moq-token-cli-x86_64-apple-darwin
             libmoq-x86_64-apple-darwin
             moq-gst-plugin-x86_64-apple-darwin
@@ -215,18 +295,38 @@
         };
 
         devShells.default = pkgs.mkShell {
-          packages = rustDeps ++ jsDeps ++ pyDeps ++ cdnDeps ++ packagingDeps ++ lintDeps;
+          packages =
+            rustDeps
+            ++ jsDeps
+            ++ pyDeps
+            ++ cdnDeps
+            ++ draftsDeps
+            ++ packagingDeps
+            ++ lintDeps
+            ++ obsDeps
+            ++ ktDeps
+            ++ devTools;
 
           # jemalloc's configure uses -O0 test builds, which conflict with
           # Nix's _FORTIFY_SOURCE hardening (requires -O).
           hardeningDisable = [ "fortify" ];
 
-          shellHook = ''
-            export LIBCLANG_PATH="${pkgs.libclang.lib}/lib"
-          '';
         };
 
         formatter = pkgs.nixfmt-tree;
+
+        # Heavy Rust CI (clippy / doc / test) runs as plain cargo via `just rs
+        # ci` (see rs/justfile), no longer through crane. `nix flake check` is
+        # kept -- it still validates flake eval + builds the dev shell -- but no
+        # longer compiles the workspace, so it's cheap. Release artifacts still
+        # build via crane `buildPackage` (see `packages` above / release-*.yml).
+        #
+        # On the self-hosted runner those cargo checks transparently reuse a
+        # per-crate compiler cache (rustc is wrapped by sccache via the runner
+        # environment), so a Cargo.lock change recompiles only the changed crate
+        # + its reverse-deps. That's a runner-side concern -- nothing here or in
+        # the workflows configures it.
+        checks = { };
       }
     );
 }

@@ -1,4 +1,12 @@
+//! WebSocket fallback transport, running the QMux wire format over `ws://` or `wss://`.
+//!
+//! Used when QUIC is unreachable: UDP blocked by a firewall, a proxy in the way, a
+//! network that only passes TCP/443. The client races this against QUIC and gives QUIC
+//! a small head start ([`Client::delay`]), so WebSocket only wins when QUIC can't get
+//! through. Servers accept it on a separate TCP port via [`Listener`].
+
 use qmux::tokio_tungstenite;
+use qmux::tokio_tungstenite::tungstenite::{self, http};
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::{net, time};
@@ -8,21 +16,44 @@ use url::Url;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+	/// The TCP socket failed to bind, accept, or connect.
 	#[error(transparent)]
 	Io(#[from] std::io::Error),
 
+	/// WebSocket fallback was turned off via [`Client::enabled`].
 	#[error("WebSocket support is disabled")]
 	Disabled,
 
+	/// The URL had no host to dial.
 	#[error("missing hostname")]
 	MissingHostname,
 
+	/// The URL scheme can't carry WebSocket. Only `http`, `https`, `ws`, and `wss` work.
 	#[error("unsupported URL scheme for WebSocket: {0}")]
 	UnsupportedScheme(String),
 
+	/// The qmux handshake failed while dialing, including a non-101 upgrade response
+	/// from the server.
 	#[error("failed to connect WebSocket")]
 	Connect(#[source] qmux::Error),
 
+	/// The URL couldn't be turned into a valid WebSocket handshake request.
+	#[error("failed to build WebSocket request")]
+	BuildRequest(#[source] tungstenite::Error),
+
+	/// An ALPN contained bytes that aren't legal in the `Sec-WebSocket-Protocol` header.
+	#[error("failed to build WebSocket protocols header")]
+	ProtocolHeader(#[source] http::header::InvalidHeaderValue),
+
+	/// The TCP/TLS connection or the WebSocket upgrade itself failed.
+	#[error("failed to connect WebSocket")]
+	WebSocketConnect(#[source] tungstenite::Error),
+
+	/// The server refused the connection outright, so retrying won't help.
+	#[error(transparent)]
+	ConnectRejected(#[from] crate::ConnectError),
+
+	/// The qmux handshake failed while accepting an incoming connection.
 	#[error("WebSocket accept failed")]
 	Accept(#[source] qmux::Error),
 }
@@ -141,17 +172,22 @@ pub(crate) async fn connect(
 
 	tracing::debug!(%url, "connecting via WebSocket");
 
-	// Use the existing TLS config (which respects tls-disable-verify) for secure connections
+	// Use the existing TLS config (which respects tls-disable-verify) for secure connections.
 	let connector = if needs_tls {
 		tokio_tungstenite::Connector::Rustls(Arc::new(tls.clone()))
 	} else {
 		tokio_tungstenite::Connector::Plain
 	};
 
+	// Most moq ALPNs can ride on any QMux draft (`&[]` lets the polyfill expand
+	// to every version it knows). `qmux_versions_for` pins the few that the spec
+	// restricts. qmux also offers the bare ALPNs (`qmux-01`, `qmux-00`,
+	// `webtransport`) by default so we still interop with relays that only know a
+	// wire-format version.
 	let session = qmux::Client::new()
-		.with_protocols(alpns)
+		.with_protocols(alpns.iter().map(|&a| (a, qmux_versions_for(a))))
 		.with_connector(connector)
-		.with_keep_alive(qmux::KeepAlive::default()) // 5s ping / 30s deadline — parity with QUIC
+		.with_keep_alive(qmux::KeepAlive::default()) // 5s ping / 30s deadline, parity with QUIC
 		.connect(url.as_str())
 		.await
 		.map_err(Error::Connect)?;
@@ -160,6 +196,33 @@ pub(crate) async fn connect(
 	WEBSOCKET_WON.lock().unwrap().insert(key);
 
 	Ok(session)
+}
+
+/// The QMux drafts a moq ALPN is allowed to ride on, for `qmux::*::with_protocols`.
+///
+/// moq-transport-18 and -19 require qmux-01, so we never pair them with qmux-00.
+/// This mirrors the policy in `js/net`'s `connect.ts`. Every other ALPN returns
+/// `&[]`, which qmux expands to every draft it knows about.
+const QMUX01_ONLY_ALPNS: &[&str] = &["moqt-18", "moqt-19"];
+
+fn qmux_versions_for(alpn: &str) -> &'static [qmux::Version] {
+	if QMUX01_ONLY_ALPNS.contains(&alpn) {
+		&[qmux::Version::QMux01]
+	} else {
+		&[]
+	}
+}
+
+impl Error {
+	pub(crate) fn connect_error(&self) -> Option<crate::ConnectError> {
+		match self {
+			Self::ConnectRejected(err) => Some(*err),
+			// qmux surfaces a non-101 WebSocket upgrade response as `Http(status)`;
+			// map an auth rejection (401/403) so the caller sees it as terminal.
+			Self::Connect(qmux::Error::Http(status)) => crate::ConnectError::from_status_u16(*status),
+			_ => None,
+		}
+	}
 }
 
 /// Listens for incoming WebSocket connections on a TCP port.
@@ -172,20 +235,30 @@ pub struct Listener {
 }
 
 impl Listener {
+	/// Bind a listener to the given address, accepting every moq ALPN we know about.
 	pub async fn bind(addr: net::SocketAddr) -> Result<Self> {
 		Self::bind_with_alpns(addr, moq_net::ALPNS).await
 	}
 
+	/// Bind a listener that only accepts the given moq ALPNs, in preference order.
 	pub async fn bind_with_alpns(addr: net::SocketAddr, alpns: &[&str]) -> Result<Self> {
 		let listener = tokio::net::TcpListener::bind(addr).await?;
-		let server = qmux::Server::new().with_protocols(alpns);
+		// `qmux_versions_for` returns `&[]` (every QMux draft) for ALPNs the spec
+		// doesn't restrict; qmux by default also accepts legacy clients that
+		// only offer a bare wire-format ALPN (today's moq-net clients still do).
+		let server = qmux::Server::new().with_protocols(alpns.iter().map(|&a| (a, qmux_versions_for(a))));
 		Ok(Self { listener, server })
 	}
 
+	/// The local address the listener is bound to.
 	pub fn local_addr(&self) -> Result<net::SocketAddr> {
 		Ok(self.listener.local_addr()?)
 	}
 
+	/// Accept the next connection, performing the WebSocket upgrade and qmux handshake.
+	///
+	/// Returns `None` only if the listener itself is gone; a per-connection failure is
+	/// yielded as `Some(Err(..))` so the accept loop keeps running.
 	pub async fn accept(&self) -> Option<Result<qmux::Session>> {
 		match self.listener.accept().await {
 			Ok((stream, addr)) => {
@@ -194,6 +267,34 @@ impl Listener {
 				Some(server.accept(stream).await.map_err(Error::Accept))
 			}
 			Err(e) => Some(Err(e.into())),
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn moqt_18_and_19_pin_to_qmux01() {
+		// The literals in `qmux_versions_for` must stay the IETF draft ALPNs;
+		// otherwise the pin silently stops matching.
+		assert_eq!(
+			QMUX01_ONLY_ALPNS
+				.iter()
+				.map(|&a| moq_net::Version::from_alpn(a).map(|v| v.code()))
+				.collect::<Vec<_>>(),
+			vec![Some(0xff000012), Some(0xff000013)]
+		);
+		for &alpn in QMUX01_ONLY_ALPNS {
+			assert_eq!(qmux_versions_for(alpn), &[qmux::Version::QMux01]);
+		}
+
+		// Everything else stays unrestricted (qmux expands `&[]` to all drafts).
+		for &alpn in moq_net::ALPNS {
+			if !QMUX01_ONLY_ALPNS.contains(&alpn) {
+				assert!(qmux_versions_for(alpn).is_empty(), "{alpn} should not be pinned");
+			}
 		}
 	}
 }

@@ -3,13 +3,30 @@ import * as Json from "@moq/json";
 import * as Msf from "@moq/msf";
 import type * as Moq from "@moq/net";
 import { Path } from "@moq/net";
-import { Effect, type Getter, Signal } from "@moq/signals";
+import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 
 import { toHang } from "./msf";
 
-// Watch supports the two on-the-wire catalog formats from @moq/hang plus a
-// "manual" mode where the user supplies the catalog directly without fetching.
-export const CATALOG_FORMATS = [...Catalog.FORMATS, "manual"] as const;
+// Connections already warned about missing broadcast-discovery support, so the
+// announcement check logs at most once per connection.
+const warnedNoDiscovery = new WeakSet<Moq.Connection.Established>();
+
+// Whether to skip the announcement gate for this connection: without discovery, waiting on an
+// announcement would hang forever, so subscribe immediately and warn once per connection.
+function skipDiscovery(conn: Moq.Connection.Established): boolean {
+	if (conn.discovery) return false;
+	if (!warnedNoDiscovery.has(conn)) {
+		warnedNoDiscovery.add(conn);
+		console.warn("relay does not support broadcast discovery; ignoring reload signal.");
+	}
+	return true;
+}
+
+// Watch supports the on-the-wire catalog formats from @moq/hang, plus "hangz" (the
+// DEFLATE-compressed `catalog.json.z` track) and a "manual" mode where the user supplies the
+// catalog directly without fetching. "hangz" is opt-in only: it shares the `.hang` broadcast suffix
+// and is never auto-detected, so set it explicitly via `catalogFormat`.
+export const CATALOG_FORMATS = [...Catalog.FORMATS, "hangz", "manual"] as const;
 export type CatalogFormat = (typeof CATALOG_FORMATS)[number];
 
 export function parseCatalogFormat(value: string | null): CatalogFormat | undefined {
@@ -17,151 +34,217 @@ export function parseCatalogFormat(value: string | null): CatalogFormat | undefi
 	return CATALOG_FORMATS.find((f) => f === value);
 }
 
-export interface BroadcastProps {
-	connection?: Moq.Connection.Established | Signal<Moq.Connection.Established | undefined>;
+type Status = "offline" | "loading" | "live";
 
-	// All actively announced broadcast paths from the connection.
-	announced?: Getter<Set<Moq.Path.Valid>>;
+// Signals the component reads. Whoever owns the backing Signal (the caller, or
+// another component whose output is wired in) does the writing.
+export type BroadcastInput = {
+	connection: Getter<Moq.Connection.Established | undefined>;
 
 	// Whether to start downloading the broadcast.
 	// Defaults to false so you can make sure everything is ready before starting.
-	enabled?: boolean | Signal<boolean>;
+	enabled: Getter<boolean>;
 
 	// The broadcast name.
-	name?: Moq.Path.Valid | Signal<Moq.Path.Valid>;
+	name: Getter<Moq.Path.Valid>;
 
 	// Whether to reload the broadcast when it goes offline.
-	// Defaults to false; pass true to wait for an announcement before subscribing.
-	reload?: boolean | Signal<boolean>;
+	// Defaults to true; pass false to subscribe immediately without waiting for an announcement.
+	reload: Getter<boolean>;
 
 	// Which catalog format to use. When `undefined` (the default), the format is
 	// auto-detected from the broadcast name extension (`.hang`, `.msf`), falling
 	// back to `"hang"` if the name has no recognized extension. Set to a
-	// specific value to override auto-detection.
-	catalogFormat?: CatalogFormat | Signal<CatalogFormat | undefined>;
+	// specific value to override auto-detection. `"hangz"` (the compressed
+	// `catalog.json.z` track) is opt-in only and never auto-detected.
+	catalogFormat: Getter<CatalogFormat | undefined>;
 
-	// Initial catalog. Used directly when catalogFormat is "manual"; otherwise it's
-	// overwritten by whatever the fetched catalog track produces. Note: switching
-	// catalogFormat between "manual" and a fetched format will reset this signal
-	// to undefined when the fetched-format spawn tears down. Set the catalog
-	// after switching formats, not before.
-	catalog?: Catalog.Root | Signal<Catalog.Root | undefined>;
-}
+	// The manual-mode catalog source. Used directly when catalogFormat is "manual";
+	// ignored otherwise. Read `output.catalog` for the effective catalog in any mode.
+	catalog: Getter<Catalog.Root | undefined>;
+};
+
+type BroadcastOutput = {
+	status: Signal<Status>;
+	active: Signal<Moq.Broadcast.Consumer | undefined>;
+
+	// The effective catalog: the fetched one, or a copy of input.catalog in manual mode.
+	catalog: Signal<Catalog.Root | undefined>;
+};
 
 // A catalog source that (optionally) reloads automatically when live/offline.
 export class Broadcast {
-	connection: Signal<Moq.Connection.Established | undefined>;
+	readonly in: Readonlys<BroadcastInput>;
 
-	enabled: Signal<boolean>;
-	name: Signal<Moq.Path.Valid>;
-	status = new Signal<"offline" | "loading" | "live">("offline");
-	reload: Signal<boolean>;
+	readonly #out: BroadcastOutput = {
+		status: new Signal<Status>("offline"),
+		active: new Signal<Moq.Broadcast.Consumer | undefined>(undefined),
+		catalog: new Signal<Catalog.Root | undefined>(undefined),
+	};
+	readonly out = readonlys(this.#out);
 
-	// `undefined` means auto-detect from the broadcast name extension.
-	catalogFormat: Signal<CatalogFormat | undefined>;
+	// The set of announced paths on the connection, for cross-broadcast (`broadcast: ../`) references
+	// so `relativeBroadcast` can gate on whether a sibling is announced. `undefined` until the stream
+	// is open. Opened lazily; the main broadcast doesn't use it (`#runBroadcast` drives off its own
+	// name-scoped stream).
+	readonly #announced = new Signal<Set<Moq.Path.Valid> | undefined>(undefined);
 
-	#active = new Signal<Moq.Broadcast | undefined>(undefined);
-	readonly active: Getter<Moq.Broadcast | undefined> = this.#active;
+	// Set true the first time a relative reference needs the announcement gate, so a broadcast with
+	// no cross-broadcast renditions never opens the (broad) connection-scoped announcement stream.
+	readonly #wantAnnounced = new Signal(false);
 
-	// The active catalog. Writable so users can supply it directly when
-	// catalogFormat is "manual"; otherwise the fetch loop owns writes.
-	catalog: Signal<Catalog.Root | undefined>;
+	#signals = new Effect();
 
-	// All actively announced broadcast paths from the connection.
-	#announced: Getter<Set<Moq.Path.Valid>>;
+	constructor(props?: Inputs<BroadcastInput>) {
+		this.in = {
+			connection: getter(props?.connection),
+			name: getter(props?.name ?? Path.empty()),
+			enabled: getter(props?.enabled ?? false),
+			reload: getter(props?.reload ?? true),
+			catalogFormat: getter<CatalogFormat | undefined>(props?.catalogFormat),
+			catalog: getter(props?.catalog),
+		};
 
-	// Whether `name` is currently in the announced set (or skipping the check).
-	// Derived in its own effect so that flaps for unrelated broadcasts don't
-	// retrigger the broadcast/catalog subscriptions.
-	#announcedNow = new Signal(false);
-
-	signals = new Effect();
-
-	constructor(props?: BroadcastProps) {
-		this.connection = Signal.from(props?.connection);
-		this.name = Signal.from(props?.name ?? Path.empty());
-		this.enabled = Signal.from(props?.enabled ?? false);
-		this.reload = Signal.from(props?.reload ?? false);
-		this.catalogFormat = Signal.from<CatalogFormat | undefined>(props?.catalogFormat);
-		this.catalog = Signal.from(props?.catalog);
-
-		this.#announced = props?.announced ?? new Signal(new Set());
-
-		this.signals.run(this.#runAnnouncedNow.bind(this));
-		this.signals.run(this.#runBroadcast.bind(this));
-		this.signals.run(this.#runCatalog.bind(this));
+		this.#signals.run(this.#runAnnounced.bind(this));
+		this.#signals.run(this.#runBroadcast.bind(this));
+		this.#signals.run(this.#runCatalog.bind(this));
 	}
 
-	#runAnnouncedNow(effect: Effect): void {
-		const reload = effect.get(this.reload);
-		if (!reload) {
-			this.#announcedNow.set(true);
-			return;
-		}
+	// Maintain the set of announced paths used by `relativeBroadcast`, by draining a connection-scoped
+	// announcement stream. Only opened once a relative reference asks for it (see `#wantAnnounced`),
+	// and reopened per connection.
+	#runAnnounced(effect: Effect): void {
+		this.#announced.set(undefined);
 
-		// Cloudflare's relay does not yet support announcement subscriptions,
-		// so an announcement will never arrive. Fall back to subscribing
-		// immediately (reload=false behaviour) instead of waiting forever.
-		const conn = effect.get(this.connection);
-		if (conn?.url.hostname.endsWith("mediaoverquic.com")) {
-			console.warn("Cloudflare relay does not support broadcast discovery yet; ignoring reload signal.");
-			this.#announcedNow.set(true);
-			return;
-		}
+		if (!effect.get(this.#wantAnnounced)) return;
+		if (!effect.get(this.in.reload)) return;
 
-		const name = effect.get(this.name);
-		const announced = effect.get(this.#announced);
-		this.#announcedNow.set(announced.has(name));
+		const conn = effect.get(this.in.connection);
+		if (!conn || skipDiscovery(conn)) return;
+
+		const announced = conn.announced(Path.empty());
+		effect.cleanup(() => announced.close());
+		this.#announced.set(new Set());
+
+		effect.spawn(async () => {
+			for (;;) {
+				const entry = await Promise.race([effect.cancel, announced.next()]);
+				if (!entry) break;
+				this.#announced.mutate((active) => {
+					if (!active) return;
+					if (entry.active) active.add(entry.path);
+					else active.delete(entry.path);
+				});
+			}
+		});
 	}
 
+	// Whether `path` is currently announced, for `relativeBroadcast`'s cross-broadcast refs. Returns
+	// true (subscribe immediately) when the gate can't apply: reload is off, or the relay doesn't
+	// support discovery. Opens the announcement stream on first use.
+	#isPathAnnounced(effect: Effect, path: Moq.Path.Valid): boolean {
+		if (!effect.get(this.in.reload)) return true;
+
+		const conn = effect.get(this.in.connection);
+		if (conn && skipDiscovery(conn)) return true;
+
+		this.#wantAnnounced.set(true);
+
+		const active = effect.get(this.#announced);
+		if (!active) return false; // stream not open yet: wait rather than subscribe to a maybe-absent path
+		return active.has(path);
+	}
+
+	// Subscribe to the broadcast, re-consuming on every (re-)announce so a same-name republish (a new
+	// publisher, or a relay-failover RESTART) re-attaches to the new instance instead of clinging to
+	// the dead one. Driven off the announcement stream's updates rather than a membership flag, since
+	// a coalesced republish leaves the active set unchanged yet still emits a fresh update.
 	#runBroadcast(effect: Effect): void {
-		const enabled = effect.get(this.enabled);
+		const enabled = effect.get(this.in.enabled);
 		if (!enabled) return;
 
-		if (!effect.get(this.#announcedNow)) return;
-
-		const conn = effect.get(this.connection);
+		const conn = effect.get(this.in.connection);
 		if (!conn) return;
 
-		const name = effect.get(this.name);
-		const broadcast = conn.consume(name);
-		effect.cleanup(() => broadcast.close());
+		const name = effect.get(this.in.name);
 
-		effect.set(this.#active, broadcast, undefined);
+		// No announcement gate: subscribe immediately (reload off, or the relay lacks discovery).
+		if (!effect.get(this.in.reload) || skipDiscovery(conn)) {
+			const broadcast = conn.consume(name);
+			effect.cleanup(() => broadcast.close());
+			effect.set(this.#out.active, broadcast, undefined);
+			return;
+		}
+
+		const announced = conn.announced(name);
+		effect.cleanup(() => announced.close());
+
+		let current: Moq.Broadcast.Consumer | undefined;
+		effect.cleanup(() => {
+			current?.close();
+			current = undefined;
+			this.#out.active.set(undefined);
+		});
+
+		effect.spawn(async () => {
+			for (;;) {
+				const event = await Promise.race([effect.cancel, announced.next()]);
+				if (!event) break;
+
+				// Scoped to `name`, so the exact broadcast arrives with an empty suffix; ignore children.
+				if (event.path !== Path.empty()) continue;
+
+				if (event.active) {
+					// A live subscription survives a redundant (re-)announce; only replace a dead one.
+					if (current && current.closed.peek() === undefined) continue;
+					current?.close();
+					current = conn.consume(name);
+					this.#out.active.set(current);
+				} else {
+					current?.close();
+					current = undefined;
+					this.#out.active.set(undefined);
+				}
+			}
+		});
 	}
 
 	#runCatalog(effect: Effect): void {
-		const enabled = effect.get(this.enabled);
+		const enabled = effect.get(this.in.enabled);
 		if (!enabled) return;
 
-		const catalogFormat = effect.get(this.catalogFormat);
-		const name = effect.get(this.name);
+		const catalogFormat = effect.get(this.in.catalogFormat);
+		const name = effect.get(this.in.name);
 		// Explicit override beats name-derived auto-detection. When neither is
 		// set we fall back to the default, keeping legacy names that have no
 		// extension working.
 		const format: CatalogFormat = catalogFormat ?? Catalog.detectFormat(name) ?? Catalog.DEFAULT_FORMAT;
 
 		if (format === "manual") {
-			// User-supplied catalog; no track to fetch.
-			const catalog = effect.get(this.catalog);
-			this.status.set(catalog ? "live" : "loading");
+			// Mirror the caller-supplied catalog into the effective output.
+			const catalog = effect.get(this.in.catalog);
+			effect.set(this.#out.catalog, catalog, undefined);
+			this.#out.status.set(catalog ? "live" : "loading");
 			return;
 		}
 
-		const broadcast = effect.get(this.active);
+		const broadcast = effect.get(this.out.active);
 		if (!broadcast) return;
 
-		this.status.set("loading");
+		this.#out.status.set("loading");
 
-		const trackName = format === "hang" ? "catalog.json" : "catalog";
-		const track = broadcast.subscribe(trackName, Catalog.PRIORITY.catalog);
+		const trackName = format === "hang" ? Catalog.TRACK : format === "hangz" ? Catalog.TRACK_COMPRESSED : "catalog";
+		const track = broadcast.track(trackName).subscribe({ priority: Catalog.PRIORITY.catalog });
 		effect.cleanup(() => track.close());
 
-		// The hang catalog is reconstructed from snapshots (and future deltas) via @moq/json;
-		// MSF stays on its own one-blob-per-group fetch.
+		// The hang catalog is reconstructed from snapshots (and future deltas) via @moq/json, with
+		// "hangz" decompressing the `.z` track; MSF stays on its own one-blob-per-group fetch.
 		let fetchNext: () => Promise<Catalog.Root | undefined>;
-		if (format === "hang") {
-			const consumer = new Json.Consumer<Catalog.Root>(track, { schema: Catalog.RootSchema });
+		if (format === "hang" || format === "hangz") {
+			const consumer = new Json.Snapshot.Consumer<Catalog.Root>(track, {
+				schema: Catalog.RootSchema,
+				compression: format === "hangz",
+			});
 			fetchNext = () => consumer.next();
 		} else {
 			fetchNext = async () => {
@@ -176,21 +259,55 @@ export class Broadcast {
 					const update = await Promise.race([effect.cancel, fetchNext()]);
 					if (!update) break;
 
-					console.debug("received catalog", format, this.name.peek(), update);
+					console.debug("received catalog", format, this.in.name.peek(), update);
 
-					this.catalog.set(update);
-					this.status.set("live");
+					this.#out.catalog.set(update);
+					this.#out.status.set("live");
 				}
 			} catch (err) {
-				console.warn("error fetching catalog", this.name.peek(), err);
+				console.warn("error fetching catalog", this.in.name.peek(), err);
 			} finally {
-				this.catalog.set(undefined);
-				this.status.set("offline");
+				this.#out.catalog.set(undefined);
+				this.#out.status.set("offline");
 			}
 		});
 	}
 
+	/**
+	 * Resolve the `Moq.Broadcast.Consumer` that publishes a given track.
+	 *
+	 * If `rel` is set (a rendition's catalog `broadcast` field), treat it as a path
+	 * relative to this broadcast's name and consume the resolved broadcast on the same
+	 * connection. Otherwise return the catalog's own active broadcast.
+	 *
+	 * The consumer is scoped to the caller's `effect` (closed on its next run), so a
+	 * reference resolves lazily and reacts to `enabled` / connection / announcement
+	 * changes exactly like the catalog broadcast.
+	 */
+	relativeBroadcast(effect: Effect, rel: string | undefined): Moq.Broadcast.Consumer | undefined {
+		if (!rel) return effect.get(this.out.active);
+
+		const base = effect.get(this.in.name);
+		const resolved = Path.resolve(base, rel);
+
+		// A reference that walks back to the catalog's own broadcast (or resolves to
+		// the empty root, via excess `..`) is served by the catalog broadcast itself,
+		// avoiding a duplicate subscription on the same path.
+		if (resolved === base || resolved === Path.empty()) return effect.get(this.out.active);
+
+		if (!effect.get(this.in.enabled)) return undefined;
+
+		const conn = effect.get(this.in.connection);
+		if (!conn) return undefined;
+
+		if (!this.#isPathAnnounced(effect, resolved)) return undefined;
+
+		const broadcast = conn.consume(resolved);
+		effect.cleanup(() => broadcast.close());
+		return broadcast;
+	}
+
 	close() {
-		this.signals.close();
+		this.#signals.close();
 	}
 }

@@ -3,23 +3,23 @@ use std::io::Cursor;
 use std::task::Poll;
 use std::time::Duration;
 
-use anyhow::Context;
 use bytes::{BufMut, Bytes, BytesMut};
 use hang::catalog::{AudioCodec, AudioConfig, Catalog, Container, VideoCodec, VideoConfig};
 use webm_iterable::matroska_spec::{Master, MatroskaSpec};
 use webm_iterable::{WebmWriter, WriteOptions};
 
-use crate::catalog::CatalogFormat;
+use crate::Result;
+use crate::catalog::Stream;
+use crate::container::ExportSource;
 use crate::container::Frame;
-
-use crate::container::{CatalogSource, ExportSource};
+use crate::container::mkv::Error;
 
 /// Matroska TimestampScale: 1 ms (in nanoseconds).
 const TIMESTAMP_SCALE_NS: u64 = 1_000_000;
 
 /// Subscribe to a moq broadcast and produce a single Matroska / WebM byte stream.
 ///
-/// Built from a [`moq_net::BroadcastConsumer`], `Export` subscribes to the hang catalog,
+/// Built from a [`Source`](crate::Source), `Export` subscribes to the hang catalog,
 /// (un)subscribes per-rendition tracks, decodes them via a per-track source, and
 /// re-encodes everything as EBML + Segment + Tracks + Cluster/SimpleBlock tags ready
 /// for any Matroska-aware consumer (ffplay, libwebm, browser MSE for WebM).
@@ -44,9 +44,9 @@ const TIMESTAMP_SCALE_NS: u64 = 1_000_000;
 ///
 /// Only Legacy-container tracks (raw codec payloads) are supported. CMAF tracks
 /// (moof+mdat passthrough) are rejected with a clear error.
-pub struct Export {
-	broadcast: moq_net::BroadcastConsumer,
-	catalog: Option<CatalogSource>,
+pub struct Export<S: Stream> {
+	source: crate::Source,
+	catalog: Option<S>,
 	latency: Duration,
 	fragment_duration: Option<Duration>,
 
@@ -112,11 +112,11 @@ impl ClusterBuilder {
 		keyframe: bool,
 		payload: &[u8],
 		is_video: bool,
-	) -> anyhow::Result<()> {
+	) -> Result<()> {
 		let rel = (frame_ticks as i64)
 			.checked_sub(self.start_ticks as i64)
-			.context("cluster underflow")?;
-		let rel: i16 = rel.try_into().context("block timestamp doesn't fit in i16")?;
+			.ok_or(Error::ClusterUnderflow)?;
+		let rel: i16 = rel.try_into().map_err(|_| Error::BlockTimestampOverflow)?;
 
 		let sb_body = encode_simple_block_body(track_number, rel, keyframe, payload);
 		write_tag_id(&mut self.body, ID_SIMPLEBLOCK as u32);
@@ -151,30 +151,16 @@ impl ClusterBuilder {
 	}
 }
 
-impl Export {
-	/// Subscribe to `broadcast` and produce MKV byte chunks, using the default
-	/// catalog format ([`CatalogFormat::Hang`]).
+impl<S: Stream> Export<S> {
+	/// Subscribe to `source` and produce MKV byte chunks, driving track
+	/// (un)subscription from `catalog`.
 	///
-	/// Use [`with_catalog_format`](Self::with_catalog_format) to subscribe to a
-	/// non-default catalog track (e.g. MSF).
-	pub fn new(broadcast: moq_net::BroadcastConsumer) -> Result<Self, crate::Error> {
-		Self::with_catalog_format(broadcast, CatalogFormat::default())
-	}
-
-	/// Subscribe to `broadcast` and produce MKV byte chunks, selecting an
-	/// explicit `catalog_format` for track discovery.
-	///
-	/// Both formats drive the same internal `hang::Catalog`-based pipeline (MSF
-	/// snapshots are converted on receipt), so the only observable difference
-	/// is which wire catalog track is consumed.
-	pub fn with_catalog_format(
-		broadcast: moq_net::BroadcastConsumer,
-		catalog_format: CatalogFormat,
-	) -> Result<Self, crate::Error> {
-		let catalog = CatalogSource::new(&broadcast, catalog_format)?;
-
-		Ok(Self {
-			broadcast,
+	/// `catalog` is any [`Stream`] of catalog snapshots, typically a
+	/// [`catalog::Consumer`](crate::catalog::Consumer) directly, or narrowed to
+	/// one rendition set via [`Stream::select`](crate::catalog::Stream::select).
+	pub fn new(source: crate::Source, catalog: S) -> Self {
+		Self {
+			source,
 			catalog: Some(catalog),
 			latency: Duration::ZERO,
 			fragment_duration: None,
@@ -182,7 +168,7 @@ impl Export {
 			catalog_snapshot: None,
 			header_emitted: false,
 			cluster: None,
-		})
+		}
 	}
 
 	/// Set the maximum buffering latency for each per-track source.
@@ -207,15 +193,15 @@ impl Export {
 	}
 
 	/// Get the next byte chunk.
-	pub async fn next(&mut self) -> anyhow::Result<Option<Bytes>> {
+	pub async fn next(&mut self) -> Result<Option<Bytes>> {
 		kio::wait(|waiter| self.poll_next(waiter)).await
 	}
 
-	pub fn poll_next(&mut self, waiter: &kio::Waiter) -> Poll<anyhow::Result<Option<Bytes>>> {
+	pub fn poll_next(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Bytes>>> {
 		// 1. Drain catalog updates.
 		while let Some(catalog) = self.catalog.as_mut() {
 			match catalog.poll_next(waiter)? {
-				Poll::Ready(Some(snapshot)) => self.update_catalog(snapshot)?,
+				Poll::Ready(Some(snapshot)) => self.update_catalog(snapshot.media())?,
 				Poll::Ready(None) => {
 					self.catalog = None;
 					break;
@@ -310,7 +296,7 @@ impl Export {
 		Poll::Pending
 	}
 
-	fn update_catalog(&mut self, catalog: Catalog) -> anyhow::Result<()> {
+	fn update_catalog(&mut self, catalog: Catalog) -> Result<()> {
 		let mut active: HashMap<String, ()> = HashMap::new();
 		for name in catalog.video.renditions.keys() {
 			active.insert(name.clone(), ());
@@ -324,12 +310,12 @@ impl Export {
 		if self.header_emitted {
 			for name in active.keys() {
 				if !self.tracks.contains_key(name) {
-					anyhow::bail!("MKV track layout changed after header was emitted: track '{name}' added");
+					return Err(Error::HeaderAddedTrack(name.clone()).into());
 				}
 			}
 			for name in self.tracks.keys() {
 				if !active.contains_key(name) {
-					anyhow::bail!("MKV track layout changed after header was emitted: track '{name}' removed");
+					return Err(Error::HeaderRemovedTrack(name.clone()).into());
 				}
 			}
 			self.catalog_snapshot = Some(catalog);
@@ -343,7 +329,7 @@ impl Export {
 				continue;
 			}
 			ensure_legacy(&config.container, "video", name)?;
-			let source = ExportSource::for_video(&self.broadcast, name, config, self.latency)?;
+			let source = ExportSource::for_video(&self.source, name, config, self.latency)?;
 			self.tracks.insert(
 				name.clone(),
 				MkvTrack {
@@ -362,7 +348,7 @@ impl Export {
 				continue;
 			}
 			ensure_legacy(&config.container, "audio", name)?;
-			let source = ExportSource::for_audio(&self.broadcast, name, config, self.latency)?;
+			let source = ExportSource::for_audio(&self.source, name, config, self.latency)?;
 			self.tracks.insert(
 				name.clone(),
 				MkvTrack {
@@ -394,8 +380,8 @@ impl Export {
 			&& self.tracks.values().all(|t| t.source.header_ready())
 	}
 
-	fn build_header(&self) -> anyhow::Result<Bytes> {
-		let catalog = self.catalog_snapshot.as_ref().context("no catalog snapshot")?;
+	fn build_header(&self) -> Result<Bytes> {
+		let catalog = self.catalog_snapshot.as_ref().ok_or(Error::NoCatalogSnapshot)?;
 
 		// Decide DocType: webm only if every codec is WebM-allowed.
 		let webm_only = catalog
@@ -412,7 +398,10 @@ impl Export {
 
 		let mut entries: Vec<MatroskaSpec> = Vec::new();
 		for (name, config) in catalog.video.renditions.iter() {
-			let track = self.tracks.get(name).context("video track not subscribed")?;
+			let track = self
+				.tracks
+				.get(name)
+				.ok_or_else(|| Error::MissingVideoTrack(name.clone()))?;
 			entries.push(build_video_track_entry(
 				track.track_number,
 				config,
@@ -420,29 +409,40 @@ impl Export {
 			)?);
 		}
 		for (name, config) in catalog.audio.renditions.iter() {
-			let track = self.tracks.get(name).context("audio track not subscribed")?;
+			let track = self
+				.tracks
+				.get(name)
+				.ok_or_else(|| Error::MissingAudioTrack(name.clone()))?;
 			entries.push(build_audio_track_entry(track.track_number, config)?);
 		}
 
 		let mut dest = Cursor::new(Vec::new());
 		{
 			let mut writer = WebmWriter::new(&mut dest);
-			writer.write(&MatroskaSpec::Ebml(Master::Full(vec![
-				MatroskaSpec::DocType(doc_type.to_string()),
-				MatroskaSpec::DocTypeVersion(4),
-				MatroskaSpec::DocTypeReadVersion(2),
-			])))?;
-			writer.write_advanced(
-				&MatroskaSpec::Segment(Master::Start),
-				WriteOptions::is_unknown_sized_element(),
-			)?;
-			writer.write(&MatroskaSpec::Info(Master::Full(vec![
-				MatroskaSpec::TimestampScale(TIMESTAMP_SCALE_NS),
-				MatroskaSpec::MuxingApp("moq-mux".to_string()),
-				MatroskaSpec::WritingApp("moq-mux".to_string()),
-			])))?;
-			writer.write(&MatroskaSpec::Tracks(Master::Full(entries)))?;
-			writer.flush()?;
+			writer
+				.write(&MatroskaSpec::Ebml(Master::Full(vec![
+					MatroskaSpec::DocType(doc_type.to_string()),
+					MatroskaSpec::DocTypeVersion(4),
+					MatroskaSpec::DocTypeReadVersion(2),
+				])))
+				.map_err(Error::from)?;
+			writer
+				.write_advanced(
+					&MatroskaSpec::Segment(Master::Start),
+					WriteOptions::is_unknown_sized_element(),
+				)
+				.map_err(Error::from)?;
+			writer
+				.write(&MatroskaSpec::Info(Master::Full(vec![
+					MatroskaSpec::TimestampScale(TIMESTAMP_SCALE_NS),
+					MatroskaSpec::MuxingApp("moq-mux".to_string()),
+					MatroskaSpec::WritingApp("moq-mux".to_string()),
+				])))
+				.map_err(Error::from)?;
+			writer
+				.write(&MatroskaSpec::Tracks(Master::Full(entries)))
+				.map_err(Error::from)?;
+			writer.flush().map_err(Error::from)?;
 		}
 
 		Ok(Bytes::from(dest.into_inner()))
@@ -460,15 +460,19 @@ impl Export {
 	/// a chunk if the cluster rolled over (the returned chunk is the
 	/// *previous* cluster; the new frame becomes the first block of a new
 	/// open cluster).
-	fn feed_frame(&mut self, name: &str, frame: Frame) -> anyhow::Result<Option<Bytes>> {
-		let track = self.tracks.get(name).context("missing track")?;
+	fn feed_frame(&mut self, name: &str, frame: Frame) -> Result<Option<Bytes>> {
+		let track = self.tracks.get(name).ok_or(Error::MissingTrack)?;
 		let track_number = track.track_number;
 		let kind = track.kind;
 		let payload = &frame.payload;
 
-		let frame_ticks: u64 = (frame.timestamp.as_micros() / 1_000)
+		// MKV's wire scale is ms (TIMESTAMP_SCALE_NS = 1_000_000). Re-express the
+		// frame's timestamp directly at MILLI rather than going through micros.
+		let frame_ticks: u64 = frame
+			.timestamp
+			.as_millis()
 			.try_into()
-			.context("timestamp doesn't fit in u64 ms")?;
+			.map_err(|_| Error::TimestampU64)?;
 
 		let is_video = kind == TrackKind::Video;
 		let keyframe = frame.keyframe;
@@ -508,14 +512,16 @@ impl Export {
 	}
 }
 
-fn ensure_legacy(container: &Container, kind: &str, name: &str) -> anyhow::Result<()> {
+fn ensure_legacy(container: &Container, kind: &str, name: &str) -> Result<()> {
 	match container {
 		// MKV emits raw codec payloads, so it accepts both wire formats whose
 		// frames are raw codec bitstreams (Legacy varint, LOC properties).
 		Container::Legacy | Container::Loc => Ok(()),
-		Container::Cmaf { .. } => {
-			anyhow::bail!("MKV export does not support CMAF {} track '{}'", kind, name);
+		Container::Cmaf { .. } => Err(Error::UnsupportedCmafTrack {
+			kind: kind.to_string(),
+			name: name.to_string(),
 		}
+		.into()),
 	}
 }
 
@@ -523,7 +529,7 @@ fn build_video_track_entry(
 	track_number: u64,
 	config: &VideoConfig,
 	description: Option<&Bytes>,
-) -> anyhow::Result<MatroskaSpec> {
+) -> Result<MatroskaSpec> {
 	// The description came from either the catalog (avc1/hvc1 sources) or
 	// the codec transform (Avc3/Hev1 sources synthesizing it from inline params).
 	let codec_private = description.map(|b| b.to_vec());
@@ -533,14 +539,14 @@ fn build_video_track_entry(
 		VideoCodec::VP9(_) => ("V_VP9", None),
 		VideoCodec::AV1(_) => ("V_AV1", codec_private),
 		VideoCodec::H264(_) => {
-			let avcc = codec_private.context("H.264 track missing AVCDecoderConfigurationRecord")?;
+			let avcc = codec_private.ok_or(Error::MissingH264Avcc)?;
 			("V_MPEG4/ISO/AVC", Some(avcc))
 		}
 		VideoCodec::H265(_) => {
-			let hvcc = codec_private.context("H.265 track missing HEVCDecoderConfigurationRecord")?;
+			let hvcc = codec_private.ok_or(Error::MissingH265Hvcc)?;
 			("V_MPEGH/ISO/HEVC", Some(hvcc))
 		}
-		other => anyhow::bail!("MKV export does not support video codec {:?}", other),
+		other => return Err(Error::UnsupportedVideoExport(format!("{:?}", other)).into()),
 	};
 
 	let mut video_children: Vec<MatroskaSpec> = Vec::new();
@@ -567,7 +573,7 @@ fn build_video_track_entry(
 	Ok(MatroskaSpec::TrackEntry(Master::Full(entry)))
 }
 
-fn build_audio_track_entry(track_number: u64, config: &AudioConfig) -> anyhow::Result<MatroskaSpec> {
+pub(super) fn build_audio_track_entry(track_number: u64, config: &AudioConfig) -> Result<MatroskaSpec> {
 	let (codec_id, codec_private) = match &config.codec {
 		AudioCodec::Opus => (
 			"A_OPUS",
@@ -576,7 +582,7 @@ fn build_audio_track_entry(track_number: u64, config: &AudioConfig) -> anyhow::R
 					sample_rate: config.sample_rate,
 					channel_count: config.channel_count,
 				}
-				.encode()
+				.encode()?
 				.to_vec(),
 			),
 		),
@@ -586,24 +592,40 @@ fn build_audio_track_entry(track_number: u64, config: &AudioConfig) -> anyhow::R
 				config
 					.description
 					.as_ref()
-					.context("AAC track missing AudioSpecificConfig (description)")?
+					.ok_or(Error::MissingAacDescription)?
 					.to_vec(),
 			),
 		),
-		other => anyhow::bail!("MKV export does not support audio codec {:?}", other),
+		AudioCodec::Flac => (
+			"A_FLAC",
+			// A_FLAC CodecPrivate is the FLAC header (the `fLaC` marker plus metadata
+			// blocks), which is exactly the catalog description.
+			Some(
+				config
+					.description
+					.as_ref()
+					.ok_or(Error::MissingFlacDescription)?
+					.to_vec(),
+			),
+		),
+		// MP3 carries its config in band, so there's no codec private.
+		AudioCodec::Mp3 => ("A_MPEG/L3", None),
+		other => return Err(Error::UnsupportedAudioExport(format!("{:?}", other)).into()),
 	};
 
-	let entry = vec![
+	let mut entry = vec![
 		MatroskaSpec::TrackNumber(track_number),
 		MatroskaSpec::TrackUID(track_number),
 		MatroskaSpec::TrackType(2),
 		MatroskaSpec::CodecID(codec_id.to_string()),
-		MatroskaSpec::CodecPrivate(codec_private.unwrap()),
-		MatroskaSpec::Audio(Master::Full(vec![
-			MatroskaSpec::SamplingFrequency(config.sample_rate as f64),
-			MatroskaSpec::Channels(config.channel_count as u64),
-		])),
 	];
+	if let Some(cp) = codec_private {
+		entry.push(MatroskaSpec::CodecPrivate(cp));
+	}
+	entry.push(MatroskaSpec::Audio(Master::Full(vec![
+		MatroskaSpec::SamplingFrequency(config.sample_rate as f64),
+		MatroskaSpec::Channels(config.channel_count as u64),
+	])));
 
 	Ok(MatroskaSpec::TrackEntry(Master::Full(entry)))
 }

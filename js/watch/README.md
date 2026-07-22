@@ -56,7 +56,7 @@ The simplest way to watch a stream:
 
 <moq-watch
     url="https://relay.example.com/anon"
-    path="room/alice.hang"
+    name="room/alice.hang"
     controls>
     <canvas></canvas>
 </moq-watch>
@@ -64,13 +64,26 @@ The simplest way to watch a stream:
 
 ### Attributes
 
-| Attribute | Type    | Default  | Description           |
-|-----------|---------|----------|-----------------------|
-| `url`     | string  | required | Relay server URL      |
-| `path`    | string  | required | Broadcast path        |
-| `paused`  | boolean | false    | Pause playback        |
-| `muted`   | boolean | false    | Mute audio            |
-| `volume`  | number  | 1        | Audio volume (0-1)    |
+| Attribute | Type                                | Default  | Description                              |
+|-----------|-------------------------------------|----------|------------------------------------------|
+| `url`     | string                              | required | Relay server URL                         |
+| `name`    | string                              | required | Broadcast name/path                      |
+| `paused`  | boolean                             | false    | Pause playback                           |
+| `muted`   | boolean                             | false    | Mute audio                               |
+| `visible` | never, distance, or always          | `20%`    | When to download video (see below)       |
+| `volume`  | number                              | 0.5      | Audio volume (0-1)                       |
+| `reload`  | boolean                             | true     | Wait for (re)announcement before subscribing. Ignored when the relay does not support broadcast discovery. |
+
+The `visible` attribute controls when the video track is downloaded, based on the canvas
+position relative to the viewport:
+
+- `never`: never download video.
+- a distance (`0px`, `200px`, `100%`, ...): download while the canvas is within that distance
+  of the viewport **and** the tab is visible. `0px` means strictly on screen; a larger distance
+  (`20%`, the default) pre-warms the video before it scrolls into view.
+- `always`: always download video, regardless of the canvas position or tab visibility.
+
+Only the distance mode suspends video while the tab is hidden; `always` keeps downloading.
 
 ## JavaScript API
 
@@ -96,7 +109,7 @@ watch.video.media.subscribe((stream) => {
 
 ## UI Web Component
 
-`@moq/watch` includes a Web Component UI overlay (`<moq-watch-ui>`) with playback controls, volume, buffering indicator, quality selector, and stats panel. It is built on top of `@moq/signals` with no framework dependency.
+`@moq/watch` includes a Web Component UI overlay (`<moq-watch-ui>`) with playback controls, volume, buffering indicator, unsupported-codec indicator, quality selector, and stats panel. It is built on top of `@moq/signals` with no framework dependency.
 
 ```html
 <script type="module">
@@ -105,7 +118,7 @@ watch.video.media.subscribe((stream) => {
 </script>
 
 <moq-watch-ui>
-    <moq-watch url="https://relay.example.com/anon" path="room/alice.hang">
+    <moq-watch url="https://relay.example.com/anon" name="room/alice.hang">
         <canvas></canvas>
     </moq-watch>
 </moq-watch-ui>
@@ -116,7 +129,6 @@ The `<moq-watch-ui>` element automatically discovers the nested `<moq-watch>` el
 ## Features
 
 - **WebCodecs decoding** — Hardware-accelerated video and audio decoding
-- **MSE fallback** — Media Source Extensions for broader codec support
 - **Reactive state** — All properties are signals from `@moq/signals`
 - **Chat** — Subscribe to text chat channels
 - **Location** — Peer location and window tracking

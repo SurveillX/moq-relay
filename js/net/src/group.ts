@@ -1,104 +1,369 @@
-import { Signal } from "@moq/signals";
+/**
+ * Group role handles: an ordered stream of frames within a track, delivered over one QUIC stream.
+ *
+ * @module
+ */
+import { type GetPromise, type Getter, Once, Signal } from "@moq/signals";
+import { Timestamp } from "./time.ts";
 
-export class GroupState {
-	frames = new Signal<Uint8Array[]>([]);
-	closed = new Signal<boolean | Error>(false);
-	total = new Signal<number>(0); // The total number of frames in the group thus far
+/** Maximum bytes of frames cached in a group before old frames are evicted from the front. */
+export const MAX_GROUP_CACHE_BYTES = 32 * 1024 * 1024;
+
+/** Maximum number of frames cached in a group before old frames are evicted from the front. */
+export const MAX_GROUP_FRAMES = 1024;
+
+/**
+ * A frame buffered in a group: its presentation {@link Timestamp} and payload bytes.
+ *
+ * The timestamp carries its own scale, so a track can pick its units; the wire layer
+ * converts it into the track's negotiated timescale.
+ */
+export interface Frame {
+	/** The frame payload. */
+	payload: Uint8Array;
+	/**
+	 * Presentation timestamp. Required: for a payload with no presentation time of its own
+	 * (a JSON catalog, control state) pass {@link Timestamp.now} explicitly.
+	 */
+	timestamp: Timestamp;
 }
 
-export class Group {
-	readonly sequence: number;
+/** Immutable group metadata. */
+export interface Info {
+	/** Sequence number of this group within its track. */
+	sequence: number;
+}
 
-	state = new GroupState();
-	readonly closed: Promise<Error | undefined>;
+/**
+ * Thrown by a frame read when the reader fell behind the group's eviction window: frames
+ * it had not yet read were dropped to stay under the cache cap, so the stream has a gap.
+ */
+export class Lagged extends Error {
+	constructor() {
+		super("lagged: frames were evicted before being read");
+		this.name = "Lagged";
+	}
+}
+
+/** Reactive backing state shared by the group producer and one consumer. */
+class GroupState {
+	readonly sequence: number;
+	frames = new Signal<Frame[]>([]);
+	closed = new Once<Error | null>();
+	total = new Signal<number>(0); // The total number of frames in the group thus far
+
+	// Frames evicted from the front by the cache cap. A reader that had not consumed
+	// them has a gap, so its next read throws Lagged rather than skipping silently.
+	offset = 0;
+	cacheBytes = 0;
 
 	constructor(sequence: number) {
 		this.sequence = sequence;
+	}
+}
 
-		// Cache the closed promise to avoid recreating it every time.
-		this.closed = new Promise((resolve) => {
-			const dispose = this.state.closed.subscribe((closed) => {
-				if (!closed) return;
-				resolve(closed instanceof Error ? closed : undefined);
-				dispose();
-			});
-		});
+function appendFrame(state: GroupState, frame: Frame) {
+	if (state.closed.peek() !== undefined) throw new Error("group is closed");
+
+	state.cacheBytes += frame.payload.byteLength;
+	state.frames.mutate((frames) => {
+		frames.push(frame);
+
+		while (frames.length > MAX_GROUP_FRAMES || state.cacheBytes > MAX_GROUP_CACHE_BYTES) {
+			const evicted = frames.shift();
+			if (!evicted) break;
+			state.cacheBytes -= evicted.payload.byteLength;
+			state.offset++;
+		}
+	});
+
+	state.total.update((total) => total + 1);
+}
+
+/**
+ * The write side of an ordered stream of frames within a track.
+ *
+ * @public
+ */
+export class Producer {
+	/** Sequence number of this group within its track. */
+	readonly sequence: number;
+
+	#state: GroupState;
+	#mirrors?: Set<GroupState>;
+
+	// Whether any mirror reader is attached (see {@link used}). Fetch coalescing watches it to
+	// cancel an abandoned download; a group can stay open indefinitely (a catalog or JSON stream),
+	// so this is what stops a reader-less fetch instead of the stream ending on its own.
+	#used = new Signal<boolean>(false);
+
+	constructor(sequence: number) {
+		this.#state = new GroupState(sequence);
+		this.sequence = sequence;
 	}
 
 	/**
-	 * Writes a frame to the group.
-	 * @param frame - The frame to write
+	 * Settles once the group closes: `null` on a clean close, or the abort {@link Error}.
+	 * Peek it synchronously (`undefined` while open), observe it reactively, or `await` it.
 	 */
-	writeFrame(frame: Uint8Array) {
-		if (this.state.closed.peek()) throw new Error("group is closed");
+	get closed(): GetPromise<Error | null> {
+		return this.#state.closed;
+	}
 
-		this.state.frames.mutate((frames) => {
-			frames.push(frame);
+	/** A read handle for this group. */
+	consume(): Consumer {
+		return makeConsumer(this.#state);
+	}
+
+	/**
+	 * Create an independent read handle that receives every frame written here.
+	 *
+	 * Frames written so far are replayed synchronously; later writes and close are teed
+	 * in as they happen.
+	 *
+	 * @internal Track fan-out and fetch coalescing only. Use {@link consume} instead.
+	 */
+	mirror(): Consumer {
+		const dst = new GroupState(this.sequence);
+		for (const frame of this.#state.frames.peek()) appendFrame(dst, frame);
+		dst.offset = this.#state.offset;
+
+		const closed = this.#state.closed.peek();
+		if (closed !== undefined) {
+			dst.closed.set(closed);
+			return makeConsumer(dst);
+		}
+
+		this.#mirrors ??= new Set();
+		this.#mirrors.add(dst);
+		this.#used.set(true);
+
+		// Track this mirror's close eagerly (not just lazily on the next write) so demand drops the
+		// moment the last reader leaves, letting an abandoned fetch cancel even with no more frames.
+		const dispose = dst.closed.subscribe((c) => {
+			if (c === undefined) return;
+			this.#mirrors?.delete(dst);
+			this.#used.set((this.#mirrors?.size ?? 0) > 0);
+			dispose();
 		});
 
-		this.state.total.update((total) => total + 1);
+		return makeConsumer(dst);
 	}
 
+	/**
+	 * Whether any mirror reader is currently attached.
+	 *
+	 * Pairs with {@link unused}. Fetch coalescing watches it to cancel a download once every reader
+	 * has gone: a group can stay open indefinitely (a catalog track, a JSON stream), so it can't
+	 * rely on the stream ending on its own.
+	 *
+	 * @internal Track fan-out and fetch coalescing only.
+	 */
+	get used(): Getter<boolean> {
+		return this.#used;
+	}
+
+	/**
+	 * Resolves once no mirror reader remains (or the group closes).
+	 *
+	 * @internal Track fan-out and fetch coalescing only.
+	 */
+	async unused(): Promise<void> {
+		while (this.#used.peek() && this.#state.closed.peek() === undefined) {
+			await Signal.race(this.#used, this.#state.closed);
+		}
+	}
+
+	/** Writes a frame to the group. */
+	writeFrame(frame: Frame) {
+		appendFrame(this.#state, frame);
+
+		if (this.#mirrors) {
+			for (const mirror of this.#mirrors) {
+				if (mirror.closed.peek() !== undefined) this.#mirrors.delete(mirror);
+				else appendFrame(mirror, frame);
+			}
+		}
+	}
+
+	/** Write a string as a single UTF-8 encoded frame, stamped with {@link Timestamp.now}. */
 	writeString(str: string) {
-		this.writeFrame(new TextEncoder().encode(str));
+		this.writeFrame({ payload: new TextEncoder().encode(str), timestamp: Timestamp.now() });
 	}
 
+	/** Write a value as a single JSON-encoded frame, stamped with {@link Timestamp.now}. */
 	writeJson(json: unknown) {
 		this.writeString(JSON.stringify(json));
 	}
 
+	/** Write a boolean as a single one-byte frame, stamped with {@link Timestamp.now}. */
 	writeBool(bool: boolean) {
-		this.writeFrame(new Uint8Array([bool ? 1 : 0]));
+		this.writeFrame({ payload: new Uint8Array([bool ? 1 : 0]), timestamp: Timestamp.now() });
+	}
+
+	/** True once the group has been closed. */
+	get isClosed(): boolean {
+		return this.#state.closed.peek() !== undefined;
+	}
+
+	/** Closes the group, optionally with an error to abort readers. */
+	close(abort?: Error) {
+		if (this.#state.closed.peek() !== undefined) return;
+		this.#state.closed.set(abort ?? null);
+
+		if (this.#mirrors) {
+			for (const mirror of this.#mirrors) {
+				if (mirror.closed.peek() === undefined) mirror.closed.set(abort ?? null);
+			}
+			this.#mirrors.clear();
+		}
+	}
+}
+
+let makeConsumer: (state: GroupState) => Consumer;
+
+/**
+ * The read side of an ordered stream of frames within a track.
+ *
+ * Created internally: obtain one from {@link Producer.consume} or a track subscriber's
+ * group reads.
+ *
+ * @public
+ */
+export class Consumer {
+	/** Sequence number of this group within its track. */
+	readonly sequence: number;
+
+	#state: GroupState;
+
+	private constructor(state: GroupState) {
+		this.#state = state;
+		this.sequence = state.sequence;
+	}
+
+	/**
+	 * Settles once the group closes: `null` on a clean close, or the abort {@link Error}.
+	 * Peek it synchronously (`undefined` while open), observe it reactively, or `await` it.
+	 */
+	get closed(): GetPromise<Error | null> {
+		return this.#state.closed;
+	}
+
+	static {
+		makeConsumer = (state) => new Consumer(state);
+	}
+
+	#readBufferedFrame(): { sequence: number; frame: Frame } | undefined {
+		const frames = this.#state.frames.peek();
+		const frame = frames.shift();
+		if (!frame) return undefined;
+
+		this.#state.cacheBytes -= frame.payload.byteLength;
+		return { sequence: this.#state.total.peek() - frames.length - 1, frame };
+	}
+
+	/** True once no further frames can be read: the group has closed and every buffered frame is read. */
+	get done(): boolean {
+		return this.#state.frames.peek().length === 0 && this.#state.closed.peek() !== undefined;
+	}
+
+	/** True once the group has been closed, regardless of whether buffered frames remain unread. Synchronous complement to the {@link closed} promise. */
+	get isClosed(): boolean {
+		return this.#state.closed.peek() !== undefined;
+	}
+
+	/** True if frames were evicted from the front of this group before being read. */
+	get skipped(): boolean {
+		return this.#state.offset > 0;
+	}
+
+	/**
+	 * Reads the next already-buffered frame without blocking.
+	 * Treat the returned frame bytes as read-only; they are shared with other consumers.
+	 *
+	 * Returns `undefined` when nothing is buffered right now. That is not by itself
+	 * end-of-group: check {@link done} to tell "no frame buffered yet" from "finished".
+	 */
+	tryReadFrame(): Frame | undefined {
+		const read = this.#readBufferedFrame();
+		return read?.frame;
+	}
+
+	/** Like {@link tryReadFrame} but also reports the frame's sequence number within the group. */
+	tryReadFrameSequence(): ({ sequence: number } & Frame) | undefined {
+		const read = this.#readBufferedFrame();
+		if (!read) return undefined;
+		return { sequence: read.sequence, payload: read.frame.payload, timestamp: read.frame.timestamp };
+	}
+
+	/** Resolves once {@link readFrame} would not block. */
+	async readable(): Promise<void> {
+		for (;;) {
+			if (this.#state.frames.peek().length > 0) return;
+			if (this.#state.closed.peek() !== undefined) return;
+			await Signal.race(this.#state.frames, this.#state.closed);
+		}
 	}
 
 	/**
 	 * Reads the next frame from the group.
-	 * @returns A promise that resolves to the next frame or undefined
+	 * Treat the returned frame bytes as read-only; they are shared with other consumers.
 	 */
-	async readFrame(): Promise<Uint8Array | undefined> {
+	async readFrame(): Promise<Frame | undefined> {
 		for (;;) {
-			const frames = this.state.frames.peek();
-			const frame = frames.shift();
-			if (frame) return frame;
+			if (this.#state.offset > 0) throw new Lagged();
 
-			const closed = this.state.closed.peek();
+			const read = this.#readBufferedFrame();
+			if (read) return read.frame;
+
+			const closed = this.#state.closed.peek();
 			if (closed instanceof Error) throw closed;
-			if (closed) return;
+			if (closed !== undefined) return;
 
-			await Signal.race(this.state.frames, this.state.closed);
+			await Signal.race(this.#state.frames, this.#state.closed);
 		}
 	}
 
-	async readFrameSequence(): Promise<{ sequence: number; data: Uint8Array } | undefined> {
+	/**
+	 * Reads the next frame along with its sequence number within the group.
+	 * Treat the returned frame bytes as read-only; they are shared with other consumers.
+	 */
+	async readFrameSequence(): Promise<({ sequence: number } & Frame) | undefined> {
 		for (;;) {
-			const frames = this.state.frames.peek();
-			const frame = frames.shift();
-			if (frame) return { sequence: this.state.total.peek() - frames.length - 1, data: frame };
+			if (this.#state.offset > 0) throw new Lagged();
 
-			const closed = this.state.closed.peek();
+			const read = this.#readBufferedFrame();
+			if (read) return { sequence: read.sequence, payload: read.frame.payload, timestamp: read.frame.timestamp };
+
+			const closed = this.#state.closed.peek();
 			if (closed instanceof Error) throw closed;
-			if (closed) return;
+			if (closed !== undefined) return;
 
-			await Signal.race(this.state.frames, this.state.closed);
+			await Signal.race(this.#state.frames, this.#state.closed);
 		}
 	}
 
+	/** Reads the next frame and decodes its payload as a UTF-8 string. */
 	async readString(): Promise<string | undefined> {
 		const frame = await this.readFrame();
-		return frame ? new TextDecoder().decode(frame) : undefined;
+		return frame ? new TextDecoder().decode(frame.payload) : undefined;
 	}
 
+	/** Reads the next frame and parses its payload as JSON. */
 	async readJson(): Promise<unknown | undefined> {
 		const frame = await this.readString();
 		return frame ? JSON.parse(frame) : undefined;
 	}
 
+	/** Reads the next frame and decodes its payload as a one-byte boolean. */
 	async readBool(): Promise<boolean | undefined> {
 		const frame = await this.readFrame();
-		return frame ? frame[0] === 1 : undefined;
+		return frame ? frame.payload[0] === 1 : undefined;
 	}
 
+	/** Closes the group, optionally with an error to abort readers. Idempotent. */
 	close(abort?: Error) {
-		this.state.closed.set(abort ?? true);
+		if (this.#state.closed.peek() !== undefined) return; // already closed
+		this.#state.closed.set(abort ?? null);
 	}
 }

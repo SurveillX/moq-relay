@@ -12,12 +12,7 @@ deploy:
     bun install
     bun wrangler deploy
 
-# Upload a single file to R2.
-# NOTE: Videos should be fragmented to minimize latency when streaming.
-# Use ffmpeg to fragment before uploading:
-#	 ffmpeg -i input.mp4 -c copy -f mp4 \
-#		 -movflags cmaf+separate_moof+delay_moov+skip_trailer+frag_every_frame \
-# output.mp4
+# Upload a single file to R2. Fragment videos first, e.g. `ffmpeg -i input.mp4 -c copy -f mp4 -movflags cmaf+separate_moof+delay_moov+skip_trailer+frag_every_frame output.mp4`.
 upload file:
     bun install
     bun wrangler r2 object put "video-moq-dev/{{ file }}" --file "media/{{ file }}" --remote
@@ -41,39 +36,33 @@ list:
 # --- Publishing ---
 
 # Publish Big Buck Bunny to a relay server.
-bbb url='http://localhost:4443/anon' *args:
+bbb url='http://localhost:4443' *args:
     just download bbb
     just cmaf bbb "{{ url }}" {{ args }}
 
 # Publish Tears of Steel to a relay server.
-tos url='http://localhost:4443/anon' *args:
+tos url='http://localhost:4443' *args:
     just download tos
     just cmaf tos "{{ url }}" {{ args }}
 
 # Publish a video using ffmpeg (CMAF / fMP4) to a relay server.
-cmaf name url='http://localhost:4443/anon' *args:
-    cargo build --bin moq-cli
-    just ffmpeg-cmaf "media/{{ name }}.mp4" |\
-    cargo run --bin moq-cli -- \
-    	{{ args }} publish --url "{{ url }}" --name "{{ name }}.hang" fmp4
+cmaf name url='http://localhost:4443' *args:
+    cargo build --bin moq
+    just ffmpeg-cmaf "media/{{ name }}.mp4" | cargo run --bin moq -- {{ args }} --client-connect "{{ url }}" --broadcast "{{ name }}.hang" import fmp4
 
 # Publish a video using ffmpeg (MPEG-TS) to a relay server.
-ts name url='http://localhost:4443/anon' *args:
-    cargo build --bin moq-cli
-    just ffmpeg-ts "media/{{ name }}.mp4" |\
-    cargo run --bin moq-cli -- \
-    	{{ args }} publish --url "{{ url }}" --name "{{ name }}.hang" ts
+ts name url='http://localhost:4443' *args:
+    cargo build --bin moq
+    just ffmpeg-ts "media/{{ name }}.mp4" | cargo run --bin moq -- {{ args }} --client-connect "{{ url }}" --broadcast "{{ name }}.hang" import ts
 
 # Publish a video via iroh.
 iroh name url prefix="":
     just download "{{ name }}"
-    cargo build --bin moq-cli
-    just ffmpeg-cmaf "media/{{ name }}.mp4" |\
-    cargo run --bin moq-cli -- \
-    	--iroh-enabled publish --url "{{ url }}" --name "{{ prefix }}{{ name }}.hang" fmp4
+    cargo build --bin moq
+    just ffmpeg-cmaf "media/{{ name }}.mp4" | cargo run --bin moq -- --iroh-enabled --client-connect "{{ url }}" --broadcast "{{ prefix }}{{ name }}.hang" import fmp4
 
 # Generate and ingest an HLS stream from a video file.
-hls name relay="http://localhost:4443/anon":
+hls name relay="http://localhost:4443":
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -141,17 +130,17 @@ hls name relay="http://localhost:4443/anon":
     }
     trap cleanup SIGINT SIGTERM EXIT
 
-    echo ">>> Running with --passthrough flag"
-    cargo run --bin moq-cli -- publish --url "{{ relay }}" --name "{{ name }}.hang" hls --playlist "$OUT_DIR/master.m3u8" --passthrough
+    echo ">>> Importing HLS via moq-cli"
+    cargo run --bin moq -- --client-connect "{{ relay }}" --broadcast "{{ name }}.hang" import hls "$OUT_DIR/master.m3u8"
     EXIT_CODE=$?
 
     cleanup
     exit $EXIT_CODE
 
 # Publish a video using H.264 Annex B format.
-h264 name url="http://localhost:4443/anon" *args:
+h264 name url="http://localhost:4443" *args:
     just download "{{ name }}"
-    cargo build --bin moq-cli
+    cargo build --bin moq
 
     ffmpeg -hide_banner -v quiet \
     	-stream_loop -1 -re \
@@ -159,16 +148,13 @@ h264 name url="http://localhost:4443/anon" *args:
     	-c:v copy -an \
     	-bsf:v h264_mp4toannexb \
     	-f h264 \
-    	- | cargo run --bin moq-cli -- publish --url "{{ url }}" --name "{{ name }}.hang" avc3 {{ args }}
+    	- | cargo run --bin moq -- {{ args }} --client-connect "{{ url }}" --broadcast "{{ name }}.hang" import avc3
 
 # Publish a video using ffmpeg directly from moq to the localhost.
 serve name *args:
     just download "{{ name }}"
-    cargo build --bin moq-cli
-    just ffmpeg-cmaf "media/{{ name }}.mp4" |\
-    cargo run --bin moq-cli -- \
-    	{{ args }} serve --listen "[::]:4443" --tls-generate "localhost" \
-    	--name "{{ name }}.hang" fmp4
+    cargo build --bin moq
+    just ffmpeg-cmaf "media/{{ name }}.mp4" | cargo run --bin moq -- {{ args }} --server-bind "[::]:4443" --tls-generate "localhost" --broadcast "{{ name }}.hang" import fmp4
 
 # Generate and serve an HLS stream from a video for testing.
 serve-hls name port="8000":
@@ -213,7 +199,7 @@ serve-hls name port="8000":
     cd "$OUT_DIR" && python3 -m http.server {{ port }}
 
 # Publish the clock broadcast.
-clock action url="http://localhost:4443/anon" *args:
+clock action url="http://localhost:4443" *args:
     @if [ "{{ action }}" != "publish" ] && [ "{{ action }}" != "subscribe" ]; then \
     	echo "Error: action must be 'publish' or 'subscribe', got '{{ action }}'" >&2; \
     	exit 1; \
@@ -221,14 +207,10 @@ clock action url="http://localhost:4443/anon" *args:
 
     cargo run -p moq-native --example clock -- --url "{{ url }}" --broadcast "clock" {{ args }} {{ action }}
 
-# Connect tokio-console to the publisher (port 6681).
-console:
-    tokio-console http://127.0.0.1:6681
-
 # --- GStreamer ---
 
 # Publish a video using GStreamer to a relay server.
-gst name url='http://localhost:4443/anon' *args:
+gst name url='http://localhost:4443' *args:
     just download "{{ name }}"
     cargo build -p moq-gst
 
@@ -257,11 +239,7 @@ ffmpeg-cmaf input output='-' *args:
     	-c copy \
     	-f mp4 -movflags cmaf+separate_moof+delay_moov+skip_trailer+frag_every_frame {{ args }} {{ output }}
 
-# Convert an h264 input file to MPEG-TS format to stdout.
-#
-# `-pes_payload_size 0` flushes one PES per audio frame instead of batching ~8
-# (the default 2930-byte minimum), so audio interleaves evenly with video rather
-# than arriving in ~185ms bursts. Without it the player must buffer a whole burst.
+# Convert an h264 input file to MPEG-TS format to stdout, with one PES per audio frame.
 [private]
 ffmpeg-ts input output='-' *args:
     ffmpeg -hide_banner -v quiet \

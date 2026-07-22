@@ -1,25 +1,25 @@
 //! Relay-side stats configuration.
 //!
-//! The actual aggregator lives in [`moq_net::Stats`]; this module just
-//! holds the relay-specific config knobs.
+//! The counter collection lives in [`moq_net::stats::Registry`] and the
+//! publishing task in [`moq_stats::Producer`]; this module just holds the
+//! relay-specific config knobs.
 
 use std::time::Duration;
 
 use clap::Args;
-use moq_net::{OriginProducer, PathOwned, Stats};
+use moq_net::PathOwned;
+use moq_net::origin;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for the relay's stats publishing.
 ///
-/// Set `enabled = true` to attach a [`moq_net::Stats`] aggregator to every
-/// session the relay accepts (and every cluster dial). The aggregator
-/// publishes a single `<prefix>/node/<node>` broadcast (or `<prefix>/node`
-/// when [`Self::node`] is unset) on the cluster origin. Each frame is a
-/// JSON map of broadcast path to a cumulative counter snapshot; an entry
-/// surfaces while the broadcast is live (any open counter exceeds its
-/// `*_closed` counterpart) and on the tick its snapshot changes, then is
-/// dropped once fully closed. See `moq_net::stats` for the per-field
-/// semantics.
+/// Set `enabled = true` to attach a [`moq_stats::Producer`] to every session
+/// the relay accepts (and every cluster dial). The producer publishes a single
+/// `<prefix>/node/<node>` broadcast (or `<prefix>/node` when [`Self::node`] is
+/// unset) on the cluster origin. Each broadcast carries plain `.json` tracks
+/// (a JSON map of broadcast path to a cumulative counter snapshot per frame)
+/// plus compressed `.json.z` siblings; see `moq_stats` for the wire format and
+/// per-field semantics.
 #[derive(Args, Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
@@ -32,7 +32,7 @@ pub struct StatsConfig {
 	/// re-parse. With a bare `bool`, an absent `--stats-enabled` CLI flag
 	/// writes the `Default::default()` value (`false`) over the TOML value.
 	/// See `tests::cli_does_not_clobber_toml_stats_enabled` and the
-	/// "Config flags + TOML merge" note in `CLAUDE.md`.
+	/// "Config flags + TOML merge" note in `rs/CLAUDE.md`.
 	#[arg(
 		long = "stats-enabled",
 		env = "MOQ_STATS_ENABLED",
@@ -63,27 +63,40 @@ pub struct StatsConfig {
 	/// path. Single-relay deployments can leave this unset.
 	#[arg(long = "stats-node", env = "MOQ_STATS_NODE")]
 	pub node: Option<String>,
+
+	/// Number of leading broadcast-path segments to bucket stats by, one
+	/// broadcast per bucket at `<prefix>/<group>/node/<node>`. Defaults to 0: a
+	/// single `<prefix>/node/<node>` broadcast for the whole node. Set to 1 to
+	/// publish a per-first-segment broadcast (e.g. per tenant), so a consumer can
+	/// announce-scope to just that group rather than slurping every node's full
+	/// stats. See [`moq_stats::Config::depth`].
+	#[arg(long = "stats-depth", env = "MOQ_STATS_DEPTH")]
+	pub depth: Option<usize>,
 }
 
 impl StatsConfig {
-	/// Build a [`Stats`] aggregator from this config, publishing on `origin`.
+	/// Build a [`moq_stats::Producer`] from this config, publishing on `origin`.
 	///
-	/// Returns a no-op aggregator ([`Stats::default`]) when [`Self::enabled`]
-	/// is false, so the relay can attach the result unconditionally.
-	pub fn build(&self, origin: OriginProducer) -> Stats {
+	/// Returns a no-op producer when [`Self::enabled`] is false, so the relay can
+	/// attach the result unconditionally. Hand the producer's
+	/// [`registry`](moq_stats::Producer::registry) to the cluster and keep the
+	/// producer itself alive for as long as the relay runs (its publish task
+	/// stops when the last clone drops).
+	pub fn build(&self, origin: origin::Producer) -> moq_stats::Producer {
 		if !self.enabled.unwrap_or(false) {
-			return Stats::default();
+			return moq_stats::Producer::new(moq_stats::Config::new());
 		}
 		let prefix = self.prefix.clone().unwrap_or_else(|| ".stats".to_string());
 		let interval = Duration::from_secs(self.interval.unwrap_or(1).max(1));
 		let node = self.node.clone().map(PathOwned::from);
-		tracing::info!(prefix, interval_secs = interval.as_secs(), node = ?node, "stats publishing enabled");
-		// Fully qualified to disambiguate from this module's clap-derived StatsConfig.
-		let config = moq_net::StatsConfig::new()
+		let depth = self.depth.unwrap_or(0);
+		tracing::info!(prefix, interval_secs = interval.as_secs(), node = ?node, depth, "stats publishing enabled");
+		let config = moq_stats::Config::new()
 			.with_origin(origin)
 			.with_prefix(prefix)
 			.with_interval(interval)
-			.with_node(node);
-		Stats::new(config)
+			.with_node(node)
+			.with_depth(depth);
+		moq_stats::Producer::new(config)
 	}
 }

@@ -50,6 +50,12 @@ pub enum Error {
 	#[error("no publish or subscribe allowed; token is useless")]
 	UselessToken,
 
+	#[error("path `{0}` does not overlap the token root")]
+	RootMismatch(String),
+
+	#[error("token grants no access to path `{0}`")]
+	NoAccess(String),
+
 	#[error("invalid algorithm: {0}")]
 	InvalidAlgorithm(String),
 
@@ -72,10 +78,10 @@ pub enum Error {
 	Jwt(#[from] jsonwebtoken::errors::Error),
 
 	#[error(transparent)]
-	Pkcs8(#[from] elliptic_curve::pkcs8::Error),
+	Pkcs8(#[from] p256::elliptic_curve::pkcs8::Error),
 
 	#[error(transparent)]
-	EllipticCurve(#[from] elliptic_curve::Error),
+	EllipticCurve(#[from] p256::elliptic_curve::Error),
 
 	#[error(transparent)]
 	Rsa(#[from] rsa::Error),

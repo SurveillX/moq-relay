@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.5](https://github.com/moq-dev/moq/compare/hang-v0.19.4...hang-v0.19.5) - 2026-07-09
+
+### Other
+
+- Per-track timeline index for each media track ([#2109](https://github.com/moq-dev/moq/pull/2109))
+
+## [0.19.4](https://github.com/moq-dev/moq/compare/hang-v0.19.3...hang-v0.19.4) - 2026-07-04
+
+### Added
+
+- *(moq-mux)* add FLAC support (catalog + mp4/mkv import/export) ([#1969](https://github.com/moq-dev/moq/pull/1969))
+- *(moq-mux)* add MP3 audio support for FLV/RTMP ([#1967](https://github.com/moq-dev/moq/pull/1967))
+
+### Other
+
+- Avoid moq-net and hang release breakage ([#2077](https://github.com/moq-dev/moq/pull/2077))
+- [codex] Future-proof moq-net metadata structs ([#2046](https://github.com/moq-dev/moq/pull/2046))
+
+## [0.19.3](https://github.com/moq-dev/moq/compare/hang-v0.19.2...hang-v0.19.3) - 2026-06-30
+
+### Added
+
+- *(hang)* compressed catalog track (catalog.json.z) ([#1904](https://github.com/moq-dev/moq/pull/1904))
+
+### Other
+
+- [codex] Route HLS CLI import through moq-hls ([#1939](https://github.com/moq-dev/moq/pull/1939))
+- Backport moq-mux to main (adapted to main's moq-net, no wire/API breaks) ([#1918](https://github.com/moq-dev/moq/pull/1918))
+
+## [0.19.2](https://github.com/moq-dev/moq/compare/hang-v0.19.1...hang-v0.19.2) - 2026-06-19
+
+### Fixed
+
+- *(hang)* omit empty HEVC constraint component in codec string ([#1781](https://github.com/moq-dev/moq/pull/1781))
+
+## [0.19.1](https://github.com/moq-dev/moq/compare/hang-v0.19.0...hang-v0.19.1) - 2026-06-16
+
+### Other
+
+- ingest and export legacy non-browser broadcast audio over MPEG-TS mp2, ac-3 & e-ac-3 ([#1701](https://github.com/moq-dev/moq/pull/1701))
+- *(demo,doc)* drop redundant /anon prefix from localhost URLs ([#1688](https://github.com/moq-dev/moq/pull/1688))
+
 ## [0.19.0](https://github.com/moq-dev/moq/compare/hang-v0.18.1...hang-v0.19.0) - 2026-06-10
 
 ### Added

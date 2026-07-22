@@ -7,6 +7,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.7](https://github.com/moq-dev/moq/compare/moq-relay-v0.13.6...moq-relay-v0.13.7) - 2026-07-18
+
+### Fixed
+
+- *(relay)* avoid websocket teardown panic ([#2390](https://github.com/moq-dev/moq/pull/2390))
+
+## [0.13.6](https://github.com/moq-dev/moq/compare/moq-relay-v0.13.5...moq-relay-v0.13.6) - 2026-07-16
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.13.5](https://github.com/moq-dev/moq/compare/moq-relay-v0.13.4...moq-relay-v0.13.5) - 2026-07-15
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.13.4](https://github.com/moq-dev/moq/compare/moq-relay-v0.13.3...moq-relay-v0.13.4) - 2026-07-12
+
+### Added
+
+- *(moq-native)* add quic::Client/quic::Server transport config ([#2161](https://github.com/moq-dev/moq/pull/2161))
+
+### Other
+
+- expose a Prometheus /metrics endpoint for node traffic ([#2172](https://github.com/moq-dev/moq/pull/2172))
+
+## [0.13.3](https://github.com/moq-dev/moq/compare/moq-relay-v0.13.2...moq-relay-v0.13.3) - 2026-07-09
+
+### Added
+
+- *(moq-net,js/net)* add moq-transport draft-19 (moqt-19) ([#2106](https://github.com/moq-dev/moq/pull/2106))
+
+## [0.13.2](https://github.com/moq-dev/moq/compare/moq-relay-v0.13.1...moq-relay-v0.13.2) - 2026-07-05
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.13.1](https://github.com/moq-dev/moq/compare/moq-relay-v0.13.0...moq-relay-v0.13.1) - 2026-07-04
+
+### Added
+
+- *(moq-net)* moq-lite-05 SETUP message + PATH parameter ([#1954](https://github.com/moq-dev/moq/pull/1954))
+
+### Other
+
+- check token root against the connection path, route to the pid alias ([#2079](https://github.com/moq-dev/moq/pull/2079))
+- [codex] Future-proof moq-net metadata structs ([#2046](https://github.com/moq-dev/moq/pull/2046))
+- Fold the internal listener into --server-bind (one authenticated accept path) ([#1974](https://github.com/moq-dev/moq/pull/1974))
+- *(rs)* upgrade reqwest 0.12 -> 0.13 across the workspace ([#1972](https://github.com/moq-dev/moq/pull/1972))
+
+## [0.13.0](https://github.com/moq-dev/moq/compare/moq-relay-v0.12.13...moq-relay-v0.13.0) - 2026-06-30
+
+### Added
+
+- *(moq-relay)* reuse client TLS for outbound auth HTTP; make --client-tls-* flags consistent ([#1901](https://github.com/moq-dev/moq/pull/1901))
+
+### Other
+
+- *(deps)* bump the cargo group across 1 directory with 18 updates ([#1942](https://github.com/moq-dev/moq/pull/1942))
+- [codex] support relay HTTPS cert arrays ([#1932](https://github.com/moq-dev/moq/pull/1932))
+- [codex] Backport relay web embedding ([#1930](https://github.com/moq-dev/moq/pull/1930))
+
+## [0.12.13](https://github.com/moq-dev/moq/compare/moq-relay-v0.12.12...moq-relay-v0.12.13) - 2026-06-23
+
+### Added
+
+- *(relay)* unauthenticated internal listener over qmux (tcp:// + unix://) ([#1810](https://github.com/moq-dev/moq/pull/1810))
+
+### Fixed
+
+- *(moq-relay)* serve the WebSocket fallback at the root path ([#1883](https://github.com/moq-dev/moq/pull/1883))
+
+### Other
+
+- split CLAUDE.md into per-directory guides ([#1846](https://github.com/moq-dev/moq/pull/1846))
+
+## [0.12.12](https://github.com/moq-dev/moq/compare/moq-relay-v0.12.11...moq-relay-v0.12.12) - 2026-06-19
+
+### Added
+
+- *(relay)* close sessions when the token/cert expires ([#1789](https://github.com/moq-dev/moq/pull/1789))
+- *(relay)* add --cluster-id to set a fixed origin id ([#1786](https://github.com/moq-dev/moq/pull/1786))
+
+## [0.12.11](https://github.com/moq-dev/moq/compare/moq-relay-v0.12.10...moq-relay-v0.12.11) - 2026-06-17
+
+### Fixed
+
+- *(moq-relay,moq-native)* stop the cert-reload busy loop, then dedupe FileWatcher ([#1773](https://github.com/moq-dev/moq/pull/1773))
+
+### Other
+
+- release ([#1676](https://github.com/moq-dev/moq/pull/1676))
+
+## [0.12.10](https://github.com/moq-dev/moq/compare/moq-relay-v0.12.9...moq-relay-v0.12.10) - 2026-06-16
+
+### Added
+
+- *(moq-relay)* make /health a plain liveness probe, drop sysinfo ([#1746](https://github.com/moq-dev/moq/pull/1746))
+- *(moq-native)* add --tls-system-roots to trust custom and system roots together ([#1711](https://github.com/moq-dev/moq/pull/1711))
+- *(moq-relay)* accept a full URL for cluster.connect ([#1705](https://github.com/moq-dev/moq/pull/1705))
+
+### Fixed
+
+- *(moq-net)* don't tear down session on unauthorized announce-interest ([#1717](https://github.com/moq-dev/moq/pull/1717))
+
+### Other
+
+- Windows support: dual-stack IPv4/IPv6 sockets, setup.bat, and `just dev` ([#1732](https://github.com/moq-dev/moq/pull/1732))
+
+### Removed
+
+- *(moq-relay)* reduce `/health` to a plain liveness probe; drop the `--web-health-*` host overload thresholds and the `sysinfo` dependency ([#1746](https://github.com/moq-dev/moq/pull/1746))
+
 ## [0.12.9](https://github.com/moq-dev/moq/compare/moq-relay-v0.12.8...moq-relay-v0.12.9) - 2026-06-10
 
 ### Added

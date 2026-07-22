@@ -6,16 +6,29 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.onCompletion
-import uniffi.moq.MoqAnnounced
 import uniffi.moq.MoqAnnouncement
 import uniffi.moq.MoqAudioConsumer
 import uniffi.moq.MoqAudioFrame
+import uniffi.moq.MoqBroadcastConsumer
+import uniffi.moq.MoqBroadcastDynamic
+import uniffi.moq.MoqBroadcastRequest
 import uniffi.moq.MoqCatalog
 import uniffi.moq.MoqCatalogConsumer
+import uniffi.moq.MoqDatagram
+import uniffi.moq.MoqException
 import uniffi.moq.MoqFrame
 import uniffi.moq.MoqGroupConsumer
+import uniffi.moq.MoqGroupRequest
+import uniffi.moq.MoqJsonSnapshotConsumer
+import uniffi.moq.MoqJsonStreamConsumer
 import uniffi.moq.MoqMediaConsumer
+import uniffi.moq.MoqMediaFrame
+import uniffi.moq.MoqOriginConsumer
+import uniffi.moq.MoqOriginDynamic
+import uniffi.moq.MoqRoute
 import uniffi.moq.MoqTrackConsumer
+import uniffi.moq.MoqTrackDynamic
+import uniffi.moq.MoqTrackRequest
 
 /**
  * Stream of catalog updates. Terminates when the underlying track ends.
@@ -33,8 +46,22 @@ fun MoqCatalogConsumer.updates(): Flow<MoqCatalog> = flow {
     if (cause is CancellationException) cancel()
 }
 
+/**
+ * Subscribe to the catalog track and return the first catalog, cancelling the
+ * subscription before returning. Convenience for callers that only need the
+ * current catalog rather than a stream of updates (use [updates] for that).
+ */
+suspend fun MoqBroadcastConsumer.catalog(): MoqCatalog {
+    val consumer = subscribeCatalog()
+    try {
+        return consumer.next() ?: throw MoqException.Closed("broadcast closed before a catalog was published")
+    } finally {
+        consumer.cancel()
+    }
+}
+
 /** Stream of decoded media frames in decode order. */
-fun MoqMediaConsumer.frames(): Flow<MoqFrame> = flow {
+fun MoqMediaConsumer.frames(): Flow<MoqMediaFrame> = flow {
     while (true) {
         currentCoroutineContext().ensureActive()
         emit(next() ?: break)
@@ -48,6 +75,29 @@ fun MoqMediaConsumer.frames(): Flow<MoqFrame> = flow {
  * `MoqAudioDecoderConfig` the consumer was created with.
  */
 fun MoqAudioConsumer.frames(): Flow<MoqAudioFrame> = flow {
+    while (true) {
+        currentCoroutineContext().ensureActive()
+        emit(next() ?: break)
+    }
+}.onCompletion { cause ->
+    if (cause is CancellationException) cancel()
+}
+
+/**
+ * Stream of JSON values (as strings) from a snapshot track, yielding the latest reconstructed
+ * value. A consumer that has fallen behind collapses the backlog to the latest.
+ */
+fun MoqJsonSnapshotConsumer.values(): Flow<String> = flow {
+    while (true) {
+        currentCoroutineContext().ensureActive()
+        emit(next() ?: break)
+    }
+}.onCompletion { cause ->
+    if (cause is CancellationException) cancel()
+}
+
+/** Stream of JSON records (as strings) from a stream track, in order. */
+fun MoqJsonStreamConsumer.values(): Flow<String> = flow {
     while (true) {
         currentCoroutineContext().ensureActive()
         emit(next() ?: break)
@@ -76,8 +126,8 @@ fun MoqTrackConsumer.groupsAsArrived(): Flow<MoqGroupConsumer> = flow {
     if (cause is CancellationException) cancel()
 }
 
-/** Stream of raw frame payloads within a group. */
-fun MoqGroupConsumer.frames(): Flow<ByteArray> = flow {
+/** Stream of timestamped raw frames from one-frame-per-group tracks. */
+fun MoqTrackConsumer.frames(): Flow<MoqFrame> = flow {
     while (true) {
         currentCoroutineContext().ensureActive()
         emit(readFrame() ?: break)
@@ -86,12 +136,97 @@ fun MoqGroupConsumer.frames(): Flow<ByteArray> = flow {
     if (cause is CancellationException) cancel()
 }
 
-/** Stream of broadcast announcements from an origin. */
-fun MoqAnnounced.announcements(): Flow<MoqAnnouncement> = flow {
+/** Stream of best-effort datagrams in arrival order. */
+fun MoqTrackConsumer.datagrams(): Flow<MoqDatagram> = flow {
     while (true) {
         currentCoroutineContext().ensureActive()
-        emit(next() ?: break)
+        emit(recvDatagram() ?: break)
     }
 }.onCompletion { cause ->
     if (cause is CancellationException) cancel()
+}
+
+
+/** Stream of tracks requested by subscribers. */
+fun MoqBroadcastDynamic.requestedTracks(): Flow<MoqTrackRequest> = flow {
+    while (true) {
+        currentCoroutineContext().ensureActive()
+        emit(requestedTrack())
+    }
+}.onCompletion { cause ->
+    if (cause is CancellationException) cancel()
+}
+
+/** Stream of uncached group requests for one track. */
+fun MoqTrackDynamic.requestedGroups(): Flow<MoqGroupRequest> = flow {
+    while (true) {
+        currentCoroutineContext().ensureActive()
+        emit(requestedGroup())
+    }
+}.onCompletion { cause ->
+    if (cause is CancellationException) cancel()
+}
+
+/** Stream of broadcasts requested by consumers. */
+fun MoqOriginDynamic.requestedBroadcasts(): Flow<MoqBroadcastRequest> = flow {
+    while (true) {
+        currentCoroutineContext().ensureActive()
+        emit(requestedBroadcast())
+    }
+}.onCompletion { cause ->
+    if (cause is CancellationException) cancel()
+}
+
+/** Stream of timestamped raw frames within a group. */
+fun MoqGroupConsumer.frames(): Flow<MoqFrame> = flow {
+    while (true) {
+        currentCoroutineContext().ensureActive()
+        emit(readFrame() ?: break)
+    }
+}.onCompletion { cause ->
+    if (cause is CancellationException) cancel()
+}
+
+/**
+ * Stream of broadcast announcements under a prefix.
+ *
+ * Acquires the subscription on first collection and cancels it when collection
+ * ends, so callers never touch the underlying handle. Use the raw
+ * `announced(prefix)` if you need to hold and cancel the handle yourself.
+ */
+fun MoqOriginConsumer.announcements(prefix: String): Flow<MoqAnnouncement> {
+    val consumer = this
+    return flow {
+        val announced = consumer.announced(prefix)
+        try {
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                emit(announced.next() ?: break)
+            }
+        } finally {
+            announced.cancel()
+        }
+    }
+}
+
+/**
+ * Stream of route updates for a broadcast: the current route first, then every
+ * change (e.g. an upstream failover). Terminates when the broadcast ends.
+ *
+ * Acquires the watch on first collection and cancels it when collection ends.
+ * Use the raw `routeUpdates()` if you need to hold and cancel the handle yourself.
+ */
+fun MoqBroadcastConsumer.routes(): Flow<MoqRoute> {
+    val consumer = this
+    return flow {
+        val watch = consumer.routeUpdates()
+        try {
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                emit(watch.next() ?: break)
+            }
+        } finally {
+            watch.cancel()
+        }
+    }
 }

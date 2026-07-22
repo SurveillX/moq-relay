@@ -5,6 +5,8 @@
 //! Specification: [<https://github.com/moq-dev/drafts>]
 
 mod announce;
+mod connecting;
+mod datagram;
 mod fetch;
 mod goaway;
 mod group;
@@ -15,12 +17,17 @@ mod priority;
 mod probe;
 mod publisher;
 mod session;
+mod setup;
 mod stream;
 mod subscribe;
 mod subscriber;
+mod track;
 mod version;
 
 pub use announce::*;
+pub(crate) use connecting::*;
+#[allow(unused_imports)]
+pub use datagram::*;
 #[allow(unused_imports)]
 pub use fetch::*;
 #[allow(unused_imports)]
@@ -32,7 +39,11 @@ pub use parameters::*;
 pub use probe::*;
 use publisher::*;
 pub(super) use session::*;
+#[allow(unused_imports)]
+pub use setup::*;
 pub use stream::*;
 pub use subscribe::*;
 use subscriber::*;
+#[allow(unused_imports)]
+pub use track::*;
 pub use version::Version;

@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, btree_map};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use serde_with::{DisplayFromStr, hex::Hex};
+use serde_with::{DisplayFromStr, DurationMilliSeconds, hex::Hex};
 
 use crate::catalog::Container;
 
@@ -22,10 +22,16 @@ use crate::catalog::Container;
 ///
 /// This struct contains a map of renditions (different quality/codec options)
 /// and optional metadata like detection, display settings, rotation, and flip.
+///
+/// Marked `#[non_exhaustive]` so additional optional fields can be added without
+/// bumping the major version. External callers start from [`Video::default`] and
+/// fill in what they need ([`insert`](Self::insert) for renditions); struct-literal
+/// construction (with or without `..base`) is not available outside this crate.
 #[serde_with::serde_as]
 #[serde_with::skip_serializing_none]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Video {
 	/// A map of track name to rendition configuration.
 	/// This is not an array in order for it to work with JSON Merge Patch.
@@ -90,6 +96,15 @@ pub struct Display {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct VideoConfig {
+	/// Optional reference to another broadcast that publishes this track, expressed
+	/// relative to the broadcast that served this catalog (e.g. `../source`). If unset,
+	/// the track lives in the same broadcast as the catalog.
+	///
+	/// This allows a transcoder to author a downstream catalog that points unchanged
+	/// renditions at the source broadcast without re-publishing the bytes.
+	#[serde(default)]
+	pub broadcast: Option<moq_net::PathRelativeOwned>,
+
 	/// The codec, see the registry for details:
 	/// <https://w3c.github.io/webcodecs/codec_registry.html>
 	#[serde_as(as = "DisplayFromStr")]
@@ -114,8 +129,8 @@ pub struct VideoConfig {
 	///
 	/// This allows you to stretch/shrink pixels of the video.
 	/// If not provided, the display aspect ratio is 1:1
-	pub display_ratio_width: Option<u32>,
-	pub display_ratio_height: Option<u32>,
+	pub display_aspect_width: Option<u32>,
+	pub display_aspect_height: Option<u32>,
 
 	// TODO color space
 	/// The maximum bitrate of the video track, if known.
@@ -141,12 +156,20 @@ pub struct VideoConfig {
 	/// The player's jitter buffer should be larger than this value.
 	/// If not provided, the player should assume each frame is flushed immediately.
 	///
+	/// Serialized as an integer number of milliseconds (sub-ms precision is truncated).
+	///
 	/// ex:
 	/// - If each frame is flushed immediately, this would be 1000/fps.
 	/// - If there can be up to 3 b-frames in a row, this would be 3 * 1000/fps.
 	/// - If frames are buffered into 2s segments, this would be 2s.
+	#[serde_as(as = "Option<DurationMilliSeconds<u64>>")]
 	#[serde(default)]
-	pub jitter: Option<moq_net::Time>,
+	pub jitter: Option<std::time::Duration>,
+
+	/// The companion timeline track indexing this rendition's groups, if the publisher
+	/// offers one. See [`Timeline`](crate::catalog::Timeline).
+	#[serde(default)]
+	pub timeline: Option<crate::catalog::Timeline>,
 }
 
 impl VideoConfig {
@@ -158,17 +181,45 @@ impl VideoConfig {
 	/// since the type is `#[non_exhaustive]`.
 	pub fn new(codec: impl Into<VideoCodec>) -> Self {
 		Self {
+			broadcast: None,
 			codec: codec.into(),
 			description: None,
 			coded_width: None,
 			coded_height: None,
-			display_ratio_width: None,
-			display_ratio_height: None,
+			display_aspect_width: None,
+			display_aspect_height: None,
 			bitrate: None,
 			framerate: None,
 			optimize_for_latency: None,
 			container: Container::default(),
 			jitter: None,
+			timeline: None,
 		}
+	}
+}
+
+#[cfg(test)]
+mod test {
+	use crate::catalog::{Container, H264};
+
+	use super::*;
+
+	#[test]
+	fn display_aspect_uses_canonical_json_names() {
+		let mut config = VideoConfig::new(H264 {
+			profile: 0x64,
+			constraints: 0,
+			level: 0x1f,
+			inline: false,
+		});
+		config.display_aspect_width = Some(4);
+		config.display_aspect_height = Some(3);
+		config.container = Container::Legacy;
+
+		let encoded = serde_json::to_value(config).expect("failed to encode");
+		assert_eq!(encoded["displayAspectWidth"], 4);
+		assert_eq!(encoded["displayAspectHeight"], 3);
+		assert!(encoded.get("displayRatioWidth").is_none());
+		assert!(encoded.get("displayRatioHeight").is_none());
 	}
 }

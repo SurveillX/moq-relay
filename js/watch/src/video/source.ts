@@ -1,19 +1,18 @@
 import type * as Catalog from "@moq/hang/catalog";
 import type * as Moq from "@moq/net";
-import { Effect, type Getter, Signal } from "@moq/signals";
+import { Time } from "@moq/net";
+import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import type { Broadcast } from "../broadcast";
-import type { Sync } from "../sync";
 
 /**
- * A function that checks if a video configuration is supported by the backend.
+ * A function that checks if a video configuration can be played.
+ *
+ * `Decoder.supported` is the WebCodecs probe used by `<moq-watch>`.
  */
 export type Supported = (config: Catalog.VideoConfig) => Promise<boolean>;
 
-export type SourceProps = {
-	broadcast?: Broadcast | Signal<Broadcast | undefined>;
-	target?: Target | Signal<Target | undefined>;
-	supported?: Supported;
-};
+/** A video source error that prevents choosing a usable rendition. */
+export type SourceError = "unsupported";
 
 export type Target = {
 	// Optional manual override for the selected rendition name.
@@ -30,6 +29,30 @@ export type Target = {
 
 	// Maximum desired bitrate in bits per second.
 	bitrate?: number;
+};
+
+export type SourceInput = {
+	broadcast: Getter<Broadcast | undefined>;
+	target: Getter<Target | undefined>;
+
+	// A function that checks if a video configuration can be played. Renditions that fail the
+	// probe are filtered out. Nothing is selected until one is provided.
+	supported: Getter<Supported | undefined>;
+};
+
+type SourceOutput = {
+	catalog: Signal<Catalog.Video | undefined>;
+	available: Signal<Record<string, Catalog.VideoConfig>>;
+
+	// The current source error, or undefined while healthy or still probing.
+	error: Signal<SourceError | undefined>;
+
+	// The name of the active rendition.
+	track: Signal<string | undefined>;
+	config: Signal<Catalog.VideoConfig | undefined>;
+
+	// The per-rendition jitter (ms) to add to the sync buffer. Wired into Sync by the parent.
+	jitter: Signal<Moq.Time.Milli | undefined>;
 };
 
 /**
@@ -186,87 +209,102 @@ function bestRendition(entries: [string, Catalog.VideoConfig][]): string {
 
 /**
  * Source handles catalog extraction, support checking, and rendition selection
- * for video playback. It is used by both MSE and Decoder backends.
+ * for video playback. The Decoder consumes whichever rendition it picks.
  */
 export class Source {
-	broadcast: Signal<Broadcast | undefined>;
-	target: Signal<Target | undefined>;
+	readonly in: Readonlys<SourceInput>;
 
-	readonly catalog: Getter<Catalog.Video | undefined>;
-
-	#available = new Signal<Record<string, Catalog.VideoConfig>>({});
-	readonly available: Getter<Record<string, Catalog.VideoConfig>> = this.#available;
-
-	// The name of the active rendition.
-	#track = new Signal<string | undefined>(undefined);
-	readonly track: Getter<string | undefined> = this.#track;
-
-	#config = new Signal<Catalog.VideoConfig | undefined>(undefined);
-	readonly config: Getter<Catalog.VideoConfig | undefined> = this.#config;
-
-	sync: Sync;
-	supported: Signal<Supported | undefined>;
+	readonly #out: SourceOutput = {
+		catalog: new Signal<Catalog.Video | undefined>(undefined),
+		available: new Signal<Record<string, Catalog.VideoConfig>>({}),
+		error: new Signal<SourceError | undefined>(undefined),
+		track: new Signal<string | undefined>(undefined),
+		config: new Signal<Catalog.VideoConfig | undefined>(undefined),
+		jitter: new Signal<Moq.Time.Milli | undefined>(undefined),
+	};
+	readonly out = readonlys(this.#out);
 
 	#signals = new Effect();
 
-	constructor(sync: Sync, props?: SourceProps) {
-		this.broadcast = Signal.from(props?.broadcast);
-		this.target = Signal.from(props?.target);
-		this.sync = sync;
-		this.supported = Signal.from(props?.supported);
+	constructor(props?: Inputs<SourceInput>) {
+		this.in = {
+			broadcast: getter(props?.broadcast),
+			target: getter(props?.target),
+			supported: getter(props?.supported),
+		};
 
-		// The video catalog, derived from the active broadcast.
-		this.catalog = this.#signals.computed((effect) => {
-			const broadcast = effect.get(this.broadcast);
-			return broadcast ? effect.get(broadcast.catalog)?.video : undefined;
-		});
-
+		this.#signals.run(this.#runCatalog.bind(this));
 		this.#signals.run(this.#runSupported.bind(this));
 		this.#signals.run(this.#runSelected.bind(this));
 	}
 
-	#runSupported(effect: Effect): void {
-		const supported = effect.get(this.supported);
-		if (!supported) return;
+	#runCatalog(effect: Effect): void {
+		const broadcast = effect.get(this.in.broadcast);
+		if (!broadcast) return;
 
-		const renditions = effect.get(this.catalog)?.renditions ?? {};
+		const catalog = effect.get(broadcast.out.catalog)?.video;
+		if (!catalog) return;
+
+		effect.set(this.#out.catalog, catalog);
+	}
+
+	#runSupported(effect: Effect): void {
+		const supported = effect.get(this.in.supported);
+		if (!supported) {
+			this.#out.error.set(undefined);
+			return;
+		}
+
+		const renditions = effect.get(this.#out.catalog)?.renditions ?? {};
+		this.#out.error.set(undefined);
 
 		effect.spawn(async () => {
 			const available: Record<string, Catalog.VideoConfig> = {};
 
 			for (const [name, config] of Object.entries(renditions)) {
-				const isSupported = await supported(config);
+				let isSupported = false;
+				try {
+					isSupported = await supported(config);
+				} catch (err) {
+					console.warn(
+						`[Source] video rendition ${name} (${config.codec}) support probe failed; treating as unsupported`,
+						err,
+					);
+				}
 				if (isSupported) available[name] = config;
 			}
 
-			if (Object.keys(available).length === 0 && Object.keys(renditions).length > 0) {
+			const error =
+				Object.keys(available).length === 0 && Object.keys(renditions).length > 0 ? "unsupported" : undefined;
+			if (error === "unsupported") {
 				console.warn("[Source] No supported video renditions found:", renditions);
 			}
 
-			this.#available.set(available);
+			this.#out.error.set(error);
+			this.#out.available.set(available);
 		});
 	}
 
 	#runSelected(effect: Effect): void {
-		const available = effect.get(this.#available);
+		const available = effect.get(this.#out.available);
 		if (Object.keys(available).length === 0) return;
 
-		const target = effect.get(this.target);
+		const target = effect.get(this.in.target);
 
 		// Manual selection by name — skip all ABR logic.
 		if (target?.name && target.name in available) {
 			const config = available[target.name];
-			effect.set(this.#track, target.name);
-			effect.set(this.#config, config);
-			effect.set(this.sync.video, config.jitter as Moq.Time.Milli | undefined);
+			effect.set(this.#out.track, target.name);
+			effect.set(this.#out.config, config);
+			effect.set(this.#out.jitter, config.jitter !== undefined ? Time.Milli(config.jitter) : undefined);
 			return;
 		}
 
 		// Auto-select: use recv bandwidth if no explicit bitrate target.
 		let effectiveTarget = target;
 		if (!target?.bitrate) {
-			const broadcast = effect.get(this.broadcast);
-			const connection = broadcast ? effect.get(broadcast.connection) : undefined;
+			const broadcast = effect.get(this.in.broadcast);
+			const connection = broadcast ? effect.get(broadcast.in.connection) : undefined;
 			const recvBw = connection?.recvBandwidth;
 			if (recvBw) {
 				const estimate = effect.get(recvBw);
@@ -283,12 +321,12 @@ export class Source {
 
 		const config = available[selected];
 
-		effect.set(this.#track, selected);
-		effect.set(this.#config, config);
+		effect.set(this.#out.track, selected);
+		effect.set(this.#out.config, config);
 
 		// Use catalog jitter if available, otherwise estimate from framerate.
 		const jitter = config.jitter ?? (config.framerate ? Math.ceil(1000 / config.framerate) : undefined);
-		effect.set(this.sync.video, jitter as Moq.Time.Milli | undefined);
+		effect.set(this.#out.jitter, jitter !== undefined ? Time.Milli(jitter) : undefined);
 	}
 
 	/**

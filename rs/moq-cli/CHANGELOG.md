@@ -7,6 +7,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.7](https://github.com/moq-dev/moq/compare/moq-cli-v0.8.6...moq-cli-v0.8.7) - 2026-07-18
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.8.6](https://github.com/moq-dev/moq/compare/moq-cli-v0.8.5...moq-cli-v0.8.6) - 2026-07-17
+
+### Other
+
+- updated the following local packages: moq-rtc
+
+## [0.8.5](https://github.com/moq-dev/moq/compare/moq-cli-v0.8.4...moq-cli-v0.8.5) - 2026-07-16
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.8.4](https://github.com/moq-dev/moq/compare/moq-cli-v0.8.3...moq-cli-v0.8.4) - 2026-07-15
+
+### Other
+
+- rewrite export::Broadcaster as an owned poll-driven state machine ([#2258](https://github.com/moq-dev/moq/pull/2258))
+
+## [0.8.3](https://github.com/moq-dev/moq/compare/moq-cli-v0.8.2...moq-cli-v0.8.3) - 2026-07-12
+
+### Added
+
+- *(moq-native)* add quic::Client/quic::Server transport config ([#2161](https://github.com/moq-dev/moq/pull/2161))
+
+## [0.8.2](https://github.com/moq-dev/moq/compare/moq-cli-v0.8.1...moq-cli-v0.8.2) - 2026-07-09
+
+### Added
+
+- *(moq-rtmp,moq-srt)* less aggressive default egress latency ([#2118](https://github.com/moq-dev/moq/pull/2118))
+
+## [0.8.1](https://github.com/moq-dev/moq/compare/moq-cli-v0.8.0...moq-cli-v0.8.1) - 2026-07-05
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.8.0](https://github.com/moq-dev/moq/compare/moq-cli-v0.7.35...moq-cli-v0.8.0) - 2026-07-04
+
+### Added
+
+- *(moq-cli)* per-sink frame-drop latency for the export gateways ([#1998](https://github.com/moq-dev/moq/pull/1998))
+
+### Other
+
+- Move the connect URL and connect/serve loops into moq-native ([#2048](https://github.com/moq-dev/moq/pull/2048))
+- [codex] configure moq-cli CORS origins ([#1996](https://github.com/moq-dev/moq/pull/1996))
+- unified endpoint grammar (binary renamed to `moq`) ([#1985](https://github.com/moq-dev/moq/pull/1985))
+- Add "--tls-generate" flag to examples ([#1959](https://github.com/moq-dev/moq/pull/1959))
+
+## [0.7.35](https://github.com/moq-dev/moq/compare/moq-cli-v0.7.34...moq-cli-v0.7.35) - 2026-06-30
+
+### Added
+
+- *(moq-srt)* bidirectional SRT/MPEG-TS gateway (+ timestamped ts::Export) ([#1915](https://github.com/moq-dev/moq/pull/1915))
+- *(hang)* compressed catalog track (catalog.json.z) ([#1904](https://github.com/moq-dev/moq/pull/1904))
+
+### Other
+
+- *(deps)* bump the cargo group across 1 directory with 18 updates ([#1942](https://github.com/moq-dev/moq/pull/1942))
+- [codex] Route HLS CLI import through moq-hls ([#1939](https://github.com/moq-dev/moq/pull/1939))
+- Backport moq-mux to main (adapted to main's moq-net, no wire/API breaks) ([#1918](https://github.com/moq-dev/moq/pull/1918))
+
+## [0.7.34](https://github.com/moq-dev/moq/compare/moq-cli-v0.7.33...moq-cli-v0.7.34) - 2026-06-23
+
+### Added
+
+- *(catalog)* expose untyped catalog extensions via moq-ffi and libmoq ([#1886](https://github.com/moq-dev/moq/pull/1886))
+- *(moq-cli)* wire verbatim MPEG-TS carriage through publish/subscribe ([#1842](https://github.com/moq-dev/moq/pull/1842))
+
+### Other
+
+- move moq-cli's TS verbatim coverage into moq-mux ([#1879](https://github.com/moq-dev/moq/pull/1879))
+
+## [0.7.33](https://github.com/moq-dev/moq/compare/moq-cli-v0.7.32...moq-cli-v0.7.33) - 2026-06-19
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.7.32](https://github.com/moq-dev/moq/compare/moq-cli-v0.7.31...moq-cli-v0.7.32) - 2026-06-16
+
+### Other
+
+- Add FLV (Flash Video / RTMP) container support to moq-mux ([#1745](https://github.com/moq-dev/moq/pull/1745))
+- Windows support: dual-stack IPv4/IPv6 sockets, setup.bat, and `just dev` ([#1732](https://github.com/moq-dev/moq/pull/1732))
+- *(moq-cli)* remove the capture feature ([#1728](https://github.com/moq-dev/moq/pull/1728))
+
 ## [0.7.31](https://github.com/moq-dev/moq/compare/moq-cli-v0.7.30...moq-cli-v0.7.31) - 2026-06-10
 
 ### Added

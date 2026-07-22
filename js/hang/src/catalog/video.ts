@@ -1,14 +1,21 @@
 import * as z from "zod/mini";
 import { ContainerSchema } from "./container";
 import { u53Schema } from "./integers";
+import { RelativeBroadcastSchema } from "./path";
+import { TimelineSchema } from "./timeline";
 
 // Backwards compatibility: old track schema
 const TrackSchema = z.object({
 	name: z.string(),
 });
 
-// Based on VideoDecoderConfig
+/** Schema for a single video rendition's decoder config. Mirrors WebCodecs VideoDecoderConfig. */
 export const VideoConfigSchema = z.object({
+	// Optional reference to another broadcast that publishes this track, expressed
+	// relative to the broadcast that served this catalog (e.g. "../source").
+	// If unset, the track lives in the same broadcast as the catalog.
+	broadcast: z.optional(RelativeBroadcastSchema),
+
 	// See: https://w3c.github.io/webcodecs/codec_registry.html
 	codec: z.string(),
 
@@ -51,10 +58,15 @@ export const VideoConfigSchema = z.object({
 	// - If there can be up to 3 b-frames in a row, this would be 3 * 1000/fps.
 	// - If frames are buffered into 2s segments, this would be 2s.
 	jitter: z.optional(u53Schema),
+
+	// The companion timeline track indexing this rendition's groups, if the publisher offers one.
+	timeline: z.optional(TimelineSchema),
 });
 
-// Mirrors VideoDecoderConfig
-// https://w3c.github.io/webcodecs/#video-decoder-config
+/**
+ * Schema for the catalog video section: renditions plus display size, rotation, and flip.
+ * Renditions mirror WebCodecs VideoDecoderConfig (https://w3c.github.io/webcodecs/#video-decoder-config).
+ */
 export const VideoSchema = z.union([
 	z.object({
 		// A map of track name to rendition configuration.
@@ -101,5 +113,7 @@ export const VideoSchema = z.union([
 	),
 ]);
 
+/** The catalog video section: renditions keyed by track name plus display options. */
 export type Video = z.infer<typeof VideoSchema>;
+/** Decoder config for a single video rendition. */
 export type VideoConfig = z.infer<typeof VideoConfigSchema>;

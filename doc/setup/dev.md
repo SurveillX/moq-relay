@@ -38,14 +38,14 @@ just fix
 just test
 
 # Publish a HLS broadcast (CMAF) over MoQ
-just pub-hls tos
+just pub hls tos
 ```
 
 Want more? See the [justfile](https://github.com/moq-dev/moq/blob/main/justfile) for all commands.
 
 ### The Internet
 
-Most of the commands default to `http://localhost:4443/anon`.
+Most of the commands default to `http://localhost:4443`.
 That's pretty lame.
 
 If you want to do a real test of how MoQ works over the internet, you're going to need a remote server.
@@ -60,19 +60,19 @@ Anything you publish is public and discoverable... so be careful and don't abuse
 ```bash
 # Run the web server, pointing to the public relay
 # NOTE: The `bbb` demo on moq.dev uses a different path so it won't show up.
-just web https://cdn.moq.dev/anon
+just web serve https://cdn.moq.dev/anon
 
 # Publish Tears of Steel, watch it via https://moq.dev/watch?name=tos
 just pub tos https://cdn.moq.dev/anon
 
 # Publish a clock broadcast
-just clock publish https://cdn.moq.dev/anon
+just pub clock publish https://cdn.moq.dev/anon
 
 # Subscribe to said clock broadcast (different tab)
-just clock subscribe https://cdn.moq.dev/anon
+just pub clock subscribe https://cdn.moq.dev/anon
 
 # Publish an authentication broadcast
-just pub av1 https://cdn.moq.dev/?jwt=not_a_real_token_ask_for_one
+just pub bbb https://cdn.moq.dev/?jwt=not_a_real_token_ask_for_one
 ```
 
 ## Debugging

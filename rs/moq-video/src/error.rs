@@ -2,50 +2,48 @@
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-	/// libav* (capture, scaling, or codec) failure.
-	///
-	/// Carries the formatted message rather than the typed `ffmpeg_next::Error`
-	/// on purpose: keeping ffmpeg out of the public surface means an
-	/// `ffmpeg-next` major bump isn't a breaking change for consumers.
-	#[error("ffmpeg: {0}")]
-	Ffmpeg(String),
-
-	/// No encoder matching the requested codec / hardware preference was
-	/// compiled into the linked ffmpeg.
-	#[error("no usable H.264 encoder found (tried: {0})")]
+	/// No encoder matching the requested codec / hardware preference could be
+	/// opened (none compiled in, or none available on this machine).
+	#[error("no usable video encoder found (tried: {0})")]
 	NoEncoder(String),
 
-	/// The requested input format (avfoundation / v4l2 / dshow) is not
-	/// available in the linked libavdevice.
-	#[error("capture backend {0:?} not available in this ffmpeg build")]
-	NoCaptureBackend(&'static str),
+	/// No decoder matching the requested codec / hardware preference could be
+	/// opened (none compiled in, or none available on this machine).
+	#[error("no usable video decoder found (tried: {0})")]
+	NoDecoder(String),
 
-	/// The opened capture device exposed no decodable video stream.
-	#[error("no video stream on capture device {0:?}")]
-	NoVideoStream(String),
+	/// A track's codec is not supported by the native decoders.
+	#[error("unsupported codec for native decode: {0}")]
+	UnsupportedCodec(String),
+
+	/// The requested capture source or enumeration has no implementation on this
+	/// platform (the message names what is missing).
+	#[error("not supported on this platform: {0}")]
+	Unsupported(String),
 
 	/// The configured framerate was zero (would divide by zero / produce a
 	/// degenerate codec time base).
 	#[error("invalid framerate: {0} (must be non-zero)")]
 	InvalidFramerate(u32),
 
-	/// moq-mux codec/transport error (H.264 import, catalog).
+	/// This encoder can't change its bitrate once open, so it can't follow a
+	/// congestion-control estimate. Encoding continues at the configured rate.
+	#[error("encoder {0} cannot change bitrate while running")]
+	BitrateUnsupported(&'static str),
+
+	/// Capture / encode / codec failure (the message carries the detail).
 	#[error(transparent)]
 	Codec(#[from] anyhow::Error),
 
+	/// moq-mux muxer/catalog error.
+	#[error(transparent)]
+	Mux(#[from] moq_mux::Error),
+
 	/// moq-net transport error.
 	#[error(transparent)]
-	Moq(#[from] moq_net::Error),
+	Net(#[from] moq_net::Error),
 
 	/// Timestamp overflow converting to the moq microsecond timescale.
 	#[error(transparent)]
 	TimeOverflow(#[from] moq_net::TimeOverflow),
-}
-
-// Manual (not `#[from]`) so the typed ffmpeg error stays out of the public
-// variant while `?` on ffmpeg results still converts automatically.
-impl From<ffmpeg_next::Error> for Error {
-	fn from(err: ffmpeg_next::Error) -> Self {
-		Self::Ffmpeg(err.to_string())
-	}
 }

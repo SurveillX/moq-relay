@@ -7,11 +7,19 @@
 //!
 //! ## API
 //! The API is built around Producer/Consumer pairs, with the hierarchy:
-//! - [Origin]: A collection of [Broadcast]s, produced by one or more [Session]s.
-//! - [Broadcast]: A collection of [Track]s, produced by a single publisher.
-//! - [Track]: A collection of [Group]s, delivered out-of-order until expired.
-//! - [Group]: A collection of [Frame]s, delivered in order until cancelled.
-//! - [Frame]: Chunks of data with an upfront size.
+//! - [origin::Consumer]: A collection of [broadcast::Consumer]s, produced by one or more [Session]s.
+//! - [broadcast::Consumer]: A collection of [track::Consumer]s, produced by a single publisher.
+//! - [track::Consumer]: A collection of [group::Info]s, delivered out-of-order until expired.
+//! - [group::Info]: A collection of [frame::Info]s, delivered in order until cancelled.
+//! - [frame::Info]: Chunks of data with an upfront size.
+//!
+//! Each level lives in its own module (`broadcast`, `track`, `group`, `frame`, `origin`,
+//! `announce`) that owns the short `Producer` / `Consumer` / `Info` names.
+//!
+//! Traffic counters for the levels above live in [`stats`]: build a [`stats::Registry`]
+//! and hand each session a [`stats::Handle`] via [`Client::with_stats`] /
+//! [`Server::with_stats`]. Publishing the counters as MoQ broadcasts lives in the
+//! `moq-stats` crate.
 //!
 //! ## Compatibility
 //! The API exposes the intersection of features supported by both protocols, intentionally
@@ -39,14 +47,27 @@
 //! last producer signals consumers that no more updates are coming.
 //!
 //! ## Async
-//! This library is async-first, using [tokio] for async I/O and task management.
-//! Any plain `async` method should be awaited from inside an active tokio runtime.
-//! Otherwise you risk a panic.
+//! This library is async-first. [`Client::connect`] and [`Server::accept`] return a
+//! `(Session, Driver)` pair: the [`Session`] is the handle, and the [`Driver`] is
+//! the future that runs all of its protocol work. Nothing is spawned behind your
+//! back: spawn the driver on your executor, await it in place, or step
+//! [`Driver::poll`] with a [`kio::Waiter`] from your own `poll_*` function. The
+//! driver holds no session handle, so the transport still closes when the last
+//! [`Session`] clone drops (or on [`Session::abort`]), which in turn finishes the
+//! driver.
 //!
-//! This requirement is being phased out as more methods grow `poll_xxx` counterparts
-//! built on [`kio`], so you can drive them from custom executors without a tokio
-//! runtime. You can also call them synchronously, since [`kio`] is built on the
-//! standard [`std::task::Waker`] API and any [`std::task::Waker`] is a valid driver.
+//! The crate has no direct tokio dependency: every future is built on [`kio`]
+//! (plain [`std::task::Waker`] plumbing) and `futures`, so any executor can poll
+//! them, and the `poll_xxx` counterparts can be stepped synchronously with a
+//! [`kio::Waiter`].
+//!
+//! The one remaining runtime tie is time. Timers go through `web_async::time`,
+//! which is backed by tokio's time driver on native (and `wasmtimer` in the
+//! browser), and those timers panic when polled outside a tokio runtime. So on
+//! native you still need a tokio runtime to poll a [`Driver`] (bandwidth sampling,
+//! the control stream timeout, and subscription linger all sleep); purely
+//! model-layer methods (tracks, groups, frames, origins) never touch a timer and
+//! run on any executor.
 
 mod client;
 mod coding;
@@ -58,21 +79,27 @@ mod path;
 mod server;
 mod session;
 mod setup;
-mod stats;
+mod util;
 mod version;
 
+pub mod stats;
+
 pub use client::*;
-pub use coding::{BoundsExceeded, DecodeError, EncodeError};
+pub use coding::{BoundsExceeded, DecodeError, EncodeError, VarInt};
 pub use error::*;
+/// The session direction a client advertises in its SETUP (moq-lite-05+).
+pub use lite::Role;
 pub use model::*;
 pub use path::*;
 pub use server::*;
 pub use session::*;
-pub use stats::*;
 pub use version::*;
 
 // Re-export the bytes crate
 pub use bytes;
+
+// Re-export the transport trait, since it bounds the Client/Server entry points.
+pub use web_transport_trait;
 
 // Re-export the kio crate, since it appears in the public API (e.g. poll_* waiters).
 pub use kio;

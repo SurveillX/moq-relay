@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use moq_native::Status;
-use moq_native::moq_net::{self, Broadcast, BroadcastConsumer, Origin, Track, TrackProducer, bytes::Bytes};
+use moq_native::moq_net::{self, Origin, bytes::Bytes};
+use moq_native::moq_net::{broadcast, track};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
@@ -75,13 +76,13 @@ pub async fn run(ctx: Connection) {
 		stats,
 	} = ctx;
 
-	let url = config.url.clone().expect("url required");
+	let url = config.client.connect.clone().expect("url required");
 
 	// Publish side: an origin we fill with our broadcasts and hand to the session.
 	let publish = Origin::random().produce();
 	// Consume side: the session fills this with peer announcements.
 	let consume = Origin::random().produce();
-	let announced = consume.consume();
+	let announced = consume.consume().announced();
 
 	let name = config.name();
 	let mut broadcasts = Vec::new();
@@ -91,16 +92,20 @@ pub async fn run(ctx: Connection) {
 	for index in 0..rolled.broadcasts {
 		let path = format!("{name}/{run_id:08x}/{connection}/{index}");
 
-		let mut broadcast = Broadcast::new().produce();
-		let track = match broadcast.create_track(Track::new(TRACK)) {
+		let mut broadcast = match publish.create_broadcast(&path, broadcast::Route::new().with_announce(true)) {
+			Ok(broadcast) => broadcast,
+			Err(err) => {
+				tracing::error!(connection, %err, "failed to create broadcast");
+				continue;
+			}
+		};
+		let track = match broadcast.create_track(TRACK, None) {
 			Ok(track) => track,
 			Err(err) => {
 				tracing::error!(connection, %err, "failed to create track");
 				continue;
 			}
 		};
-
-		publish.publish_broadcast(&path, broadcast.consume());
 		own.insert(path.clone());
 		// Hold the broadcast producer for the connection's lifetime so it stays announced.
 		broadcasts.push(broadcast);
@@ -109,7 +114,7 @@ pub async fn run(ctx: Connection) {
 		tasks.spawn(produce(connection, path, rolled, track, stats));
 	}
 
-	let client = client.with_publish(publish.consume()).with_consume(consume);
+	let client = client.with_publisher(&publish).with_subscriber(consume);
 	let mut reconnect = client.reconnect(url);
 
 	// Subscriber: drain up to `subscribe` peer broadcasts.
@@ -167,7 +172,7 @@ async fn produce(
 	connection: u64,
 	path: String,
 	rolled: Rolled,
-	mut track: TrackProducer,
+	mut track: track::Producer,
 	stats: Arc<Stats>,
 ) -> anyhow::Result<()> {
 	let _gauge = Gauge::inc(&stats.broadcasts);
@@ -204,13 +209,13 @@ async fn produce(
 				.as_millis(),
 		};
 		let header = Bytes::from(serde_json::to_vec(&header)?);
-		group.write_frame(header.clone())?;
+		group.write_frame(moq_net::Timestamp::now(), header.clone())?;
 		stats.frame_sent(header.len());
 
 		// The remaining frames in the group are zeroed payload.
 		for _ in 0..rolled.group_size {
 			ticker.tick().await;
-			group.write_frame(zeros.clone())?;
+			group.write_frame(moq_net::Timestamp::now(), zeros.clone())?;
 			stats.frame_sent(zeros.len());
 		}
 
@@ -222,7 +227,7 @@ async fn produce(
 /// Watch announcements and drain up to `want` peer broadcasts (excluding our own),
 /// spreading each subscription's start over `startup` to avoid a thundering herd.
 async fn subscribe(
-	mut announced: moq_net::OriginConsumer,
+	mut announced: moq_net::announce::Consumer,
 	own: HashSet<String>,
 	want: u64,
 	startup: Duration,
@@ -232,7 +237,7 @@ async fn subscribe(
 	let mut seen: HashSet<String> = HashSet::new();
 
 	while (seen.len() as u64) < want {
-		let Some((path, broadcast)) = announced.announced().await else {
+		let Some(moq_net::announce::Update { path, broadcast }) = announced.next().await else {
 			break;
 		};
 		let Some(broadcast) = broadcast else {
@@ -266,10 +271,10 @@ async fn subscribe(
 
 /// Subscribe to the broadcast's track, counting every frame received and tracking
 /// group-sequence gaps to report skipped groups.
-async fn drain(broadcast: BroadcastConsumer, stats: &Stats) -> anyhow::Result<()> {
+async fn drain(broadcast: broadcast::Consumer, stats: &Stats) -> anyhow::Result<()> {
 	let _gauge = Gauge::inc(&stats.subscriptions);
 
-	let mut track = broadcast.subscribe_track(&Track::new(TRACK))?;
+	let mut track = broadcast.track(TRACK)?.subscribe(None).await?;
 	let mut gaps = GapTracker::new(stats);
 	let mut learned_shape = false;
 
@@ -283,7 +288,7 @@ async fn drain(broadcast: BroadcastConsumer, stats: &Stats) -> anyhow::Result<()
 			// The first frame of every group is the JSON keyframe. Parse it once to
 			// learn the publisher's shape (we may be watching a peer, not ourselves).
 			if first && !learned_shape {
-				if let Ok(header) = serde_json::from_slice::<RecvHeader>(&frame) {
+				if let Ok(header) = serde_json::from_slice::<RecvHeader>(&frame.payload) {
 					tracing::debug!(
 						fps = header.fps,
 						frame_size = header.frame_size,
@@ -294,7 +299,7 @@ async fn drain(broadcast: BroadcastConsumer, stats: &Stats) -> anyhow::Result<()
 				}
 			}
 			first = false;
-			stats.frame_recv(frame.len());
+			stats.frame_recv(frame.payload.len());
 		}
 	}
 	Ok(())
@@ -412,8 +417,8 @@ mod tests {
 		tokio::time::pause();
 
 		let stats = Arc::new(Stats::default());
-		let mut broadcast = Broadcast::new().produce();
-		let track = broadcast.create_track(Track::new(TRACK)).unwrap();
+		let mut broadcast = broadcast::Info::new().produce();
+		let track = broadcast.create_track(TRACK, None).unwrap();
 		let consumer = broadcast.consume();
 
 		// 10fps (100ms/frame), 8-byte frames, 2 payload frames per group.
@@ -422,11 +427,11 @@ mod tests {
 		// Advance past one full group (keyframe + 2 payload) into the next.
 		tokio::time::advance(Duration::from_millis(350)).await;
 
-		let mut sub = consumer.subscribe_track(&Track::new(TRACK)).unwrap();
+		let mut sub = consumer.track(TRACK).unwrap().subscribe(None).await.unwrap();
 		let mut group = sub.next_group().await.unwrap().expect("a group");
 
 		let keyframe = group.read_frame().await.unwrap().expect("keyframe");
-		let header: serde_json::Value = serde_json::from_slice(&keyframe).unwrap();
+		let header: serde_json::Value = serde_json::from_slice(&keyframe.payload).unwrap();
 		assert_eq!(header["connection"], 7);
 		assert_eq!(header["broadcast"], "bench/test");
 		assert_eq!(header["group"], 0);
@@ -435,7 +440,7 @@ mod tests {
 		assert_eq!(header["group_size"], 2);
 
 		for _ in 0..2 {
-			let payload = group.read_frame().await.unwrap().expect("payload");
+			let payload = group.read_frame().await.unwrap().expect("payload").payload;
 			assert_eq!(payload.len(), 8);
 			assert!(payload.iter().all(|&b| b == 0));
 		}
@@ -450,14 +455,14 @@ mod tests {
 		tokio::time::pause();
 
 		let stats = Arc::new(Stats::default());
-		let mut broadcast = Broadcast::new().produce();
-		let track = broadcast.create_track(Track::new(TRACK)).unwrap();
+		let mut broadcast = broadcast::Info::new().produce();
+		let track = broadcast.create_track(TRACK, None).unwrap();
 		let consumer = broadcast.consume();
 
 		let task = tokio::spawn(produce(0, "bench/test".into(), rolled(10, 4, 0), track, stats.clone()));
 		tokio::time::advance(Duration::from_millis(250)).await;
 
-		let mut sub = consumer.subscribe_track(&Track::new(TRACK)).unwrap();
+		let mut sub = consumer.track(TRACK).unwrap().subscribe(None).await.unwrap();
 		let mut group = sub.next_group().await.unwrap().expect("a group");
 
 		// Just the keyframe, then the group ends.

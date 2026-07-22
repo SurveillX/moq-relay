@@ -76,7 +76,7 @@ async function publish(config: Config) {
 	console.log("✅ Connected to relay:", config.url);
 
 	// Create a new "broadcast", which is a collection of tracks.
-	const broadcast = new Moq.Broadcast();
+	const broadcast = new Moq.Broadcast.Producer();
 	connection.publish(Moq.Path.from(config.broadcast), broadcast);
 
 	console.log("✅ Published broadcast:", config.broadcast);
@@ -86,15 +86,17 @@ async function publish(config: Config) {
 		const request = await broadcast.requested();
 		if (!request) break;
 
-		if (request.track.name === config.track) {
-			publishTrack(request.track);
+		if (request.name === config.track) {
+			// Accept to commit the track's immutable properties (so a lite-05 TRACK
+			// request resolves) and obtain the Track to produce into.
+			void publishTrack(request.accept());
 		} else {
-			request.track.close(new Error("not found"));
+			request.reject(new Error("not found"));
 		}
 	}
 }
 
-async function publishTrack(track: Moq.Track) {
+async function publishTrack(track: Moq.Track.Producer) {
 	// Send timestamps over the wire, matching the Rust implementation format
 	console.log("✅ Publishing clock data on track:", track.name);
 
@@ -141,7 +143,7 @@ async function subscribe(config: Config) {
 	console.log("✅ Connected to relay:", config.url);
 
 	const broadcast = connection.consume(Moq.Path.from(config.broadcast));
-	const track = broadcast.subscribe(config.track, 0);
+	const track = broadcast.track(config.track).subscribe({ priority: 0 });
 
 	console.log("✅ Subscribed to track:", config.track);
 
@@ -160,7 +162,7 @@ async function subscribe(config: Config) {
 			continue;
 		}
 
-		const base = new TextDecoder().decode(baseFrame);
+		const base = new TextDecoder().decode(baseFrame.payload);
 
 		// Read individual second frames
 		for (;;) {

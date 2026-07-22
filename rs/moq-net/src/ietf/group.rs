@@ -1,9 +1,95 @@
 use crate::coding::{Decode, DecodeError, Encode, EncodeError};
+use crate::{Timescale, Timestamp};
 
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 use super::Version;
 use crate::ietf::Param;
+
+/// MOQ Object Property IDs (the MOQ Object Properties registry, shared with
+/// draft-ietf-moq-loc). Even type ids carry a single varint value.
+const PROP_TIMESTAMP: u64 = 0x06;
+const PROP_TIMESCALE: u64 = 0x08;
+
+/// Encode a frame's presentation timestamp as moq-transport Object Properties.
+///
+/// Matches the LOC encoding of the same registry ids so a relay or LOC-aware peer
+/// reads the same bytes on drafts that delta-encode KVP type ids. The Timestamp
+/// value is always absolute. Writes the raw KVP bytes
+/// (no outer length prefix); the caller frames the block with its byte length.
+pub fn encode_object_time<W: bytes::BufMut>(
+	w: &mut W,
+	timestamp: Timestamp,
+	version: Version,
+) -> Result<(), EncodeError> {
+	encode_object_property_type(w, PROP_TIMESTAMP, 0, version)?;
+	timestamp.value().encode(w, version)?;
+	encode_object_property_type(w, PROP_TIMESCALE, PROP_TIMESTAMP, version)?;
+	u64::from(timestamp.scale()).encode(w, version)?;
+	Ok(())
+}
+
+fn encode_object_property_type<W: bytes::BufMut>(
+	w: &mut W,
+	kind: u64,
+	prev: u64,
+	version: Version,
+) -> Result<(), EncodeError> {
+	let encoded = match version {
+		Version::Draft14 | Version::Draft15 => kind,
+		_ => kind.checked_sub(prev).ok_or(EncodeError::BoundsExceeded)?,
+	};
+	encoded.encode(w, version)
+}
+
+/// Decode the Timestamp (0x06) + Timescale (0x08) Object Properties from an object's
+/// extension block, skipping any other properties. Returns `None` when no Timestamp
+/// property is present; a missing Timescale defaults to microseconds (the registry default).
+pub fn decode_object_time<R: bytes::Buf>(r: &mut R, version: Version) -> Result<Option<Timestamp>, DecodeError> {
+	let mut timestamp: Option<u64> = None;
+	let mut timescale: Option<u64> = None;
+	let mut prev_type: u64 = 0;
+	let mut first = true;
+
+	while r.has_remaining() {
+		let step = u64::decode(r, version)?;
+		let abs = match version {
+			Version::Draft14 | Version::Draft15 => step,
+			_ if first => step,
+			_ => prev_type.checked_add(step).ok_or(DecodeError::BoundsExceeded)?,
+		};
+		first = false;
+		prev_type = abs;
+
+		if abs % 2 == 0 {
+			// Even type: a single varint value.
+			let value = u64::decode(r, version)?;
+			match abs {
+				PROP_TIMESTAMP => timestamp = Some(value),
+				PROP_TIMESCALE => timescale = Some(value),
+				_ => {}
+			}
+		} else {
+			// Odd type: length-prefixed bytes we don't care about.
+			let len = u64::decode(r, version)? as usize;
+			if r.remaining() < len {
+				return Err(DecodeError::Short);
+			}
+			r.advance(len);
+		}
+	}
+
+	let Some(value) = timestamp else {
+		return Ok(None);
+	};
+	let scale = match timescale {
+		Some(s) => Timescale::new(s).map_err(|_| DecodeError::InvalidValue)?,
+		None => Timescale::MICRO,
+	};
+	Ok(Some(
+		Timestamp::new(value, scale).map_err(|_| DecodeError::InvalidValue)?,
+	))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
 #[repr(u8)]
@@ -235,6 +321,99 @@ impl Decode<Version> for GroupHeader {
 mod tests {
 	use super::*;
 
+	use bytes::Buf;
+
+	/// Object Property timestamp round-trips through encode/decode at its own scale.
+	#[test]
+	fn test_object_time_roundtrip() {
+		let ts = Timestamp::new(96_000, Timescale::MICRO).unwrap();
+		let mut buf = bytes::BytesMut::new();
+		encode_object_time(&mut buf, ts, Version::Draft18).unwrap();
+
+		let mut bytes = buf.freeze();
+		let decoded = decode_object_time(&mut bytes, Version::Draft18).unwrap().unwrap();
+		assert_eq!(decoded.value(), 96_000);
+		assert_eq!(decoded.scale(), Timescale::MICRO);
+		assert!(!bytes.has_remaining());
+	}
+
+	#[test]
+	fn test_object_time_legacy_uses_absolute_types() {
+		let ts = Timestamp::new(96_000, Timescale::MILLI).unwrap();
+		let mut buf = bytes::BytesMut::new();
+		encode_object_time(&mut buf, ts, Version::Draft15).unwrap();
+
+		let mut bytes = buf.clone().freeze();
+		assert_eq!(u64::decode(&mut bytes, Version::Draft15).unwrap(), PROP_TIMESTAMP);
+		assert_eq!(u64::decode(&mut bytes, Version::Draft15).unwrap(), ts.value());
+		assert_eq!(u64::decode(&mut bytes, Version::Draft15).unwrap(), PROP_TIMESCALE);
+		assert_eq!(
+			u64::decode(&mut bytes, Version::Draft15).unwrap(),
+			u64::from(ts.scale())
+		);
+		assert!(!bytes.has_remaining());
+
+		let mut bytes = buf.freeze();
+		let decoded = decode_object_time(&mut bytes, Version::Draft15).unwrap().unwrap();
+		assert_eq!(decoded.value(), ts.value());
+		assert_eq!(decoded.scale(), Timescale::MILLI);
+	}
+
+	#[test]
+	fn test_object_time_delta_types_start_at_draft16() {
+		let ts = Timestamp::new(96_000, Timescale::MILLI).unwrap();
+		let mut buf = bytes::BytesMut::new();
+		encode_object_time(&mut buf, ts, Version::Draft16).unwrap();
+
+		let mut bytes = buf.freeze();
+		assert_eq!(u64::decode(&mut bytes, Version::Draft16).unwrap(), PROP_TIMESTAMP);
+		assert_eq!(u64::decode(&mut bytes, Version::Draft16).unwrap(), ts.value());
+		assert_eq!(
+			u64::decode(&mut bytes, Version::Draft16).unwrap(),
+			PROP_TIMESCALE - PROP_TIMESTAMP
+		);
+		assert_eq!(
+			u64::decode(&mut bytes, Version::Draft16).unwrap(),
+			u64::from(ts.scale())
+		);
+		assert!(!bytes.has_remaining());
+	}
+
+	#[test]
+	fn test_object_time_decodes_draft14_absolute_timescale() {
+		let mut buf = bytes::BytesMut::new();
+		PROP_TIMESTAMP.encode(&mut buf, Version::Draft14).unwrap();
+		42u64.encode(&mut buf, Version::Draft14).unwrap();
+		PROP_TIMESCALE.encode(&mut buf, Version::Draft14).unwrap();
+		u64::from(Timescale::MILLI).encode(&mut buf, Version::Draft14).unwrap();
+
+		let mut bytes = buf.freeze();
+		let decoded = decode_object_time(&mut bytes, Version::Draft14).unwrap().unwrap();
+		assert_eq!(decoded.value(), 42);
+		assert_eq!(decoded.scale(), Timescale::MILLI);
+	}
+
+	/// A timescale-less extension block falls back to microseconds (registry default).
+	#[test]
+	fn test_object_time_defaults_to_micros() {
+		let mut buf = bytes::BytesMut::new();
+		// Just a 0x06 Timestamp property, no 0x08.
+		PROP_TIMESTAMP.encode(&mut buf, Version::Draft18).unwrap();
+		1234u64.encode(&mut buf, Version::Draft18).unwrap();
+
+		let mut bytes = buf.freeze();
+		let decoded = decode_object_time(&mut bytes, Version::Draft18).unwrap().unwrap();
+		assert_eq!(decoded.value(), 1234);
+		assert_eq!(decoded.scale(), Timescale::MICRO);
+	}
+
+	/// No Timestamp property at all yields None (the caller wall-clock-stamps).
+	#[test]
+	fn test_object_time_absent() {
+		let mut empty = bytes::Bytes::new();
+		assert!(decode_object_time(&mut empty, Version::Draft18).unwrap().is_none());
+	}
+
 	// Test table from draft-ietf-moq-transport-14 Section 10.4.2 Table 7
 	#[test]
 	fn test_group_flags_spec_table() {
@@ -384,6 +563,27 @@ mod tests {
 
 		// Draft-17 rejects the FIRST_OBJECT bit (it's outside the 0x10-0x1d / 0x30-0x3d ranges).
 		assert!(GroupFlags::decode(v17 | GroupFlags::FIRST_OBJECT_BIT, Version::Draft17).is_err());
+	}
+
+	/// Draft-19 makes no changes to the subgroup header wire format, so the flags
+	/// byte must be byte-identical to draft-18 on both encode and decode.
+	#[test]
+	fn test_draft19_matches_draft18() {
+		for flags in [
+			GroupFlags::default(),
+			GroupFlags {
+				has_subgroup: true,
+				has_extensions: true,
+				has_end: true,
+				has_subgroup_object: false,
+				has_priority: false,
+			},
+		] {
+			let v18 = flags.encode(Version::Draft18).unwrap();
+			let v19 = flags.encode(Version::Draft19).unwrap();
+			assert_eq!(v18, v19, "draft-19 must encode the subgroup header like draft-18");
+			assert_eq!(GroupFlags::decode(v19, Version::Draft19).unwrap(), flags);
+		}
 	}
 
 	/// Draft-18 byte 0x70..=0x7D should decode to the same flags as 0x30..=0x3D.

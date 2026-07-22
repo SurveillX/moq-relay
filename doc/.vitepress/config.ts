@@ -67,6 +67,7 @@ export default defineConfig({
 						{ text: "Development", link: "/setup/dev" },
 						{ text: "Production", link: "/setup/prod" },
 						{ text: "Linux Packages", link: "/setup/linux" },
+						{ text: "Windows", link: "/setup/windows" },
 					],
 				},
 				{
@@ -136,8 +137,11 @@ export default defineConfig({
 							],
 						},
 						{ text: "CLI", link: "/bin/cli" },
+						{ text: "WebRTC", link: "/bin/rtc" },
+						{ text: "RTMP", link: "/bin/rtmp" },
 						{ text: "OBS", link: "/bin/obs" },
 						{ text: "GStreamer", link: "/bin/gstreamer" },
+						{ text: "HLS", link: "/bin/hls" },
 						{ text: "Web", link: "/bin/web" },
 					],
 				},
@@ -223,7 +227,10 @@ export default defineConfig({
 						{
 							text: "Go",
 							link: "/lib/go/",
-							items: [{ text: "moq", link: "/lib/go/moq" }],
+							items: [
+								{ text: "moq", link: "/lib/go/moq" },
+								{ text: "moq-ffi", link: "/lib/go/moq-ffi" },
+							],
 						},
 					],
 				},
@@ -260,7 +267,8 @@ export default defineConfig({
 	},
 
 	ignoreDeadLinks: [
-		// Localhost URLs are intentional for development
-		"http://localhost:5173",
+		// Localhost URLs are intentional for development examples and aren't
+		// reachable at build time (e.g. the relay on :4443, the dev server on :5173).
+		/^https?:\/\/localhost(:\d+)?(\/|\?|#|$)/,
 	],
 });

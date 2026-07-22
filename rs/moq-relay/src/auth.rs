@@ -1,8 +1,9 @@
 use anyhow::Context;
 use axum::http;
+use moq_native::Transport;
 #[cfg(test)]
 use moq_net::AsPath;
-use moq_net::{Path, PathOwned, PathPrefixes};
+use moq_net::{Path, PathOwned, PathPrefixes, stats::Tier};
 use moq_token::{Key, KeyId};
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
@@ -11,13 +12,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use url::Url;
 
-/// Parameters extracted from an incoming connection URL for authentication.
+/// Parameters extracted from an incoming connection for authentication: the
+/// request-derived path + JWT, plus metadata about the connection itself that the
+/// auth API can bucket on (e.g. the transport). Connection metadata is set by the
+/// relay after parsing the request (the URL/SETUP parsers don't know it).
 #[derive(Default, Debug)]
 pub struct AuthParams {
 	/// The URL path identifying the broadcast root.
 	pub path: String,
 	/// A JWT token, if provided via the `jwt` query parameter.
 	pub jwt: Option<String>,
+	/// The connection's transport, forwarded to the auth API as `transport=` so it
+	/// can bucket by connection type (e.g. bill traffic on the internal Unix-socket
+	/// listener -- the out-of-process RTMP/SRT/WebRTC gateways, `"unix"` -- into a
+	/// distinct tier). Absent (`None`) sends no `transport` parameter.
+	pub transport: Option<Transport>,
 }
 
 impl AuthParams {
@@ -57,7 +66,38 @@ impl AuthParams {
 			}
 		}
 
-		Self { path, jwt }
+		Self {
+			path,
+			jwt,
+			..Default::default()
+		}
+	}
+
+	/// Extract `(path, jwt)` from a moq SETUP request path of the form
+	/// `/broadcast?jwt=<token>`.
+	///
+	/// URL-less transports (a qmux Unix socket, raw QUIC) carry the request path
+	/// in the moq-lite-05 SETUP rather than a real request URI, so there is no
+	/// host and no subdomain->path routing to apply; the caller (a gateway) has
+	/// already prepended any vanity prefix. The path is used verbatim; only the
+	/// `jwt` query parameter is split off and URL-decoded.
+	pub(crate) fn from_path(raw: &str) -> Self {
+		let (path, query) = match raw.split_once('?') {
+			Some((path, query)) => (path, Some(query)),
+			None => (raw, None),
+		};
+
+		let jwt = query.and_then(|query| {
+			url::form_urlencoded::parse(query.as_bytes())
+				.find(|(k, v)| k == "jwt" && !v.is_empty())
+				.map(|(_, v)| v.into_owned())
+		});
+
+		Self {
+			path: path.to_string(),
+			jwt,
+			..Default::default()
+		}
 	}
 }
 
@@ -166,40 +206,34 @@ impl axum::response::IntoResponse for AuthError {
 	}
 }
 
-/// TLS configuration for HTTP requests made by the auth client (JWK fetches
-/// and public-API lookups).
-///
-/// Mirrors [`moq_native::tls::Client`] so the auth client can be configured
-/// independently of the cluster client. Defaults to system roots with no
-/// client identity, which is what most external auth endpoints expect.
+/// Deprecated `--auth-tls-*` overrides, kept for backwards compatibility. The
+/// auth client otherwise reuses the cluster client's `--client-tls-*` config.
+/// Hidden from `--help`; setting any field logs a deprecation warning.
+#[doc(hidden)]
 #[serde_as]
 #[derive(Clone, Default, Debug, clap::Args, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
 pub struct AuthTls {
-	/// PEM file(s) of root CAs. If empty, the platform's native roots are used.
-	/// In config files, accepts either a single string or a TOML array.
 	#[serde(skip_serializing_if = "Vec::is_empty")]
-	#[arg(id = "auth-tls-root", long = "auth-tls-root", env = "MOQ_AUTH_TLS_ROOT")]
+	#[arg(id = "auth-tls-root", long = "auth-tls-root", env = "MOQ_AUTH_TLS_ROOT", hide = true)]
 	#[serde_as(as = "OneOrMany<_>")]
 	pub root: Vec<PathBuf>,
 
-	/// PEM file containing the client certificate chain for mTLS.
 	#[serde(skip_serializing_if = "Option::is_none")]
-	#[arg(id = "auth-tls-cert", long = "auth-tls-cert", env = "MOQ_AUTH_TLS_CERT")]
+	#[arg(id = "auth-tls-cert", long = "auth-tls-cert", env = "MOQ_AUTH_TLS_CERT", hide = true)]
 	pub cert: Option<PathBuf>,
 
-	/// PEM file containing the private key for mTLS.
 	#[serde(skip_serializing_if = "Option::is_none")]
-	#[arg(id = "auth-tls-key", long = "auth-tls-key", env = "MOQ_AUTH_TLS_KEY")]
+	#[arg(id = "auth-tls-key", long = "auth-tls-key", env = "MOQ_AUTH_TLS_KEY", hide = true)]
 	pub key: Option<PathBuf>,
 
-	/// Danger: Disable TLS certificate verification on auth requests.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[arg(
 		id = "auth-tls-disable-verify",
 		long = "auth-tls-disable-verify",
 		env = "MOQ_AUTH_TLS_DISABLE_VERIFY",
+		hide = true,
 		default_missing_value = "true",
 		num_args = 0..=1,
 		require_equals = true,
@@ -209,6 +243,12 @@ pub struct AuthTls {
 }
 
 impl AuthTls {
+	/// True when any deprecated `--auth-tls-*` override is configured, in which
+	/// case it takes precedence over the shared `--client-tls-*` identity.
+	fn is_set(&self) -> bool {
+		!self.root.is_empty() || self.cert.is_some() || self.key.is_some() || self.disable_verify.is_some()
+	}
+
 	/// Convert into a [`moq_native::tls::Client`] so we can reuse its
 	/// rustls-building logic. The fields map one-to-one.
 	fn to_client_tls(&self) -> anyhow::Result<moq_native::tls::Client> {
@@ -249,10 +289,17 @@ pub struct AuthConfig {
 	#[arg(long = "auth-key-dir", env = "MOQ_AUTH_KEY_DIR")]
 	pub key_dir: Option<String>,
 
-	/// TLS configuration for outbound HTTP auth requests (JWK + public-API).
+	/// Deprecated `--auth-tls-*` overrides; see [`AuthTls`].
 	#[command(flatten)]
 	#[serde(default)]
 	pub tls: AuthTls,
+
+	/// Cluster client TLS injected by [`AuthConfig::init`] so outbound auth HTTP
+	/// (JWK + auth/public-API fetches) reuses the `--client-tls-*` identity.
+	/// Not a CLI or TOML field; the deprecated `--auth-tls-*` flags override it.
+	#[arg(skip)]
+	#[serde(skip)]
+	client_tls: Option<moq_native::tls::Client>,
 
 	/// Public (unauthenticated) access configuration.
 	///
@@ -325,13 +372,16 @@ pub struct AuthConfig {
 	/// and `--auth-public-api` (configuring both is a startup error).
 	/// `--auth-domain` still applies (subdomain->path runs first).
 	///
-	/// Per connection the relay issues `GET <base>?root=<path>&kid=<kid>&mtls=true`
+	/// Per connection the relay issues
+	/// `GET <base>?root=<path>&kid=<kid>&mtls=true&transport=<transport>`
 	/// over the same cached, mTLS-gated HTTP client used by the other auth fetches.
 	/// `root` is the connection path (slashes preserved); `kid` is sent only when
 	/// the connection carries a JWT (value from its header); `mtls=true` is sent
-	/// only when the peer presented a verified client cert. All three are query
-	/// params (never path segments), so the base URL is used verbatim. The
-	/// response is a JSON object whose fields are ALL optional:
+	/// only when the peer presented a verified client cert; `transport` is the
+	/// connection's transport (`quic`/`websocket`/`tcp`/`unix`/`iroh`), so the API
+	/// can bucket by connection type (e.g. tier Unix-socket gateway traffic
+	/// separately). All are query params (never path segments), so the base URL is
+	/// used verbatim. The response is a JSON object whose fields are ALL optional:
 	///
 	/// - `alias`: the canonical full root to scope this connection to (the path
 	///   with its first segment resolved to the project's stable id, the rest
@@ -343,10 +393,14 @@ pub struct AuthConfig {
 	///   no public access.
 	/// - `key`: the verifying JWK (a JSON object, deserialized directly) for the
 	///   requested `kid`. Absent -> key-not-found (the JWT is rejected).
-	/// - `internal`: the billing tier. The relay forwards `mtls=true` and lets the
-	///   API decide. Absent defaults per connection: internal for mTLS peers
-	///   (trusted), external for JWT/public. So the API can promote a first-party
-	///   token to internal, or demote a cert-verified connection to external.
+	/// - `tier`: the billing tier label (e.g. `internal`, `region/sjc`). The relay
+	///   forwards `mtls=true` and lets the API decide. Absent defaults per
+	///   connection: `internal` for mTLS peers (trusted), the default (unprefixed)
+	///   tier for JWT/public. So the API can bucket a first-party token to
+	///   `internal`, or a cert-verified connection back to the default tier. An
+	///   empty label selects the default tier. The legacy `internal: bool` field
+	///   is still accepted (`true` -> `internal`, `false` -> default tier) when
+	///   `tier` is absent.
 	///
 	/// FAILS CLOSED: any network error, non-2xx status, or parse error rejects
 	/// the connection. Unlike the standalone flags, the verifying key itself
@@ -358,6 +412,13 @@ pub struct AuthConfig {
 	#[arg(long = "auth-api", env = "MOQ_AUTH_API")]
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub auth_api: Option<String>,
+
+	/// Default billing tier label for mTLS peers when the auth API doesn't
+	/// return one (or no `--auth-api` is configured). Default `internal`. An
+	/// empty value selects the default (unprefixed) tier.
+	#[arg(long = "auth-mtls-tier", env = "MOQ_AUTH_MTLS_TIER")]
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub mtls_tier: Option<String>,
 }
 
 /// Public access configuration.
@@ -496,11 +557,37 @@ struct AuthApiResponse {
 	/// moq-token's serde); absent -> not found.
 	#[serde(default)]
 	key: Option<Key>,
-	/// Billing tier for this connection. The relay sends `mtls=true` when the
-	/// peer presented a verified client cert and lets the API decide. Absent
-	/// defaults per path: internal for mTLS peers (trusted), external otherwise.
+	/// Billing tier label for this connection (e.g. `internal`, `region/sjc`).
+	/// The relay sends `mtls=true` when the peer presented a verified client
+	/// cert and lets the API decide. Absent defaults per path: `internal` for
+	/// mTLS peers (trusted), the default (unprefixed) tier otherwise. An empty
+	/// label is the default tier.
+	#[serde(default)]
+	tier: Option<String>,
+	/// Legacy boolean form of `tier`, kept for backward compatibility with auth
+	/// APIs written against the original contract. `true` maps to the `internal`
+	/// tier, `false` to the default (unprefixed) tier. Ignored when `tier` is
+	/// also present.
 	#[serde(default)]
 	internal: Option<bool>,
+}
+
+impl AuthApiResponse {
+	/// Billing tier this response selects, honoring the legacy `internal: bool`
+	/// field when the newer `tier` label is absent. `None` leaves the choice to
+	/// the relay's per-connection default.
+	fn tier(&self) -> Option<Tier> {
+		if let Some(label) = &self.tier {
+			return Some(Tier::new(label.clone()));
+		}
+		self.internal.map(|internal| {
+			if internal {
+				Tier::new("internal")
+			} else {
+				Tier::default()
+			}
+		})
+	}
 }
 
 /// Resolved public access configuration.
@@ -520,7 +607,12 @@ impl PublicAccess {
 
 impl AuthConfig {
 	/// Initializes an [`Auth`] instance from this configuration.
-	pub async fn init(self) -> anyhow::Result<Auth> {
+	///
+	/// `client_tls` is the cluster client TLS (`--client-tls-*`); the auth client
+	/// reuses it for outbound HTTP unless the deprecated `--auth-tls-*` flags are
+	/// set.
+	pub async fn init(mut self, client_tls: &moq_native::tls::Client) -> anyhow::Result<Auth> {
+		self.client_tls = Some(client_tls.clone());
 		Auth::new(self).await
 	}
 
@@ -546,6 +638,7 @@ impl AuthConfig {
 /// rate-limit info, etc.) can be added without bumping the major version.
 /// External consumers must build tokens through library APIs (e.g. via
 /// [`Auth::verify`]) rather than by struct literal.
+#[derive(Debug)]
 #[non_exhaustive]
 pub struct AuthToken {
 	/// The root path this token is scoped to.
@@ -554,23 +647,24 @@ pub struct AuthToken {
 	pub subscribe: PathPrefixes,
 	/// Paths the holder is allowed to publish to, relative to `root`.
 	pub publish: PathPrefixes,
-	/// True when the peer authenticated through a trusted TLS root rather than
-	/// a JWT. Used to record stats on the internal tier so cluster peers can
-	/// be billed separately from end-user traffic.
-	pub internal: bool,
-
-	/// SurveillX measured-viewing (Phase C): usage-session id from the token's
-	/// `usid` claim. None for mTLS / public / legacy (non-metered) tokens.
-	pub usid: Option<String>,
-	/// SurveillX measured-viewing (Phase C): the raw verified JWT, echoed to the
-	/// usage reporter as lease-proof. None for mTLS/public tokens.
-	pub jwt: Option<String>,
+	/// Billing tier this session's stats record under. Chosen by business logic
+	/// (the auth API's `tier` field), defaulting to `internal` for trusted mTLS
+	/// peers and the default tier otherwise, so cluster peers can be billed
+	/// separately from end-user traffic.
+	pub tier: Tier,
+	/// When the credential backing this session expires, if it has an expiry.
+	///
+	/// For JWT auth this is the token's `exp` claim; for mTLS it's the peer
+	/// certificate's `notAfter`. The relay closes the session once this passes
+	/// instead of trusting a credential that was only checked at connect time.
+	pub expires: Option<std::time::SystemTime>,
 }
 
 impl AuthToken {
 	/// Construct a token for a peer that was authenticated at the TLS layer
 	/// via mTLS. These peers are granted full publish and subscribe access
-	/// within `root` and are flagged as internal. The cert's trust chain
+	/// within `root`. The billing tier is left at the default; the caller (mTLS
+	/// handshake, internal listener, or cluster dial) sets it from config. The cert's trust chain
 	/// (verified against the configured CA) is the only credential we require;
 	/// nothing else in the cert is inspected.
 	///
@@ -584,23 +678,10 @@ impl AuthToken {
 			root,
 			subscribe: PathPrefixes::from(vec![Path::new("").to_owned()]),
 			publish: PathPrefixes::from(vec![Path::new("").to_owned()]),
-			internal: true,
-			usid: None,
-			jwt: None,
+			tier: Tier::default(),
+			// Filled in by the caller from the peer certificate's notAfter.
+			expires: None,
 		}
-	}
-}
-
-impl std::fmt::Debug for AuthToken {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("AuthToken")
-			.field("root", &self.root)
-			.field("subscribe", &self.subscribe)
-			.field("publish", &self.publish)
-			.field("internal", &self.internal)
-			.field("usid", &self.usid)
-			.field("jwt", &self.jwt.as_ref().map(|_| "<redacted>"))
-			.finish()
 	}
 }
 
@@ -683,6 +764,10 @@ pub struct Auth {
 	/// public access, and alias together. Mutually exclusive with the standalone
 	/// key/public sources. See [`AuthConfig::auth_api`].
 	auth_api: Option<(url::Url, ClientWithMiddleware)>,
+	/// Billing tier recorded for an mTLS peer when the auth API doesn't return a
+	/// tier (or none is configured). See [`AuthConfig::mtls_tier`]; default
+	/// `internal`, set via [`Auth::with_mtls_tier`].
+	mtls_tier: Tier,
 }
 
 impl Auth {
@@ -705,7 +790,20 @@ impl Auth {
 			"--auth-api cannot be combined with --auth-key/--auth-key-dir/--auth-public/--auth-public-api"
 		);
 
-		let tls = config.tls.to_client_tls()?.build()?;
+		// Outbound auth HTTP (JWK + auth/public-API fetches) reuses the cluster
+		// client's --client-tls-* identity. The deprecated --auth-tls-* flags
+		// still override it when set.
+		let tls_config = if config.tls.is_set() {
+			tracing::warn!(
+				"the --auth-tls-* flags are deprecated and will be removed; the auth client now \
+				 reuses the cluster client TLS (--client-tls-root, --client-tls-cert, --client-tls-key). \
+				 Drop --auth-tls-* and configure those instead."
+			);
+			config.tls.to_client_tls()?
+		} else {
+			config.client_tls.clone().unwrap_or_default()
+		};
+		let tls = tls_config.build()?;
 
 		let source = if let Some(key) = config.key {
 			let source = if let Ok(url) = Url::parse(&key) {
@@ -821,13 +919,36 @@ impl Auth {
 			public,
 			domains: Arc::from(domains.into_boxed_slice()),
 			auth_api,
+			mtls_tier: crate::trusted_tier(config.mtls_tier),
 		})
+	}
+
+	/// Override the mTLS fallback billing tier (default `internal`). For the
+	/// mTLS-only stub built via [`Auth::default`], where there is no
+	/// [`AuthConfig`] to carry `--auth-mtls-tier`. An empty label selects the
+	/// default (unprefixed) tier.
+	pub fn with_mtls_tier(mut self, tier: Option<String>) -> Self {
+		self.mtls_tier = crate::trusted_tier(tier);
+		self
 	}
 
 	/// Build [`AuthParams`] from an incoming connection URL, applying any
 	/// configured subdomain-based slug routing.
 	pub(crate) fn params_from_url(&self, url: &url::Url) -> AuthParams {
 		AuthParams::from_url(url, &self.domains)
+	}
+
+	/// Build a full-access token for a peer already authenticated by mTLS.
+	///
+	/// The HTTPS/QUIC layer verifies the client certificate before calling this.
+	/// This method applies the relay's canonical alias resolution and billing
+	/// tier decision, so embedded HTTP handlers get the same authorization scope
+	/// as the built-in relay routes.
+	pub async fn verify_mtls(&self, path: &str, transport: Option<Transport>) -> Result<AuthToken, AuthError> {
+		let (root, tier) = self.resolve_mtls(path, transport).await?;
+		let mut token = AuthToken::unrestricted(Path::new(&root).to_owned());
+		token.tier = tier;
+		Ok(token)
 	}
 
 	/// Resolve the canonical root and billing tier for an mTLS peer via the
@@ -844,23 +965,22 @@ impl Auth {
 	/// canonical root (e.g. `x7k2qp`), producing a zombie session: the publisher
 	/// believes it is connected and never reconnects, but nothing is ever served.
 	/// Failing closed lets the client retry and self-heal once the API recovers.
-	pub(crate) async fn resolve_mtls(&self, path: &str) -> Result<(String, bool), AuthError> {
+	async fn resolve_mtls(&self, path: &str, transport: Option<Transport>) -> Result<(String, Tier), AuthError> {
 		let Some((base, client)) = &self.auth_api else {
-			return Ok((path.to_string(), true));
+			return Ok((path.to_string(), self.mtls_tier.clone()));
 		};
 
-		let resp = Self::fetch_auth_api(client, base, path, None, true).await?;
-		Ok((
-			resp.alias.unwrap_or_else(|| path.to_string()),
-			resp.internal.unwrap_or(true),
-		))
+		let resp = Self::fetch_auth_api(client, base, path, None, true, transport.map(Transport::as_str)).await?;
+		// Fall back to the configured mTLS tier when the API omits one.
+		let tier = resp.tier().unwrap_or_else(|| self.mtls_tier.clone());
+		Ok((resp.alias.unwrap_or_else(|| path.to_string()), tier))
 	}
 
 	/// Build the unified auth-API request URL. The connection path (`root`), the
 	/// JWT `kid`, and the `mtls` flag are all query params on the base URL — never
 	/// path segments — so client-controlled values are percent-encoded by
 	/// `query_pairs_mut` and can't retarget the path/query.
-	fn auth_api_url(base: &url::Url, path: &str, kid: Option<&str>, mtls: bool) -> url::Url {
+	fn auth_api_url(base: &url::Url, path: &str, kid: Option<&str>, mtls: bool, transport: Option<&str>) -> url::Url {
 		let mut url = base.clone();
 		{
 			let mut q = url.query_pairs_mut();
@@ -870,6 +990,9 @@ impl Auth {
 			}
 			if mtls {
 				q.append_pair("mtls", "true");
+			}
+			if let Some(transport) = transport {
+				q.append_pair("transport", transport);
 			}
 		}
 		url
@@ -884,8 +1007,9 @@ impl Auth {
 		path: &str,
 		kid: Option<&str>,
 		mtls: bool,
+		transport: Option<&str>,
 	) -> Result<AuthApiResponse, AuthError> {
-		let url = Self::auth_api_url(base, path, kid, mtls);
+		let url = Self::auth_api_url(base, path, kid, mtls, transport);
 		let body = client.get(url).send().await?.error_for_status()?.text().await?;
 		serde_json::from_str(&body).map_err(AuthError::from)
 	}
@@ -909,33 +1033,48 @@ impl Auth {
 			None => None,
 		};
 
-		let resp = Self::fetch_auth_api(client, base, &params.path, kid.as_deref(), false).await?;
-		// Absent alias -> use the request path unchanged.
-		let root = resp.alias.unwrap_or_else(|| params.path.clone());
+		let resp = Self::fetch_auth_api(
+			client,
+			base,
+			&params.path,
+			kid.as_deref(),
+			false,
+			params.transport.map(Transport::as_str),
+		)
+		.await?;
+		// Resolve the tier before consuming `resp`'s other fields below.
+		// Non-mTLS connections default to the unprefixed tier; the API may bucket
+		// specific ones (e.g. a first-party dashboard token to `internal`).
+		let tier = resp.tier().unwrap_or_default();
+		// The API resolves the connection path's leading segment (a vanity name or
+		// pid) to the project's canonical pid. Broadcasts anchor here on the
+		// backbone so they survive vanity renames. Absent alias (unknown project)
+		// -> route to the request path unchanged.
+		let alias = resp.alias.unwrap_or_else(|| params.path.clone());
 
 		let claims = if let Some(token) = params.jwt.as_deref() {
 			let key = resp.key.ok_or(AuthError::KeyNotFound)?;
-			key.decode(token).map_err(|_| AuthError::DecodeFailed)?
+			// claims.root is the token's own root (a vanity name OR a pid); it is
+			// checked against the ORIGINAL connection path below, not the alias, so
+			// a vanity token matches a vanity URL and a pid token matches a pid URL.
+			key.verify(token).map_err(|_| AuthError::DecodeFailed)?
 		} else {
 			let public = resp.public.unwrap_or_default();
 			if public.subscribe.is_empty() && public.publish.is_empty() {
 				return Err(AuthError::ExpectedToken);
 			}
-			// Public prefixes are relative to the connection root, so anchor the
-			// claims there (mirrors the standalone --auth-public-api path).
-			moq_token::Claims {
-				root: root.clone(),
-				subscribe: public.subscribe,
-				publish: public.publish,
-				..Default::default()
-			}
+			// Anonymous access: anchor the public claims at the connection path so
+			// the overlap check below is a no-op; routing still lands on the alias.
+			moq_token::Claims::default()
+				.with_root(params.path.clone())
+				.with_subscribe(public.subscribe)
+				.with_publish(public.publish)
 		};
 
-		let mut token = Self::finalize(&root, claims)?;
-		// Non-mTLS connections default to external; the API may promote specific
-		// ones (e.g. a first-party dashboard token) to internal.
-		token.internal = resp.internal.unwrap_or(false);
-		token.jwt = params.jwt.clone();
+		// Check the token root against the ORIGINAL connection path (vanity or
+		// pid); anchor the resulting scope on the alias (canonical pid).
+		let mut token = Self::finalize(&params.path, &alias, claims)?;
+		token.tier = tier;
 		Ok(token)
 	}
 
@@ -965,32 +1104,28 @@ impl Auth {
 			let key = resolver.resolve(header.kid.as_deref()).await?;
 
 			// Verify the token with the resolved key
-			key.decode(token).map_err(|_| AuthError::DecodeFailed)?
+			key.verify(token).map_err(|_| AuthError::DecodeFailed)?
 		} else if !self.public.is_empty() {
-			// No JWT — use public access (static prefixes + optional API).
+			// No JWT. Use public access (static prefixes + optional API).
 			let root = Path::new(&params.path);
 
 			// Use static config if any static prefix overlaps the request path in either
 			// direction (request is under a public prefix, or request is a parent of one).
 			let overlaps = |p: &Path| root.has_prefix(p) || p.has_prefix(&root);
 			if self.public.subscribe.iter().any(&overlaps) || self.public.publish.iter().any(overlaps) {
-				moq_token::Claims {
-					root: "".to_string(),
-					subscribe: self.public.subscribe.iter().map(|p| p.to_string()).collect(),
-					publish: self.public.publish.iter().map(|p| p.to_string()).collect(),
-					..Default::default()
-				}
+				moq_token::Claims::default()
+					.with_root("")
+					.with_subscribe(self.public.subscribe.iter().map(|p| p.to_string()))
+					.with_publish(self.public.publish.iter().map(|p| p.to_string()))
 			} else if let Some((base, client)) = &self.public.api {
-				// No static overlap — fetch from API. Response paths are relative to the namespace.
+				// No static overlap. Response paths are relative to the namespace.
 				let namespace = root.to_string();
 				let url = base.join(&namespace)?;
 				let response = Self::fetch_public_response(client, &url).await?;
-				moq_token::Claims {
-					root: namespace,
-					subscribe: response.subscribe,
-					publish: response.publish,
-					..Default::default()
-				}
+				moq_token::Claims::default()
+					.with_root(namespace)
+					.with_subscribe(response.subscribe)
+					.with_publish(response.publish)
 			} else {
 				return Err(AuthError::ExpectedToken);
 			}
@@ -998,66 +1133,50 @@ impl Auth {
 			return Err(AuthError::ExpectedToken);
 		};
 
-		let mut token = Self::finalize(&params.path, claims)?;
-		token.jwt = params.jwt.clone();
-		Ok(token)
+		Self::finalize(&params.path, &params.path, claims)
 	}
 
-	/// Reduce verified `claims` against the connection `root_str` into an
-	/// [`AuthToken`]. The connection path and the token root must overlap; the
-	/// permission prefixes are re-based onto the connection root and any that
-	/// fall outside it are dropped. Shared by the standalone and `--auth-api`
-	/// paths.
-	fn finalize(root_str: &str, claims: moq_token::Claims) -> Result<AuthToken, AuthError> {
-		let usid = claims.usid.clone();
-		let root = Path::new(root_str);
-		let claims_root = Path::new(&claims.root);
-
-		// The URL path and the token root must overlap:
-		// - URL extends root (e.g. URL="/demo/room", root="demo") → suffix narrows permissions
-		// - URL is parent of root (e.g. URL="/", root="demo") → prefix widens permission paths
-		let (suffix, prefix) = if let Some(suffix) = root.strip_prefix(&claims_root) {
-			(suffix, Path::new(""))
-		} else if let Some(prefix) = claims_root.strip_prefix(&root) {
-			(Path::new(""), prefix)
-		} else {
-			return Err(AuthError::IncorrectRoot);
+	/// Reduce verified `claims` into an [`AuthToken`].
+	///
+	/// [`Claims::authorize`](moq_token::Claims::authorize) does the overlap check and
+	/// rebases the permission prefixes against `check_root` (the ORIGINAL connection
+	/// path the client dialed, e.g. a vanity name); a token whose root sits outside
+	/// that path is rejected. The resulting `AuthToken.root` is anchored at
+	/// `route_root` (the `--auth-api` alias, i.e. the canonical pid), so broadcasts
+	/// live under the stable pid on the backbone and survive vanity-name changes.
+	/// `route_root` is `check_root` with only its leading segment swapped to the pid
+	/// (same depth), so the rebased relative prefixes anchor unchanged. The standalone
+	/// path passes the same value for both (no alias). Shared by the standalone and
+	/// `--auth-api` paths.
+	fn finalize(check_root: &str, route_root: &str, claims: moq_token::Claims) -> Result<AuthToken, AuthError> {
+		let root = Path::new(check_root);
+		let route_root = Path::new(route_root);
+		let depth = |path: &Path<'_>| {
+			if path.is_empty() {
+				0
+			} else {
+				path.as_str().split('/').count()
+			}
 		};
 
-		let scope = |paths: Vec<String>| -> PathPrefixes {
-			paths
-				.into_iter()
-				.filter_map(|p| {
-					let p = prefix.join(&p);
-					if p.is_empty() {
-						return Some(p);
-					}
-					if let Some(remaining) = p.strip_prefix(&suffix) {
-						Some(remaining.into_owned())
-					} else if suffix.has_prefix(&p) {
-						Some(Path::new("").into_owned())
-					} else {
-						None
-					}
-				})
-				.collect()
-		};
-
-		let subscribe = scope(claims.subscribe);
-		let publish = scope(claims.publish);
-
-		// Reject connections that end up with no permissions after reduction.
-		if subscribe.is_empty() && publish.is_empty() {
+		if depth(&root) != depth(&route_root) {
 			return Err(AuthError::IncorrectRoot);
 		}
 
+		// A token that grants nothing here is indistinguishable from one aimed at
+		// another root, so both reduce to IncorrectRoot.
+		let permissions = claims.authorize(check_root).map_err(|_| AuthError::IncorrectRoot)?;
+
+		// authorize() returns paths already normalized and relative to check_root,
+		// which route_root matches in depth.
+		let rebase = |paths: Vec<String>| -> PathPrefixes { paths.iter().map(|p| Path::new(p).to_owned()).collect() };
+
 		Ok(AuthToken {
-			root: root.to_owned(),
-			subscribe,
-			publish,
-			internal: false,
-			usid,
-			jwt: None,
+			root: route_root.to_owned(),
+			subscribe: rebase(permissions.subscribe),
+			publish: rebase(permissions.publish),
+			tier: Tier::default(),
+			expires: claims.expires,
 		})
 	}
 
@@ -1071,6 +1190,33 @@ mod tests {
 	use super::*;
 	use moq_token::{Algorithm, Key, KeyId};
 	use tempfile::TempDir;
+
+	#[test]
+	fn auth_params_from_path() {
+		// Path + JWT (the gateway media uplink shape).
+		let p = AuthParams::from_path("/customer/foo/bar?jwt=xd");
+		assert_eq!(p.path, "/customer/foo/bar");
+		assert_eq!(p.jwt.as_deref(), Some("xd"));
+
+		// Path only (tokenless public playback).
+		let p = AuthParams::from_path("/customer/foo/bar");
+		assert_eq!(p.path, "/customer/foo/bar");
+		assert_eq!(p.jwt, None);
+
+		// Empty (a no-path, no-JWT stream connection: resolved via public auth).
+		let p = AuthParams::from_path("");
+		assert_eq!(p.path, "");
+		assert_eq!(p.jwt, None);
+
+		// An empty jwt value counts as absent.
+		let p = AuthParams::from_path("/foo?jwt=");
+		assert_eq!(p.jwt, None);
+
+		// The jwt may sit among other query params and be URL-encoded.
+		let p = AuthParams::from_path("/foo?a=1&jwt=ab%20cd");
+		assert_eq!(p.path, "/foo");
+		assert_eq!(p.jwt.as_deref(), Some("ab cd"));
+	}
 
 	fn create_test_key_with_kid(kid: &str) -> Key {
 		Key::generate(Algorithm::HS256, Some(moq_token::KeyId::decode(kid).unwrap())).unwrap()
@@ -1178,6 +1324,7 @@ mod tests {
 			.verify(&AuthParams {
 				path: "/any/path".into(),
 				jwt: Some("fake-token".into()),
+				..Default::default()
 			})
 			.await;
 		assert!(result.is_err());
@@ -1196,23 +1343,62 @@ mod tests {
 		})
 		.await?;
 
-		let claims = moq_token::Claims {
-			root: "room/123".to_string(),
-			subscribe: vec!["".to_string()],
-			publish: vec!["alice".into()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default()
+			.with_root("room/123")
+			.with_subscribe([""])
+			.with_publish(["alice"]);
+		let token = key.sign(&claims)?;
 
 		let token = auth
 			.verify(&AuthParams {
 				path: "/room/123".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await?;
 		assert_eq!(token.root, "room/123".as_path());
 		assert_eq!(token.subscribe, vec!["".as_path()]);
 		assert_eq!(token.publish, vec!["alice".as_path()]);
+
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn test_jwt_expiry_carried_through() -> anyhow::Result<()> {
+		let key = create_test_key_with_kid("test-key");
+		let dir = setup_key_dir(&[("test-key", &key)]);
+
+		let auth = Auth::new(AuthConfig {
+			key_dir: Some(dir.path().to_string_lossy().to_string()),
+			..Default::default()
+		})
+		.await?;
+
+		// JWT `exp` has second granularity, so use a whole-second expiry to avoid
+		// rounding ambiguity on the round-trip.
+		let want = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)?
+			.as_secs()
+			+ 3600;
+		let expires = std::time::UNIX_EPOCH + std::time::Duration::from_secs(want);
+		let claims = moq_token::Claims::default()
+			.with_root("room/123")
+			.with_subscribe([""])
+			.with_publish(["alice"])
+			.with_expires(expires);
+		let token = key.sign(&claims)?;
+
+		let token = auth
+			.verify(&AuthParams {
+				path: "/room/123".into(),
+				jwt: Some(token),
+				..Default::default()
+			})
+			.await?;
+
+		// The `exp` claim survives finalize() so the relay can close on expiry.
+		let got = token.expires.expect("expiry should be carried through");
+		assert_eq!(got.duration_since(std::time::UNIX_EPOCH)?.as_secs(), want);
 
 		Ok(())
 	}
@@ -1228,18 +1414,17 @@ mod tests {
 		})
 		.await?;
 
-		let claims = moq_token::Claims {
-			root: "room/123".to_string(),
-			subscribe: vec!["".to_string()],
-			publish: vec!["".to_string()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default()
+			.with_root("room/123")
+			.with_subscribe([""])
+			.with_publish([""]);
+		let token = key.sign(&claims)?;
 
 		let result = auth
 			.verify(&AuthParams {
 				path: "/secret".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await;
 		assert!(result.is_err());
@@ -1258,18 +1443,17 @@ mod tests {
 		})
 		.await?;
 
-		let claims = moq_token::Claims {
-			root: "room/123".to_string(),
-			subscribe: vec!["bob".into()],
-			publish: vec!["alice".into()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default()
+			.with_root("room/123")
+			.with_subscribe(["bob"])
+			.with_publish(["alice"]);
+		let token = key.sign(&claims)?;
 
 		let token = auth
 			.verify(&AuthParams {
 				path: "/room/123".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await?;
 		assert_eq!(token.root, "room/123".as_path());
@@ -1290,18 +1474,14 @@ mod tests {
 		})
 		.await?;
 
-		let claims = moq_token::Claims {
-			root: "room/123".to_string(),
-			subscribe: vec!["".to_string()],
-			publish: vec![],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default().with_root("room/123").with_subscribe([""]);
+		let token = key.sign(&claims)?;
 
 		let token = auth
 			.verify(&AuthParams {
 				path: "/room/123".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await?;
 		assert_eq!(token.subscribe, vec!["".as_path()]);
@@ -1321,18 +1501,14 @@ mod tests {
 		})
 		.await?;
 
-		let claims = moq_token::Claims {
-			root: "room/123".to_string(),
-			subscribe: vec![],
-			publish: vec!["bob".into()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default().with_root("room/123").with_publish(["bob"]);
+		let token = key.sign(&claims)?;
 
 		let token = auth
 			.verify(&AuthParams {
 				path: "/room/123".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await?;
 		assert_eq!(token.subscribe, vec![]);
@@ -1352,18 +1528,17 @@ mod tests {
 		})
 		.await?;
 
-		let claims = moq_token::Claims {
-			root: "room/123".to_string(),
-			subscribe: vec!["".to_string()],
-			publish: vec!["".to_string()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default()
+			.with_root("room/123")
+			.with_subscribe([""])
+			.with_publish([""]);
+		let token = key.sign(&claims)?;
 
 		let token = auth
 			.verify(&AuthParams {
 				path: "/room/123/alice".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await?;
 
@@ -1375,7 +1550,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_claims_reduction_with_publish_restrictions() -> anyhow::Result<()> {
+	async fn test_claims_reduction_with_publisher_restrictions() -> anyhow::Result<()> {
 		let key = create_test_key_with_kid("test-key");
 		let dir = setup_key_dir(&[("test-key", &key)]);
 
@@ -1385,18 +1560,17 @@ mod tests {
 		})
 		.await?;
 
-		let claims = moq_token::Claims {
-			root: "room/123".to_string(),
-			subscribe: vec!["".to_string()],
-			publish: vec!["alice".into()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default()
+			.with_root("room/123")
+			.with_subscribe([""])
+			.with_publish(["alice"]);
+		let token = key.sign(&claims)?;
 
 		let token = auth
 			.verify(&AuthParams {
 				path: "/room/123/alice".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await?;
 
@@ -1418,18 +1592,17 @@ mod tests {
 		})
 		.await?;
 
-		let claims = moq_token::Claims {
-			root: "room/123".to_string(),
-			subscribe: vec!["bob".into()],
-			publish: vec!["".to_string()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default()
+			.with_root("room/123")
+			.with_subscribe(["bob"])
+			.with_publish([""]);
+		let token = key.sign(&claims)?;
 
 		let token = auth
 			.verify(&AuthParams {
 				path: "/room/123/bob".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await?;
 
@@ -1451,18 +1624,17 @@ mod tests {
 		})
 		.await?;
 
-		let claims = moq_token::Claims {
-			root: "room/123".to_string(),
-			subscribe: vec!["bob".into()],
-			publish: vec!["alice".into()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default()
+			.with_root("room/123")
+			.with_subscribe(["bob"])
+			.with_publish(["alice"]);
+		let token = key.sign(&claims)?;
 
 		let verified = auth
 			.verify(&AuthParams {
 				path: "/room/123/alice".into(),
 				jwt: Some(token.clone()),
+				..Default::default()
 			})
 			.await?;
 
@@ -1474,6 +1646,7 @@ mod tests {
 			.verify(&AuthParams {
 				path: "/room/123/bob".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await?;
 
@@ -1495,18 +1668,17 @@ mod tests {
 		})
 		.await?;
 
-		let claims = moq_token::Claims {
-			root: "room/123".to_string(),
-			subscribe: vec!["users/bob/screen".into()],
-			publish: vec!["users/alice/camera".into()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default()
+			.with_root("room/123")
+			.with_subscribe(["users/bob/screen"])
+			.with_publish(["users/alice/camera"]);
+		let token = key.sign(&claims)?;
 
 		let verified = auth
 			.verify(&AuthParams {
 				path: "/room/123/users".into(),
 				jwt: Some(token.clone()),
+				..Default::default()
 			})
 			.await?;
 
@@ -1518,6 +1690,7 @@ mod tests {
 			.verify(&AuthParams {
 				path: "/room/123/users/alice".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await?;
 
@@ -1539,36 +1712,32 @@ mod tests {
 		})
 		.await?;
 
-		let claims = moq_token::Claims {
-			root: "room/123".to_string(),
-			subscribe: vec!["alice".into()],
-			publish: vec![],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default()
+			.with_root("room/123")
+			.with_subscribe(["alice"]);
+		let token = key.sign(&claims)?;
 
 		let verified = auth
 			.verify(&AuthParams {
 				path: "/room/123/alice".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await?;
 
 		assert_eq!(verified.subscribe, vec!["".as_path()]);
 		assert_eq!(verified.publish, vec![]);
 
-		let claims = moq_token::Claims {
-			root: "room/123".to_string(),
-			subscribe: vec![],
-			publish: vec!["alice".into()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default()
+			.with_root("room/123")
+			.with_publish(["alice"]);
+		let token = key.sign(&claims)?;
 
 		let verified = auth
 			.verify(&AuthParams {
 				path: "/room/123/alice".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await?;
 
@@ -1588,17 +1757,14 @@ mod tests {
 		.await?;
 
 		let key = create_test_key_with_kid("nonexistent");
-		let claims = moq_token::Claims {
-			root: "test".to_string(),
-			subscribe: vec!["".to_string()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default().with_root("test").with_subscribe([""]);
+		let token = key.sign(&claims)?;
 
 		let result = auth
 			.verify(&AuthParams {
 				path: "/test".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await;
 		assert!(matches!(result, Err(AuthError::KeyNotFound)));
@@ -1652,33 +1818,27 @@ mod tests {
 		.await?;
 
 		// Sign with key-1
-		let claims = moq_token::Claims {
-			root: "room/1".to_string(),
-			subscribe: vec!["".to_string()],
-			..Default::default()
-		};
-		let token1 = key1.encode(&claims)?;
+		let claims = moq_token::Claims::default().with_root("room/1").with_subscribe([""]);
+		let token1 = key1.sign(&claims)?;
 
 		let verified = auth
 			.verify(&AuthParams {
 				path: "/room/1".into(),
 				jwt: Some(token1),
+				..Default::default()
 			})
 			.await?;
 		assert_eq!(verified.root, "room/1".as_path());
 
 		// Sign with key-2
-		let claims = moq_token::Claims {
-			root: "room/2".to_string(),
-			subscribe: vec!["".to_string()],
-			..Default::default()
-		};
-		let token2 = key2.encode(&claims)?;
+		let claims = moq_token::Claims::default().with_root("room/2").with_subscribe([""]);
+		let token2 = key2.sign(&claims)?;
 
 		let verified = auth
 			.verify(&AuthParams {
 				path: "/room/2".into(),
 				jwt: Some(token2),
+				..Default::default()
 			})
 			.await?;
 		assert_eq!(verified.root, "room/2".as_path());
@@ -1723,17 +1883,14 @@ mod tests {
 		})
 		.await?;
 
-		let claims = moq_token::Claims {
-			root: "test".to_string(),
-			subscribe: vec!["".to_string()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default().with_root("test").with_subscribe([""]);
+		let token = key.sign(&claims)?;
 
 		let result = auth
 			.verify(&AuthParams {
 				path: "/test".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await;
 		assert!(matches!(result, Err(AuthError::MissingKeyId)));
@@ -1791,18 +1948,17 @@ mod tests {
 		.await?;
 
 		// JWT tokens should still work normally
-		let claims = moq_token::Claims {
-			root: "secret".to_string(),
-			subscribe: vec!["".to_string()],
-			publish: vec!["alice".into()],
-			..Default::default()
-		};
-		let jwt = key.encode(&claims)?;
+		let claims = moq_token::Claims::default()
+			.with_root("secret")
+			.with_subscribe([""])
+			.with_publish(["alice"]);
+		let jwt = key.sign(&claims)?;
 
 		let token = auth
 			.verify(&AuthParams {
 				path: "/secret".into(),
 				jwt: Some(jwt),
+				..Default::default()
 			})
 			.await?;
 		assert_eq!(token.root, "secret".as_path());
@@ -1824,18 +1980,17 @@ mod tests {
 		.await?;
 
 		// Token with root="demo", connecting to "/"
-		let claims = moq_token::Claims {
-			root: "demo".to_string(),
-			subscribe: vec!["".to_string()],
-			publish: vec!["alice".into()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default()
+			.with_root("demo")
+			.with_subscribe([""])
+			.with_publish(["alice"]);
+		let token = key.sign(&claims)?;
 
 		let verified = auth
 			.verify(&AuthParams {
 				path: "/".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await?;
 
@@ -1859,18 +2014,17 @@ mod tests {
 		.await?;
 
 		// Token with root="room/123", connecting to "/room"
-		let claims = moq_token::Claims {
-			root: "room/123".to_string(),
-			subscribe: vec!["".to_string()],
-			publish: vec!["alice".into()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default()
+			.with_root("room/123")
+			.with_subscribe([""])
+			.with_publish(["alice"]);
+		let token = key.sign(&claims)?;
 
 		let verified = auth
 			.verify(&AuthParams {
 				path: "/room".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await?;
 
@@ -1894,18 +2048,17 @@ mod tests {
 		.await?;
 
 		// Token with root="demo", connecting to "/other"
-		let claims = moq_token::Claims {
-			root: "demo".to_string(),
-			subscribe: vec!["".to_string()],
-			publish: vec!["".to_string()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default()
+			.with_root("demo")
+			.with_subscribe([""])
+			.with_publish([""]);
+		let token = key.sign(&claims)?;
 
 		let result = auth
 			.verify(&AuthParams {
 				path: "/other".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await;
 		assert!(matches!(result, Err(AuthError::IncorrectRoot)));
@@ -1925,19 +2078,15 @@ mod tests {
 		.await?;
 
 		// Token with root="", subscribe=["demo"] — only demo/ is accessible
-		let claims = moq_token::Claims {
-			root: "".to_string(),
-			subscribe: vec!["demo".to_string()],
-			publish: vec![],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default().with_root("").with_subscribe(["demo"]);
+		let token = key.sign(&claims)?;
 
 		// Connecting to /other should fail — no permissions remain after filtering
 		let result = auth
 			.verify(&AuthParams {
 				path: "/other".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await;
 		assert!(matches!(result, Err(AuthError::IncorrectRoot)));
@@ -2177,17 +2326,14 @@ api = "https://api.example.com/access"
 
 		let auth = auth_with_url_key_dir(&server).await;
 
-		let claims = moq_token::Claims {
-			root: "room/1".to_string(),
-			subscribe: vec!["".to_string()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default().with_root("room/1").with_subscribe([""]);
+		let token = key.sign(&claims)?;
 
 		let verified = auth
 			.verify(&AuthParams {
 				path: "/room/1".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await?;
 		assert_eq!(verified.root, "room/1".as_path());
@@ -2206,16 +2352,13 @@ api = "https://api.example.com/access"
 
 		let auth = auth_with_url_key_dir(&server).await;
 
-		let claims = moq_token::Claims {
-			root: "room/1".to_string(),
-			subscribe: vec!["".to_string()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default().with_root("room/1").with_subscribe([""]);
+		let token = key.sign(&claims)?;
 		let result = auth
 			.verify(&AuthParams {
 				path: "/room/1".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await;
 		assert!(matches!(result, Err(AuthError::KeyNotFound)));
@@ -2234,16 +2377,13 @@ api = "https://api.example.com/access"
 
 		let auth = auth_with_url_key_dir(&server).await;
 
-		let claims = moq_token::Claims {
-			root: "room/1".to_string(),
-			subscribe: vec!["".to_string()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default().with_root("room/1").with_subscribe([""]);
+		let token = key.sign(&claims)?;
 		let result = auth
 			.verify(&AuthParams {
 				path: "/room/1".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await;
 		assert!(matches!(result, Err(AuthError::ApiUnavailable(_))));
@@ -2260,16 +2400,13 @@ api = "https://api.example.com/access"
 		.await?;
 
 		let key = create_test_key_with_kid("test-key");
-		let claims = moq_token::Claims {
-			root: "room/1".to_string(),
-			subscribe: vec!["".to_string()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default().with_root("room/1").with_subscribe([""]);
+		let token = key.sign(&claims)?;
 		let result = auth
 			.verify(&AuthParams {
 				path: "/room/1".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await;
 		assert!(matches!(result, Err(AuthError::ApiUnavailable(_))));
@@ -2289,16 +2426,13 @@ api = "https://api.example.com/access"
 
 		let auth = auth_with_url_key_dir(&server).await;
 
-		let claims = moq_token::Claims {
-			root: "room/1".to_string(),
-			subscribe: vec!["".to_string()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default().with_root("room/1").with_subscribe([""]);
+		let token = key.sign(&claims)?;
 		let result = auth
 			.verify(&AuthParams {
 				path: "/room/1".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await;
 		assert!(matches!(result, Err(AuthError::DecodeFailed)));
@@ -2324,17 +2458,14 @@ api = "https://api.example.com/access"
 
 		let auth = auth_with_url_key_dir(&server).await;
 
-		let claims = moq_token::Claims {
-			root: "room/1".to_string(),
-			subscribe: vec!["".to_string()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default().with_root("room/1").with_subscribe([""]);
+		let token = key.sign(&claims)?;
 
 		for _ in 0..2 {
 			auth.verify(&AuthParams {
 				path: "/room/1".into(),
 				jwt: Some(token.clone()),
+				..Default::default()
 			})
 			.await?;
 		}
@@ -2605,16 +2736,35 @@ api = "https://api.example.com/access"
 		})
 		.await?;
 
-		let claims = moq_token::Claims {
-			root: "room/1".to_string(),
-			subscribe: vec!["".to_string()],
-			..Default::default()
-		};
-		let token = fx.key.encode(&claims)?;
+		let claims = moq_token::Claims::default().with_root("room/1").with_subscribe([""]);
+		let token = fx.key.sign(&claims)?;
 		let verified = auth_with_identity
 			.verify(&AuthParams {
 				path: "/room/1".into(),
 				jwt: Some(token.clone()),
+				..Default::default()
+			})
+			.await?;
+		assert_eq!(verified.root, "room/1".as_path());
+
+		// New path: the identity is supplied via the shared --client-tls-* config
+		// (injected through AuthConfig::init) instead of the deprecated
+		// --auth-tls-* flags. The server accepts it the same way.
+		let mut client_tls = moq_native::tls::Client::default();
+		client_tls.root = vec![fx.ca_pem_path.clone()];
+		client_tls.cert = Some(fx.client_cert_path.clone());
+		client_tls.key = Some(fx.client_key_path.clone());
+		let auth_via_client_tls = AuthConfig {
+			key_dir: Some(format!("{}/keys/", fx.base_url)),
+			..Default::default()
+		}
+		.init(&client_tls)
+		.await?;
+		let verified = auth_via_client_tls
+			.verify(&AuthParams {
+				path: "/room/1".into(),
+				jwt: Some(token.clone()),
+				..Default::default()
 			})
 			.await?;
 		assert_eq!(verified.root, "room/1".as_path());
@@ -2635,6 +2785,7 @@ api = "https://api.example.com/access"
 			.verify(&AuthParams {
 				path: "/room/1".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await;
 		assert!(
@@ -2778,7 +2929,8 @@ api = "https://api.example.com/access"
 		assert_eq!(token.root, "demo".as_path());
 		assert_eq!(token.subscribe, vec!["".as_path()]);
 		assert_eq!(token.publish, vec!["".as_path()]);
-		assert!(token.internal);
+		// The billing tier is set by the caller, not baked into the token.
+		assert_eq!(token.tier, Tier::default());
 	}
 
 	#[test]
@@ -2787,7 +2939,7 @@ api = "https://api.example.com/access"
 		// grant unscoped across the whole cluster.
 		let token = AuthToken::unrestricted(Path::new("/").to_owned());
 		assert_eq!(token.root, "".as_path());
-		assert!(token.internal);
+		assert_eq!(token.tier, Tier::default());
 	}
 
 	// ---------------------------------------------------------------------
@@ -2806,8 +2958,10 @@ api = "https://api.example.com/access"
 
 	#[tokio::test]
 	async fn auth_api_jwt_scopes_to_alias() -> anyhow::Result<()> {
-		// JWT connection: the unified call returns the verifying key plus the
-		// full resolved alias; the token scopes to that alias root.
+		// JWT connection: the token root is the vanity path the client dialed
+		// ("demo/room"); the API resolves that to the canonical alias
+		// ("x7k2qp/room"), and the verified token anchors on the alias so the
+		// backbone uses the stable pid.
 		let server = MockServer::start().await;
 		let key = create_test_key_with_kid("test-key");
 
@@ -2823,17 +2977,14 @@ api = "https://api.example.com/access"
 
 		let auth = auth_with_api(&server).await;
 
-		let claims = moq_token::Claims {
-			root: "x7k2qp/room".to_string(),
-			subscribe: vec!["".to_string()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default().with_root("demo/room").with_subscribe([""]);
+		let token = key.sign(&claims)?;
 
 		let verified = auth
 			.verify(&AuthParams {
 				path: "/demo/room".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await?;
 		assert_eq!(verified.root, "x7k2qp/room".as_path());
@@ -2843,8 +2994,9 @@ api = "https://api.example.com/access"
 
 	#[tokio::test]
 	async fn auth_api_full_root_passthrough() -> anyhow::Result<()> {
-		// The server returns the FULL resolved root (deep path preserved); the
-		// relay uses it verbatim — no client-side first-segment rewriting.
+		// A vanity parent token ("demo") connecting to a deep path
+		// ("demo/room/cam"): the token root overlaps the connection path, and the
+		// verified root is anchored on the FULL resolved alias ("x7k2qp/room/cam").
 		let server = MockServer::start().await;
 		let key = create_test_key_with_kid("test-key");
 
@@ -2859,20 +3011,58 @@ api = "https://api.example.com/access"
 			.await;
 
 		let auth = auth_with_api(&server).await;
-		let claims = moq_token::Claims {
-			root: "x7k2qp".to_string(),
-			subscribe: vec!["".to_string()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default().with_root("demo").with_subscribe([""]);
+		let token = key.sign(&claims)?;
 
 		let verified = auth
 			.verify(&AuthParams {
 				path: "/demo/room/cam".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await?;
 		assert_eq!(verified.root, "x7k2qp/room/cam".as_path());
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn auth_api_jwt_vanity_root_scopes_to_pid() -> anyhow::Result<()> {
+		// Regression for the dashboard flow: a token minted with the vanity
+		// project name as its root ("kixelated") connecting to the vanity
+		// subdomain path. The API aliases the name to the pid ("uwwdyw61"); the
+		// token verifies against the vanity path and the scope anchors on the pid,
+		// so publishing "hello-world" lands at "uwwdyw61/hello-world".
+		let server = MockServer::start().await;
+		let key = create_test_key_with_kid("test-key");
+
+		Mock::given(method("GET"))
+			.and(path_matcher("/auth"))
+			.and(query_param("root", "kixelated"))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_string(format!(r#"{{"alias":"uwwdyw61","key":{}}}"#, jwk_body(&key))),
+			)
+			.mount(&server)
+			.await;
+
+		let auth = auth_with_api(&server).await;
+
+		let claims = moq_token::Claims::default()
+			.with_root("kixelated")
+			.with_publish(["hello-world"])
+			.with_subscribe(["hello-world"]);
+		let token = key.sign(&claims)?;
+
+		let verified = auth
+			.verify(&AuthParams {
+				path: "/kixelated".into(),
+				jwt: Some(token),
+				..Default::default()
+			})
+			.await?;
+		assert_eq!(verified.root, "uwwdyw61".as_path());
+		assert_eq!(verified.publish, vec!["hello-world".as_path()]);
+		assert_eq!(verified.subscribe, vec!["hello-world".as_path()]);
 		Ok(())
 	}
 
@@ -2894,29 +3084,111 @@ api = "https://api.example.com/access"
 		assert_eq!(verified.root, "x7k2qp".as_path());
 		assert_eq!(verified.subscribe, vec!["cam".as_path()]);
 		assert_eq!(verified.publish, vec![]);
-		assert!(!verified.internal);
+		assert_eq!(verified.tier, Tier::default());
 		Ok(())
 	}
 
 	#[tokio::test]
-	async fn auth_api_internal_flag_promotes_tier() -> anyhow::Result<()> {
-		// A non-mTLS connection can be marked internal by the API (e.g. a
-		// first-party dashboard token), defaulting to external otherwise.
+	async fn auth_api_alias_depth_mismatch_fails_closed() -> anyhow::Result<()> {
+		let server = MockServer::start().await;
+		Mock::given(method("GET"))
+			.and(path_matcher("/auth"))
+			.and(query_param("root", "demo/room"))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_string(r#"{"alias":"x7k2qp/room/extra","public":{"subscribe":[""]}}"#),
+			)
+			.mount(&server)
+			.await;
+
+		let auth = auth_with_api(&server).await;
+		let result = auth.verify(&AuthParams::new("/demo/room")).await;
+		assert!(matches!(result, Err(AuthError::IncorrectRoot)));
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn auth_api_tier_label_buckets_connection() -> anyhow::Result<()> {
+		// A non-mTLS connection can be assigned any billing tier label by the API
+		// (e.g. a first-party dashboard token), defaulting to the unprefixed tier.
 		let server = MockServer::start().await;
 		Mock::given(method("GET"))
 			.and(path_matcher("/auth"))
 			.and(query_param("root", "demo"))
 			.respond_with(
 				ResponseTemplate::new(200)
-					.set_body_string(r#"{"alias":"x7k2qp","public":{"subscribe":[""]},"internal":true}"#),
+					.set_body_string(r#"{"alias":"x7k2qp","public":{"subscribe":[""]},"tier":"internal"}"#),
 			)
 			.mount(&server)
 			.await;
 
 		let auth = auth_with_api(&server).await;
 		let verified = auth.verify(&AuthParams::new("/demo")).await?;
-		assert!(verified.internal);
+		assert_eq!(verified.tier, Tier::new("internal"));
 		Ok(())
+	}
+
+	#[tokio::test]
+	async fn auth_api_forwards_transport_for_tiering() -> anyhow::Result<()> {
+		// The relay forwards the connection transport as `transport=`, so the API can
+		// bucket by connection type -- e.g. tier traffic on the internal Unix-socket
+		// listener (the RTMP/SRT/WebRTC gateways) into its own billing tier. The mock
+		// REQUIRES the param, so a missing `transport` fails the match (404 -> closed).
+		let server = MockServer::start().await;
+		Mock::given(method("GET"))
+			.and(path_matcher("/auth"))
+			.and(query_param("root", "customer/live"))
+			.and(query_param("transport", "unix"))
+			.respond_with(
+				ResponseTemplate::new(200).set_body_string(r#"{"public":{"subscribe":[""]},"tier":"legacy"}"#),
+			)
+			.mount(&server)
+			.await;
+
+		let auth = auth_with_api(&server).await;
+		let params = AuthParams {
+			path: "/customer/live".into(),
+			transport: Some(Transport::Unix),
+			..Default::default()
+		};
+		let verified = auth.verify(&params).await?;
+		assert_eq!(verified.tier, Tier::new("legacy"));
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn auth_api_legacy_internal_bool_maps_to_tier() -> anyhow::Result<()> {
+		// Backward compatibility: an auth API written against the original
+		// contract returns `internal: bool`, not `tier`. `true` -> `internal`.
+		let server = MockServer::start().await;
+		Mock::given(method("GET"))
+			.and(path_matcher("/auth"))
+			.and(query_param("root", "demo"))
+			.respond_with(
+				ResponseTemplate::new(200).set_body_string(r#"{"public":{"subscribe":[""]},"internal":true}"#),
+			)
+			.mount(&server)
+			.await;
+
+		let auth = auth_with_api(&server).await;
+		let verified = auth.verify(&AuthParams::new("/demo")).await?;
+		assert_eq!(verified.tier, Tier::new("internal"));
+		Ok(())
+	}
+
+	#[test]
+	fn auth_api_response_tier_precedence() {
+		// New `tier` label wins over the legacy `internal` bool when both are present.
+		let both: AuthApiResponse = serde_json::from_str(r#"{"tier":"region/sjc","internal":true}"#).unwrap();
+		assert_eq!(both.tier(), Some(Tier::new("region/sjc")));
+
+		// Legacy `internal: false` demotes to the default (unprefixed) tier.
+		let legacy_false: AuthApiResponse = serde_json::from_str(r#"{"internal":false}"#).unwrap();
+		assert_eq!(legacy_false.tier(), Some(Tier::default()));
+
+		// Neither field present: the relay applies its per-connection default.
+		let neither: AuthApiResponse = serde_json::from_str(r#"{}"#).unwrap();
+		assert_eq!(neither.tier(), None);
 	}
 
 	#[tokio::test]
@@ -2932,16 +3204,13 @@ api = "https://api.example.com/access"
 			.await;
 
 		let auth = auth_with_api(&server).await;
-		let claims = moq_token::Claims {
-			root: "unknown".to_string(),
-			subscribe: vec!["".to_string()],
-			..Default::default()
-		};
-		let token = key.encode(&claims)?;
+		let claims = moq_token::Claims::default().with_root("unknown").with_subscribe([""]);
+		let token = key.sign(&claims)?;
 		let verified = auth
 			.verify(&AuthParams {
 				path: "/unknown".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await?;
 		assert_eq!(verified.root, "unknown".as_path());
@@ -2961,15 +3230,12 @@ api = "https://api.example.com/access"
 			.await;
 
 		let auth = auth_with_api(&server).await;
-		let token = key.encode(&moq_token::Claims {
-			root: "x7k2qp".to_string(),
-			subscribe: vec!["".to_string()],
-			..Default::default()
-		})?;
+		let token = key.sign(&moq_token::Claims::default().with_root("x7k2qp").with_subscribe([""]))?;
 		let result = auth
 			.verify(&AuthParams {
 				path: "/demo".into(),
 				jwt: Some(token),
+				..Default::default()
 			})
 			.await;
 		assert!(matches!(result, Err(AuthError::KeyNotFound)));
@@ -2994,8 +3260,8 @@ api = "https://api.example.com/access"
 
 	#[tokio::test]
 	async fn auth_api_mtls_resolves_alias_and_tier() -> anyhow::Result<()> {
-		// mTLS peers get the canonical root + tier; absent `internal` defaults to
-		// internal (trusted peer).
+		// mTLS peers get the canonical root + tier; absent `tier` defaults to
+		// `internal` (trusted peer).
 		let server = MockServer::start().await;
 		Mock::given(method("GET"))
 			.and(path_matcher("/auth"))
@@ -3006,42 +3272,49 @@ api = "https://api.example.com/access"
 
 		let auth = auth_with_api(&server).await;
 		assert_eq!(
-			auth.resolve_mtls("/demo/room").await?,
-			("x7k2qp/room".to_string(), true)
+			auth.resolve_mtls("/demo/room", None).await?,
+			("x7k2qp/room".to_string(), Tier::new("internal"))
 		);
 		Ok(())
 	}
 
 	#[tokio::test]
-	async fn auth_api_mtls_tier_override_external() -> anyhow::Result<()> {
-		// The API can demote a cert-verified connection to the external tier.
+	async fn auth_api_mtls_tier_override_default() -> anyhow::Result<()> {
+		// The API can move a cert-verified connection to the default (unprefixed)
+		// tier by returning an empty label.
 		let server = MockServer::start().await;
 		Mock::given(method("GET"))
 			.and(path_matcher("/auth"))
 			.and(query_param("root", "demo"))
-			.respond_with(ResponseTemplate::new(200).set_body_string(r#"{"alias":"x7k2qp","internal":false}"#))
+			.respond_with(ResponseTemplate::new(200).set_body_string(r#"{"alias":"x7k2qp","tier":""}"#))
 			.mount(&server)
 			.await;
 
 		let auth = auth_with_api(&server).await;
-		assert_eq!(auth.resolve_mtls("/demo").await?, ("x7k2qp".to_string(), false));
+		assert_eq!(
+			auth.resolve_mtls("/demo", None).await?,
+			("x7k2qp".to_string(), Tier::default())
+		);
 		Ok(())
 	}
 
 	#[tokio::test]
 	async fn auth_api_mtls_resolves_root_via_api() -> anyhow::Result<()> {
 		// Root connections go through the API too, so it owns the alias + tier for
-		// every mTLS peer. Here the API aliases the root and demotes it to external.
+		// every mTLS peer. Here the API aliases the root and buckets it to `region`.
 		let server = MockServer::start().await;
 		Mock::given(method("GET"))
 			.and(path_matcher("/auth"))
 			.and(query_param("root", ""))
-			.respond_with(ResponseTemplate::new(200).set_body_string(r#"{"alias":"x7k2qp","internal":false}"#))
+			.respond_with(ResponseTemplate::new(200).set_body_string(r#"{"alias":"x7k2qp","tier":"region"}"#))
 			.mount(&server)
 			.await;
 
 		let auth = auth_with_api(&server).await;
-		assert_eq!(auth.resolve_mtls("/").await?, ("x7k2qp".to_string(), false));
+		assert_eq!(
+			auth.resolve_mtls("/", None).await?,
+			("x7k2qp".to_string(), Tier::new("region"))
+		);
 		Ok(())
 	}
 
@@ -3055,8 +3328,14 @@ api = "https://api.example.com/access"
 			..Default::default()
 		})
 		.await?;
-		assert_eq!(auth.resolve_mtls("/demo").await?, ("/demo".to_string(), true));
-		assert_eq!(auth.resolve_mtls("/").await?, ("/".to_string(), true));
+		assert_eq!(
+			auth.resolve_mtls("/demo", None).await?,
+			("/demo".to_string(), Tier::new("internal"))
+		);
+		assert_eq!(
+			auth.resolve_mtls("/", None).await?,
+			("/".to_string(), Tier::new("internal"))
+		);
 		Ok(())
 	}
 
@@ -3074,7 +3353,7 @@ api = "https://api.example.com/access"
 			.await;
 
 		let auth = auth_with_api(&server).await;
-		let err = auth.resolve_mtls("/demo").await.unwrap_err();
+		let err = auth.resolve_mtls("/demo", None).await.unwrap_err();
 		assert!(matches!(err, AuthError::ApiUnavailable(_)));
 		assert_eq!(http::StatusCode::from(err), http::StatusCode::BAD_GATEWAY);
 		Ok(())
@@ -3093,7 +3372,7 @@ api = "https://api.example.com/access"
 			.await;
 
 		let auth = auth_with_api(&server).await;
-		let err = auth.resolve_mtls("/demo").await.unwrap_err();
+		let err = auth.resolve_mtls("/demo", None).await.unwrap_err();
 		assert!(matches!(err, AuthError::ApiInvalidResponse(_)));
 		assert_eq!(http::StatusCode::from(err), http::StatusCode::BAD_GATEWAY);
 		Ok(())

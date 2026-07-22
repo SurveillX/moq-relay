@@ -1,4 +1,5 @@
 use std::{
+	cell::OnceCell,
 	fmt,
 	future::Future,
 	marker::PhantomData,
@@ -14,33 +15,56 @@ const INLINE_WAITERS: usize = 32;
 
 /// Handle passed to poll functions for registering with [`WaiterList`]s.
 ///
-/// Each waiter owns an `Arc<Waker>`; list entries hold a `Weak<Waker>` that
-/// becomes dead as soon as the owning [`Waiter`] is dropped. The list
-/// reclaims those dead slots in place on the next register call without
-/// needing to walk the whole list or do any explicit removal.
+/// Holds the task's [`Waker`] by value and, lazily, a shared `Arc<Waker>` that list
+/// entries reference weakly. The `Arc` is allocated on the first [`Self::register`],
+/// so a poll that resolves without ever parking never touches the heap. Its `Weak`s
+/// go dead the moment the owning [`Waiter`] drops, which is how a [`WaiterList`]
+/// reclaims slots with no explicit deregister.
 pub struct Waiter {
-	waker: Arc<Waker>,
+	// The task waker. Cloning it is cheap (an atomic bump, no allocation).
+	waker: Waker,
+
+	// The shared handle downgraded into every list this waiter registers with. Created on the
+	// first `register` (a poll that never parks never allocates it), then reused so multiple
+	// lists in one poll share a single allocation whose `Weak`s die together when the waiter drops.
+	shared: OnceCell<Arc<Waker>>,
 }
 
 impl Waiter {
 	/// Create a new waiter from an async [`Waker`].
 	pub fn new(waker: Waker) -> Self {
-		Self { waker: Arc::new(waker) }
+		Self {
+			waker,
+			shared: OnceCell::new(),
+		}
 	}
 
 	/// Create a no-op waiter that discards registrations.
-	///
-	/// Registrations are stored as `Weak<Waker>` refs, so a noop waiter's
-	/// weak ref will just be cleaned up on the next register call.
 	pub fn noop() -> Self {
-		Self {
-			waker: Arc::new(std::task::Waker::noop().clone()),
-		}
+		Self::new(Waker::noop().clone())
 	}
 
 	/// Register this waiter with a [`WaiterList`] for future notification.
 	pub fn register(&self, list: &mut WaiterList) {
 		list.register(self);
+	}
+
+	/// The underlying task [`Waker`], for hand-rolling foreign-future integration. Prefer
+	/// [`poll_future`](Self::poll_future), which wraps the usual [`Context`] dance.
+	pub fn waker(&self) -> &Waker {
+		&self.waker
+	}
+
+	/// The shared waker handle downgraded into lists, allocated on first use and cached so
+	/// repeat registrations (across polls, or across lists in one poll) share one allocation.
+	fn shared(&self) -> &Arc<Waker> {
+		self.shared.get_or_init(|| Arc::new(self.waker.clone()))
+	}
+
+	/// Poll a foreign [`Future`] against this waiter, so it re-wakes the enclosing
+	/// `poll_*` step when it is ready.
+	pub fn poll_future<F: Future + ?Sized>(&self, future: Pin<&mut F>) -> Poll<F::Output> {
+		future.poll(&mut Context::from_waker(self.waker()))
 	}
 }
 
@@ -57,6 +81,7 @@ pub struct WaiterList {
 }
 
 impl WaiterList {
+	/// Create an empty list, allocating nothing until the first [`register`](Self::register).
 	pub fn new() -> Self {
 		Self {
 			entries: SmallVec::new(),
@@ -71,7 +96,7 @@ impl WaiterList {
 	/// cursor advances on each append so the probe window covers the
 	/// whole list over time.
 	pub fn register(&mut self, waiter: &Waiter) {
-		let new_weak = Arc::downgrade(&waiter.waker);
+		let new_weak = Arc::downgrade(waiter.shared());
 
 		for _ in 0..self.entries.len().min(2) {
 			if self.entries[self.cursor].strong_count() == 0 {
@@ -122,7 +147,9 @@ impl fmt::Debug for WaiterList {
 struct WaiterFn<F, R> {
 	poll: F,
 	waiter: Option<Waiter>, // Store the previous waiter to avoid dropping it.
-	_marker: PhantomData<R>,
+	// `fn() -> R` keeps the marker `Unpin` (and `Send`/`Sync`) regardless of `R`:
+	// the output is only ever moved out of `Poll::Ready`, never stored.
+	_marker: PhantomData<fn() -> R>,
 }
 
 /// Create a [`Future`] from a poll function that receives a [`Waiter`].
@@ -132,7 +159,6 @@ struct WaiterFn<F, R> {
 pub fn wait<F, R>(poll: F) -> impl Future<Output = R>
 where
 	F: FnMut(&Waiter) -> Poll<R> + Unpin,
-	R: Unpin,
 {
 	WaiterFn {
 		poll,
@@ -144,7 +170,6 @@ where
 impl<F, R> Future for WaiterFn<F, R>
 where
 	F: FnMut(&Waiter) -> Poll<R> + Unpin,
-	R: Unpin,
 {
 	type Output = R;
 
@@ -154,5 +179,36 @@ where
 		// list so the inner poll function's register call can recycle it.
 		this.waiter = Some(Waiter::new(cx.waker().clone()));
 		(this.poll)(this.waiter.as_ref().unwrap())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn poll_future_bridges_a_std_future() {
+		let waiter = Waiter::noop();
+
+		// A ready future resolves through the waiter.
+		let fut = std::pin::pin!(std::future::ready(7u8));
+		assert_eq!(waiter.poll_future(fut), Poll::Ready(7));
+
+		// A never-ready future stays pending.
+		let fut = std::pin::pin!(std::future::pending::<u8>());
+		assert_eq!(waiter.poll_future(fut), Poll::Pending);
+
+		// A type-erased future works too (the `?Sized` bound).
+		let mut boxed: Pin<Box<dyn Future<Output = u8>>> = Box::pin(std::future::ready(9u8));
+		assert_eq!(waiter.poll_future(boxed.as_mut()), Poll::Ready(9));
+	}
+
+	#[test]
+	fn wait_output_need_not_be_unpin() {
+		struct NotUnpin(#[allow(dead_code)] std::marker::PhantomPinned);
+
+		let mut fut = std::pin::pin!(crate::wait(|_| Poll::Ready(NotUnpin(std::marker::PhantomPinned))));
+		let mut cx = Context::from_waker(Waker::noop());
+		assert!(fut.as_mut().poll(&mut cx).is_ready());
 	}
 }

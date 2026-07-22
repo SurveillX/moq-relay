@@ -21,8 +21,8 @@ browser implementation.
 The [`web-transport`](https://crates.io/crates/web-transport) meta-crate picks
 the backend by target automatically:
 
-- **native** &rarr; [`web-transport-quinn`](https://crates.io/crates/web-transport-quinn) (a real QUIC stack)
-- **wasm** &rarr; [`web-transport-wasm`](https://crates.io/crates/web-transport-wasm) (a thin wrapper over the browser's `WebTransport`)
+- **native** → [`web-transport-quinn`](https://crates.io/crates/web-transport-quinn) (a real QUIC stack)
+- **wasm** → [`web-transport-wasm`](https://crates.io/crates/web-transport-wasm) (a thin wrapper over the browser's `WebTransport`)
 
 So the same `moq-net` code works in both places. On wasm you skip
 [`moq-native`](/lib/rs/crate/moq-native) entirely (it's quinn-only) and get the
@@ -74,10 +74,17 @@ let transport = web_transport::ClientBuilder::new()
 // Hand the transport to moq-net and run the MoQ handshake.
 let origin = moq_net::Origin::new().produce();
 let mut consumer = origin.consume();
-let session = moq_net::Client::new()
-    .with_consume(origin)
+let (session, driver) = moq_net::Client::new()
+    .with_subscriber(origin)
     .connect(transport)
     .await?;
+
+// Nothing drives the protocol but the driver, so run it for as long as you hold
+// the session. It holds no session clone, so dropping your last `session` still
+// closes the transport, which in turn ends the spawned task.
+wasm_bindgen_futures::spawn_local(async move {
+    let _ = driver.await;
+});
 
 // Read announcements off `consumer` exactly as on native...
 ```

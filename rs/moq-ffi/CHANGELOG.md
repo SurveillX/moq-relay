@@ -7,6 +7,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Expose explicit raw group sequences, known track ends, and raw group aborts
+  across the generated bindings.
+
+### Changed
+
+- `abort` takes the application error code as a `u16`, matching the wire type,
+  instead of an `i32` that was range-checked at runtime. The `InvalidErrorCode`
+  error variant is gone with it: an out-of-range code no longer compiles.
+
+## [0.2.33](https://github.com/moq-dev/moq/compare/moq-ffi-v0.2.32...moq-ffi-v0.2.33) - 2026-07-18
+
+### Other
+
+- *(deps)* bump the cargo group across 1 directory with 3 updates ([#2273](https://github.com/moq-dev/moq/pull/2273))
+
+## [0.2.32](https://github.com/moq-dev/moq/compare/moq-ffi-v0.2.31...moq-ffi-v0.2.32) - 2026-07-17
+
+### Fixed
+
+- *(moq-ffi)* reject unsupported audio codecs ([#2331](https://github.com/moq-dev/moq/pull/2331))
+
+## [0.2.31](https://github.com/moq-dev/moq/compare/moq-ffi-v0.2.30...moq-ffi-v0.2.31) - 2026-07-16
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.2.30](https://github.com/moq-dev/moq/compare/moq-ffi-v0.2.29...moq-ffi-v0.2.30) - 2026-07-15
+
+### Added
+
+- *(moq-ffi)* expose client mTLS certificate configuration ([#2256](https://github.com/moq-dev/moq/pull/2256))
+
+## [0.2.29](https://github.com/moq-dev/moq/compare/moq-ffi-v0.2.28...moq-ffi-v0.2.29) - 2026-07-12
+
+### Other
+
+- split into snapshot/stream modules and expose JSON tracks through moq-ffi/libmoq ([#2196](https://github.com/moq-dev/moq/pull/2196))
+
+## [0.2.28](https://github.com/moq-dev/moq/compare/moq-ffi-v0.2.27...moq-ffi-v0.2.28) - 2026-07-09
+
+### Fixed
+
+- *(moq-native)* compile for target_os="android" under jni 0.22 ([#2105](https://github.com/moq-dev/moq/pull/2105))
+
+## [0.2.27](https://github.com/moq-dev/moq/compare/moq-ffi-v0.2.26...moq-ffi-v0.2.27) - 2026-07-05
+
+### Other
+
+- [codex] fix AAC catalog description ([#2093](https://github.com/moq-dev/moq/pull/2093))
+
+## [0.2.26](https://github.com/moq-dev/moq/compare/moq-ffi-v0.2.25...moq-ffi-v0.2.26) - 2026-07-04
+
+### Added
+
+- *(moq-ffi)* expose TLS system root trust control ([#1978](https://github.com/moq-dev/moq/pull/1978))
+
+### Fixed
+
+- *(moq-native)* verify server certs with the OS platform verifier ([#1968](https://github.com/moq-dev/moq/pull/1968))
+
+### Other
+
+- [codex] Future-proof moq-net metadata structs ([#2046](https://github.com/moq-dev/moq/pull/2046))
+
+## [0.2.25](https://github.com/moq-dev/moq/compare/moq-ffi-v0.2.24...moq-ffi-v0.2.25) - 2026-06-30
+
+### Other
+
+- API cleanup before the semver bump ([#1941](https://github.com/moq-dev/moq/pull/1941))
+- Backport moq-mux to main (adapted to main's moq-net, no wire/API breaks) ([#1918](https://github.com/moq-dev/moq/pull/1918))
+
+## [0.2.23](https://github.com/moq-dev/moq/compare/moq-ffi-v0.2.22...moq-ffi-v0.2.23) - 2026-06-23
+
+### Added
+
+- *(catalog)* expose untyped catalog extensions via moq-ffi and libmoq ([#1886](https://github.com/moq-dev/moq/pull/1886))
+
+## [0.2.22](https://github.com/moq-dev/moq/compare/moq-ffi-v0.2.21...moq-ffi-v0.2.22) - 2026-06-19
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.2.21](https://github.com/moq-dev/moq/compare/moq-ffi-v0.2.20...moq-ffi-v0.2.21) - 2026-06-16
+
+### Added
+
+- certificate pinning for native and browser clients ([#1698](https://github.com/moq-dev/moq/pull/1698))
+- *(moq-ffi)* expose dynamic track requests ([#1674](https://github.com/moq-dev/moq/pull/1674))
+
+### Fixed
+
+- *(native)* surface terminal auth connect errors ([#1649](https://github.com/moq-dev/moq/pull/1649))
+
+### Other
+
+- Mux import with existing track ([#1684](https://github.com/moq-dev/moq/pull/1684))
+
 ## [0.2.20](https://github.com/moq-dev/moq/compare/moq-ffi-v0.2.19...moq-ffi-v0.2.20) - 2026-06-10
 
 ### Added

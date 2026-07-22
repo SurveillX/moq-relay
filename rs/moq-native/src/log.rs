@@ -26,20 +26,28 @@ impl Default for Log {
 }
 
 impl Log {
+	/// Log at the given level and below.
 	pub fn new(level: Level) -> Self {
 		Self { level }
 	}
 
+	/// The configured level as a filter.
 	pub fn level(&self) -> LevelFilter {
 		LevelFilter::from_level(self.level)
 	}
 
+	/// Install this as the process-wide tracing subscriber.
+	///
+	/// `RUST_LOG` overrides the configured level. Logs go to stderr, or to
+	/// logcat on Android. Errors if a subscriber is already installed, so call
+	/// it once at startup.
 	pub fn init(&self) -> crate::Result<()> {
 		let filter = EnvFilter::builder()
 			.with_default_directive(self.level().into()) // Default to our -q/-v args
 			.from_env_lossy() // Allow overriding with RUST_LOG
 			.add_directive("h2=warn".parse()?)
 			.add_directive("quinn=info".parse()?)
+			.add_directive("noq=info".parse()?)
 			.add_directive("tungstenite=info".parse()?)
 			.add_directive("rustls=info".parse()?)
 			.add_directive("tracing::span=off".parse()?)
@@ -66,9 +74,6 @@ impl Log {
 				.with_filter(filter);
 			registry.with(fmt_layer)
 		};
-
-		#[cfg(feature = "tokio-console")]
-		let registry = registry.with(console_subscriber::spawn());
 
 		registry
 			.try_init()

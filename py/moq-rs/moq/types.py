@@ -25,13 +25,40 @@ from moq_ffi import (
     MoqCatalog as Catalog,
 )
 from moq_ffi import (
+    MoqConnectionStats as ConnectionStats,
+)
+from moq_ffi import (
+    MoqContainer as Container,
+)
+from moq_ffi import (
+    MoqDatagram as Datagram,
+)
+from moq_ffi import (
     MoqDimensions as Dimensions,
+)
+from moq_ffi import (
+    MoqFetchGroupOptions as FetchGroupOptions,
 )
 from moq_ffi import (
     MoqFrame as Frame,
 )
 from moq_ffi import (
+    MoqMediaFrame as MediaFrame,
+)
+from moq_ffi import (
+    MoqRoute as Route,
+)
+from moq_ffi import (
+    MoqSubscription as Subscription,
+)
+from moq_ffi import (
+    MoqTrackInfo as TrackInfo,
+)
+from moq_ffi import (
     MoqVideo as Video,
+)
+from moq_ffi import (
+    MoqVideoHint as VideoHint,
 )
 
 __all__ = [
@@ -43,7 +70,16 @@ __all__ = [
     "AudioFormat",
     "AudioFrame",
     "Catalog",
+    "ConnectionStats",
+    "Container",
+    "Datagram",
     "Dimensions",
     "Frame",
+    "FetchGroupOptions",
+    "MediaFrame",
+    "Route",
+    "Subscription",
+    "TrackInfo",
     "Video",
+    "VideoHint",
 ]

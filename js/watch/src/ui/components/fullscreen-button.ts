@@ -1,28 +1,24 @@
 import type { Effect } from "@moq/signals";
-import type MoqWatch from "../../element";
+import { createFullscreen } from "../fullscreen";
 import { fullscreenEnter, fullscreenExit, icon } from "../icons";
+import { controlButton } from "./button";
 
-export function fullscreenButton(parent: Effect, watch: MoqWatch): HTMLElement {
-	const button = document.createElement("button");
-	button.type = "button";
-	button.className = "button flex-center";
-	button.title = "Fullscreen";
-	button.setAttribute("aria-label", "Fullscreen");
-	button.replaceChildren(icon(fullscreenEnter));
+/** Fullscreen toggle button wired to the shared cross-browser fullscreen controller. */
+export function fullscreenButton(parent: Effect, player: HTMLElement): HTMLElement {
+	const button = controlButton(fullscreenEnter, "Fullscreen");
+
+	const fullscreen = createFullscreen(parent, player);
 
 	const updateIcon = () => {
-		const isFull = !!document.fullscreenElement;
+		const isFull = fullscreen.active();
 		button.replaceChildren(icon(isFull ? fullscreenExit : fullscreenEnter));
+		button.title = isFull ? "Exit fullscreen" : "Fullscreen";
+		button.setAttribute("aria-label", button.title);
 	};
-	parent.event(document, "fullscreenchange", updateIcon);
+	updateIcon();
+	parent.cleanup(fullscreen.onChange(updateIcon));
 
-	parent.event(button, "click", () => {
-		if (document.fullscreenElement) {
-			document.exitFullscreen();
-		} else {
-			watch.requestFullscreen();
-		}
-	});
+	parent.event(button, "click", () => fullscreen.toggle());
 
 	return button;
 }

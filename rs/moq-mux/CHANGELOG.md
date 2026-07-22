@@ -7,6 +7,139 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.6](https://github.com/moq-dev/moq/compare/moq-mux-v0.7.5...moq-mux-v0.7.6) - 2026-07-18
+
+### Fixed
+
+- *(moq-mux)* strip edit lists from the CMAF init ([#2383](https://github.com/moq-dev/moq/pull/2383))
+
+### Other
+
+- *(moq-mux)* bump mp4-atom to 0.14 ([#2391](https://github.com/moq-dev/moq/pull/2391))
+
+## [0.7.5](https://github.com/moq-dev/moq/compare/moq-mux-v0.7.4...moq-mux-v0.7.5) - 2026-07-16
+
+### Added
+
+- *(moq-mux)* cut(end) as the group boundary ([#2270](https://github.com/moq-dev/moq/pull/2270))
+
+### Fixed
+
+- *(moq-hls)* honor byte ranges and map changes ([#2271](https://github.com/moq-dev/moq/pull/2271))
+
+## [0.7.4](https://github.com/moq-dev/moq/compare/moq-mux-v0.7.3...moq-mux-v0.7.4) - 2026-07-12
+
+### Other
+
+- split into snapshot/stream modules and expose JSON tracks through moq-ffi/libmoq ([#2196](https://github.com/moq-dev/moq/pull/2196))
+
+## [0.7.3](https://github.com/moq-dev/moq/compare/moq-mux-v0.7.2...moq-mux-v0.7.3) - 2026-07-09
+
+### Fixed
+
+- *(moq-mux)* match per-rendition init track id to its fragments ([#2104](https://github.com/moq-dev/moq/pull/2104))
+
+### Other
+
+- Per-track timeline index for each media track ([#2109](https://github.com/moq-dev/moq/pull/2109))
+
+## [0.7.2](https://github.com/moq-dev/moq/compare/moq-mux-v0.7.1...moq-mux-v0.7.2) - 2026-07-05
+
+### Other
+
+- *(deps)* bump the cargo group with 9 updates ([#2098](https://github.com/moq-dev/moq/pull/2098))
+- [codex] fix AAC catalog description ([#2093](https://github.com/moq-dev/moq/pull/2093))
+
+## [0.7.1](https://github.com/moq-dev/moq/compare/moq-mux-v0.7.0...moq-mux-v0.7.1) - 2026-07-04
+
+### Added
+
+- *(moq-rtmp,moq-mux)* enhanced-RTMP capsEx negotiation + multitrack ([#2068](https://github.com/moq-dev/moq/pull/2068))
+- *(moq-mux)* add FLAC support (catalog + mp4/mkv import/export) ([#1969](https://github.com/moq-dev/moq/pull/1969))
+- *(moq-mux,moq-gst)* MP3 support for MKV and GStreamer ([#1970](https://github.com/moq-dev/moq/pull/1970))
+- *(moq-mux)* add MP3 audio support for FLV/RTMP ([#1967](https://github.com/moq-dev/moq/pull/1967))
+- *(moq-mux)* Opus audio over MPEG-TS (import + export) ([#1965](https://github.com/moq-dev/moq/pull/1965))
+
+### Fixed
+
+- *(moq-mux)* treat H.264 recovery-point SEI as an open-GOP keyframe ([#2066](https://github.com/moq-dev/moq/pull/2066))
+
+### Other
+
+- [codex] fix FLV export DTS timestamps
+- [codex] fix timestamp elapsed arithmetic ([#2051](https://github.com/moq-dev/moq/pull/2051))
+- [codex] Future-proof moq-net metadata structs ([#2046](https://github.com/moq-dev/moq/pull/2046))
+- [codex] fix fMP4 composition offsets ([#2015](https://github.com/moq-dev/moq/pull/2015))
+- Add track name to the consumer skip/reset logs ([#2012](https://github.com/moq-dev/moq/pull/2012))
+
+## [0.7.0](https://github.com/moq-dev/moq/compare/moq-mux-v0.6.0...moq-mux-v0.7.0) - 2026-06-30
+
+### Added
+
+- *(moq-rtc)* add WebRTC (WHIP/WHEP) gateway ([#1916](https://github.com/moq-dev/moq/pull/1916))
+- *(moq-srt)* bidirectional SRT/MPEG-TS gateway (+ timestamped ts::Export) ([#1915](https://github.com/moq-dev/moq/pull/1915))
+- *(moq-rtmp)* RTMP/E-RTMP gateway + enhanced-RTMP FLV codecs on main ([#1914](https://github.com/moq-dev/moq/pull/1914))
+- *(hang)* compressed catalog track (catalog.json.z) ([#1904](https://github.com/moq-dev/moq/pull/1904))
+- *(json)* group-scoped DEFLATE compression with browser support ([#1897](https://github.com/moq-dev/moq/pull/1897))
+- *(moq-mux)* clear consumer buffer when group timestamps rewind ([#1884](https://github.com/moq-dev/moq/pull/1884))
+
+### Fixed
+
+- *(moq-mux)* codec/container correctness fixes from #1918 review ([#1923](https://github.com/moq-dev/moq/pull/1923)) ([#1925](https://github.com/moq-dev/moq/pull/1925))
+
+### Other
+
+- drop redundant non_exhaustive on select builders ([#1944](https://github.com/moq-dev/moq/pull/1944))
+- unify rendition selection behind select::Broadcast
+- API cleanup before the semver bump ([#1941](https://github.com/moq-dev/moq/pull/1941))
+- [codex] Route HLS CLI import through moq-hls ([#1939](https://github.com/moq-dev/moq/pull/1939))
+- Fix fMP4 zero-duration samples ([#1933](https://github.com/moq-dev/moq/pull/1933))
+- [codex] Backport moq-hls to main ([#1924](https://github.com/moq-dev/moq/pull/1924))
+- Backport moq-mux to main (adapted to main's moq-net, no wire/API breaks) ([#1918](https://github.com/moq-dev/moq/pull/1918))
+
+### Changed
+
+- Emit MSF catalogs at draft-ietf-moq-msf-01: `version` is the string `"draft-01"` and init data is carried via the root `initDataList` + per-track `initRef`. The MSF consumer still accepts draft-00 (numeric `version`, inline `initData`).
+
+## [0.6.0](https://github.com/moq-dev/moq/compare/moq-mux-v0.5.6...moq-mux-v0.6.0) - 2026-06-23
+
+### Added
+
+- *(catalog)* expose untyped catalog extensions via moq-ffi and libmoq ([#1886](https://github.com/moq-dev/moq/pull/1886))
+- *(moq-mux)* generic verbatim MPEG-TS carriage (mpegts catalog section) ([#1815](https://github.com/moq-dev/moq/pull/1815))
+
+### Fixed
+
+- *(moq-mux)* author DTS for B-frame MPEG-TS export ([#1843](https://github.com/moq-dev/moq/pull/1843))
+- *(moq-mux)* carry all distinct SPS/PPS/VPS through transmux, not just the last seen ([#1812](https://github.com/moq-dev/moq/pull/1812))
+
+### Other
+
+- move moq-cli's TS verbatim coverage into moq-mux ([#1879](https://github.com/moq-dev/moq/pull/1879))
+
+## [0.5.6](https://github.com/moq-dev/moq/compare/moq-mux-v0.5.5...moq-mux-v0.5.6) - 2026-06-17
+
+### Added
+
+- *(json)* default delta_ratio to 8, count only delta bytes ([#1765](https://github.com/moq-dev/moq/pull/1765))
+
+## [0.5.5](https://github.com/moq-dev/moq/compare/moq-mux-v0.5.4...moq-mux-v0.5.5) - 2026-06-16
+
+### Fixed
+
+- *(moq-mux)* confirm TS sync lock before trusting a candidate sync byte ([#1697](https://github.com/moq-dev/moq/pull/1697))
+
+### Other
+
+- Add FLV (Flash Video / RTMP) container support to moq-mux ([#1745](https://github.com/moq-dev/moq/pull/1745))
+- Mux import with existing track ([#1684](https://github.com/moq-dev/moq/pull/1684))
+- ingest and export legacy non-browser broadcast audio over MPEG-TS mp2, ac-3 & e-ac-3 ([#1701](https://github.com/moq-dev/moq/pull/1701))
+- harden the scte35_inject fixture generator ([#1696](https://github.com/moq-dev/moq/pull/1696))
+- *(moq-mux)* SIMD-accelerate MPEG-TS sync byte resync ([#1695](https://github.com/moq-dev/moq/pull/1695))
+- SIMD start-code scanning via memchr ([#1694](https://github.com/moq-dev/moq/pull/1694))
+- export SCTE-35 sections back to MPEG-TS ([#1685](https://github.com/moq-dev/moq/pull/1685))
+- ingest SCTE-35 from MPEG-TS, and tolerate mid-stream joins ([#1617](https://github.com/moq-dev/moq/pull/1617))
+
 ## [0.5.4](https://github.com/moq-dev/moq/compare/moq-mux-v0.5.3...moq-mux-v0.5.4) - 2026-06-10
 
 ### Added

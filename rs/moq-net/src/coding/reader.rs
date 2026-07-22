@@ -45,6 +45,15 @@ impl<S: web_transport_trait::RecvStream, V> Reader<S, V> {
 	}
 
 	/// Decode the next message unless the stream is closed.
+	///
+	/// Cancel-safe with the transports we ship (`web_transport_quinn`, `qmux`).
+	/// The only `.await` points are reads from the underlying transport; partial
+	/// bytes accumulate in `self.buffer` and a re-entry resumes decoding from
+	/// the same position, so dropping the future mid-message never desynchronizes
+	/// the stream. This requires the transport's `read_buf` to be cancel-safe
+	/// (Quinn's `RecvStream::read` is documented as such, and qmux's
+	/// `RecvStream::read_chunk` is a `tokio::sync::mpsc::Receiver::recv`).
+	/// New transport impls must preserve this property.
 	pub async fn decode_maybe<T: Decode<V> + Debug>(&mut self) -> Result<Option<T>, Error>
 	where
 		V: Clone,
@@ -77,21 +86,13 @@ impl<S: web_transport_trait::RecvStream, V> Reader<S, V> {
 		}
 	}
 
-	/// Read into the provided buffer, draining the reader's internal buffer first.
-	///
-	/// Returns the number of bytes written, or `None` if the stream is closed
-	/// (and the internal buffer was empty).
-	pub async fn read_buf<B: BufMut + web_transport_trait::MaybeSend>(
-		&mut self,
-		dst: &mut B,
-	) -> Result<Option<usize>, Error> {
-		if !self.buffer.is_empty() && dst.has_remaining_mut() {
-			let n = cmp::min(self.buffer.len(), dst.remaining_mut());
-			let chunk = self.buffer.split_to(n);
-			dst.put_slice(&chunk);
-			return Ok(Some(n));
+	/// Read the next chunk, draining the reader's internal buffer first.
+	pub async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, Error> {
+		if !self.buffer.is_empty() {
+			let n = cmp::min(self.buffer.len(), max);
+			return Ok(Some(self.buffer.split_to(n).freeze()));
 		}
-		self.stream.read_buf(dst).await.map_err(Error::from_transport)
+		self.stream.read_chunk(max).await.map_err(Error::from_transport)
 	}
 
 	/// Read exactly the given number of bytes from the stream.
@@ -117,25 +118,6 @@ impl<S: web_transport_trait::RecvStream, V> Reader<S, V> {
 		}
 
 		Ok(buf.into_inner().freeze())
-	}
-
-	/// Skip the given number of bytes from the stream.
-	pub async fn skip(&mut self, mut size: usize) -> Result<(), Error> {
-		let buffered = self.buffer.len().min(size);
-		self.buffer.advance(buffered);
-		size -= buffered;
-
-		while size > 0 {
-			let chunk = self
-				.stream
-				.read_chunk(size)
-				.await
-				.map_err(Error::from_transport)?
-				.ok_or(DecodeError::Short)?;
-			size -= chunk.len();
-		}
-
-		Ok(())
 	}
 
 	/// Wait until the stream is closed, erroring if there are any additional bytes.

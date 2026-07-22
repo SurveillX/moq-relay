@@ -1,11 +1,11 @@
-import type { Moq } from "@moq/hang";
+import * as Moq from "@moq/net";
 import type { Effect } from "@moq/signals";
 import type { BufferedRanges } from "../..";
 import type MoqWatch from "../../element";
 
-const MIN_RANGE = 0 as Moq.Time.Milli;
-const RANGE_STEP = 10 as Moq.Time.Milli;
-const DEFAULT_MAX = 4000 as Moq.Time.Milli;
+const MIN_RANGE = Moq.Time.Milli(0);
+const RANGE_STEP = Moq.Time.Milli(10);
+const DEFAULT_MAX = Moq.Time.Milli(4000);
 const LABEL_WIDTH = 48;
 
 function drawRanges(
@@ -41,8 +41,8 @@ function drawRanges(
 
 	for (let i = 0; i < ranges.length; i++) {
 		const range = ranges[i];
-		const startMs = (range.start - timestamp) as Moq.Time.Milli;
-		const endMs = (range.end - timestamp) as Moq.Time.Milli;
+		const startMs = Moq.Time.Milli(range.start - timestamp);
+		const endMs = Moq.Time.Milli(range.end - timestamp);
 		const visibleStart = Math.max(0, startMs);
 		const visibleEnd = Math.min(endMs, max);
 
@@ -127,7 +127,7 @@ export function bufferControl(parent: Effect, watch: MoqWatch, max: Moq.Time.Mil
 	let hasInteracted = false;
 
 	parent.run((effect) => {
-		const jitter = effect.get(watch.backend.jitter);
+		const jitter = effect.get(watch.sync.out.jitter);
 		const pct = (jitter / max) * 100;
 		targetLine.style.left = `${pct}%`;
 		targetLabel.textContent = `${Math.round(jitter)}ms`;
@@ -139,9 +139,9 @@ export function bufferControl(parent: Effect, watch: MoqWatch, max: Moq.Time.Mil
 		const trackWidth = rect.width - LABEL_WIDTH;
 		const x = Math.max(0, Math.min(clientX - rect.left - LABEL_WIDTH, trackWidth));
 		const ms = (x / trackWidth) * max;
-		const snapped = (Math.round(ms / RANGE_STEP) * RANGE_STEP) as Moq.Time.Milli;
-		const clamped = Math.max(MIN_RANGE, Math.min(max, snapped)) as Moq.Time.Milli;
-		watch.backend.latency.set(clamped);
+		const snapped = Moq.Time.Milli(Math.round(ms / RANGE_STEP) * RANGE_STEP);
+		const clamped = Moq.Time.Milli(Math.max(MIN_RANGE, Math.min(max, snapped)));
+		watch.latencyMin = clamped;
 	};
 
 	const interact = () => {
@@ -169,26 +169,26 @@ export function bufferControl(parent: Effect, watch: MoqWatch, max: Moq.Time.Mil
 	});
 
 	parent.event(viz, "keydown", (e) => {
-		let delta = 0 as Moq.Time.Milli;
+		let delta = Moq.Time.Milli(0);
 		if (e.key === "ArrowRight" || e.key === "ArrowUp") {
 			delta = RANGE_STEP;
 		} else if (e.key === "ArrowLeft" || e.key === "ArrowDown") {
-			delta = -RANGE_STEP as Moq.Time.Milli;
+			delta = Moq.Time.Milli(-RANGE_STEP);
 		} else {
 			return;
 		}
 		e.preventDefault();
 		interact();
-		const current = watch.backend.jitter.peek();
-		const value = Math.max(MIN_RANGE, Math.min(max, current + delta)) as Moq.Time.Milli;
-		watch.backend.latency.set(value);
+		const current = watch.sync.out.jitter.peek();
+		const value = Moq.Time.Milli(Math.max(MIN_RANGE, Math.min(max, current + delta)));
+		watch.latencyMin = value;
 	});
 
 	const draw = () => {
-		const timestamp = watch.backend.sync.now();
-		const isBuffering = watch.backend.video.stalled.peek();
-		drawRanges(videoCanvas, watch.backend.video.buffered.peek(), timestamp, max, isBuffering);
-		drawRanges(audioCanvas, watch.backend.audio.buffered.peek(), timestamp, max, isBuffering);
+		const timestamp = watch.sync.now();
+		const isBuffering = watch.video.out.stalled.peek();
+		drawRanges(videoCanvas, watch.video.out.buffered.peek(), timestamp, max, isBuffering);
+		drawRanges(audioCanvas, watch.audio.out.buffered.peek(), timestamp, max, isBuffering);
 		parent.animate(draw);
 	};
 	parent.animate(draw);

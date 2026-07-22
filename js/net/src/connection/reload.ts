@@ -1,65 +1,77 @@
 import { Effect, type Getter, Signal } from "@moq/signals";
+import * as Announce from "../announced.ts";
 import type * as Path from "../path.ts";
 import { empty as emptyPath } from "../path.ts";
-import { type ConnectProps, connect, type WebSocketOptions } from "./connect.ts";
+import { type ConnectProps, connect, type WebSocketOptions, type WebTransportProps } from "./connect.ts";
 import type { Established } from "./established.ts";
 
+/** Exponential backoff settings for {@link Reload}'s reconnect loop. */
 export type ReloadDelay = {
-	// The delay in milliseconds before reconnecting.
-	// default: 1000
+	/** The delay in milliseconds before reconnecting (default: 1000). */
 	initial: DOMHighResTimeStamp;
 
-	// The multiplier for the delay.
-	// default: 2
+	/** The multiplier for the delay (default: 2). */
 	multiplier: number;
 
-	// The maximum delay in milliseconds.
-	// default: 30000
+	/** The maximum delay in milliseconds (default: 30000). */
 	max: DOMHighResTimeStamp;
 
-	// Maximum total time in milliseconds to spend retrying before giving up.
-	// Resets after each successful connection. Set to 0 for unlimited retries.
-	// default: 300000 (5 minutes)
+	/**
+	 * Maximum total time in milliseconds to spend retrying before giving up (default:
+	 * 300000, 5 minutes). Resets after each successful connection. Set to 0 for
+	 * unlimited retries.
+	 */
 	timeout?: DOMHighResTimeStamp;
 };
 
+/** Options for {@link Reload}: connect options plus reactive URL/enabled signals and backoff tuning. */
 export type ReloadProps = ConnectProps & {
-	// Whether to reload the connection when it disconnects.
-	// default: true
+	/** Whether to reload the connection when it disconnects (default: true). */
 	enabled?: boolean | Signal<boolean>;
 
-	// The URL of the relay server.
+	/** The URL of the relay server. */
 	url?: URL | Signal<URL | undefined>;
 
-	// The delay for the reload.
+	/** Backoff settings for the reconnect loop. */
 	delay?: ReloadDelay;
 };
 
+/** Current state of a {@link Reload} connection. */
 export type ReloadStatus = "connecting" | "connected" | "disconnected";
 
+/** Maintains a MoQ connection, reconnecting with exponential backoff when it drops. */
 export class Reload {
+	/** Relay URL to connect to; updating it triggers a reconnect. */
 	url: Signal<URL | undefined>;
+
+	/** Whether reconnecting is active. */
 	enabled: Signal<boolean>;
 
+	/** Current connection status. */
 	status = new Signal<ReloadStatus>("disconnected");
+
+	/** The currently established session, or undefined while disconnected. */
 	established = new Signal<Established | undefined>(undefined);
 
-	// All actively announced broadcast paths, updated reactively.
-	#announced = new Signal<Set<Path.Valid>>(new Set());
-	readonly announced: Getter<Set<Path.Valid>> = this.#announced;
+	/** WebTransport options applied to each connection attempt (not reactive). */
+	webtransport?: WebTransportProps;
 
-	// WebTransport options (not reactive).
-	webtransport?: WebTransportOptions;
-
-	// WebSocket (fallback) options (not reactive).
+	/** WebSocket fallback options applied to each connection attempt (not reactive). */
 	websocket: WebSocketOptions | undefined;
 
-	// Not reactive, but can be updated.
+	/**
+	 * Whether the relay supports broadcast discovery, applied to each connection attempt (not
+	 * reactive). Undefined defers to the default for the URL. See {@link Established.discovery}.
+	 */
+	discovery?: boolean;
+
+	/** Backoff settings for the reconnect loop. */
 	delay: ReloadDelay;
 
-	signals = new Effect();
+	/** The reactive effect scope driving the connect loop; closed by {@link Reload.close}. */
+	#signals = new Effect();
 
-	// Resolves when the reconnect loop stops (close() or timeout).
+	/** Resolves when the reconnect loop stops via {@link Reload.close} or the retry timeout. */
 	closed: Promise<void>;
 	#closedResolve!: () => void;
 	#closedReject!: (err: Error) => void;
@@ -72,12 +84,19 @@ export class Reload {
 	// Increased by 1 each time to trigger a reload.
 	#tick = new Signal(0);
 
+	// True after the browser freezes or hides the page until it visibly resumes.
+	#suspended = new Signal(false);
+
+	// Use the serialized URL as the reactive connection key. URL objects use identity
+	// equality, but replacing one with an equivalent instance should not reconnect.
+	#url: Getter<string | undefined>;
 	constructor(props?: ReloadProps) {
 		this.url = Signal.from(props?.url);
 		this.enabled = Signal.from(props?.enabled ?? false);
 		this.delay = props?.delay ?? { initial: 1000, multiplier: 2, max: 30000 };
 		this.webtransport = props?.webtransport;
 		this.websocket = props?.websocket;
+		this.discovery = props?.discovery;
 
 		this.#delay = this.delay.initial;
 
@@ -86,26 +105,41 @@ export class Reload {
 			this.#closedReject = reject;
 		});
 
+		if (typeof window !== "undefined" && typeof document !== "undefined") {
+			this.#signals.event(window, "pagehide", () => this.#suspended.set(true));
+			this.#signals.event(window, "pageshow", () => this.#suspended.set(false));
+			this.#signals.event(window, "unload", () => this.#suspended.set(true));
+			this.#signals.event(document, "visibilitychange", () => {
+				if (!document.hidden) this.#suspended.set(false);
+			});
+		}
+
+		this.#url = this.#signals.computed((effect) => effect.get(this.url)?.href);
 		// Create a reactive root so cleanup is easier.
-		this.signals.run(this.#connect.bind(this));
-		this.signals.run(this.#runAnnounced.bind(this));
+		this.#signals.run(this.#connect.bind(this));
 	}
 
 	#connect(effect: Effect): void {
 		// Will retry when the tick changes.
 		effect.get(this.#tick);
 
+		const suspended = effect.get(this.#suspended);
 		const enabled = effect.get(this.enabled);
-		if (!enabled) return;
+		if (!enabled || suspended) return;
 
-		const url = effect.get(this.url);
-		if (!url) return;
+		const href = effect.get(this.#url);
+		if (!href) return;
+		const url = new URL(href);
 
 		effect.set(this.status, "connecting", "disconnected");
 
 		effect.spawn(async () => {
 			try {
-				const pending = connect(url, { websocket: this.websocket, webtransport: this.webtransport });
+				const pending = connect(url, {
+					websocket: this.websocket,
+					webtransport: this.webtransport,
+					discovery: this.discovery,
+				});
 
 				const connection = await Promise.race([effect.cancel, pending]);
 				if (!connection) {
@@ -147,46 +181,72 @@ export class Reload {
 		});
 	}
 
-	#runAnnounced(effect: Effect): void {
-		this.#announced.set(new Set());
+	/**
+	 * Subscribe to broadcast announcements under an optional prefix, spanning reconnects.
+	 *
+	 * The same {@link Announce.Consumer} stream as {@link Established.announced}, but everything active
+	 * is retracted (an `active: false` update) whenever the connection drops and re-announced on
+	 * reconnect, so a consumer draining `next()` never clings to a dead route across a reconnect.
+	 *
+	 * Stays empty while the relay lacks {@link Established.discovery}.
+	 */
+	announced(prefix: Path.Valid = emptyPath()): Announce.Consumer {
+		const producer = new Announce.Producer(prefix);
+		const consumer = producer.consume();
 
-		const conn = effect.get(this.established);
-		if (!conn) return;
-
-		effect.cleanup(() => this.#announced.set(new Set()));
-
-		// Cloudflare's relay does not yet support SUBSCRIBE_NAMESPACE, so
-		// skip announce subscriptions entirely for those hosts.
-		if (conn.url.hostname.endsWith("mediaoverquic.com")) {
-			return;
-		}
-
-		const announced = conn.announced(emptyPath());
-		effect.cleanup(() => announced.close());
-
-		effect.spawn(async () => {
-			try {
-				for (;;) {
-					const entry = await Promise.race([effect.cancel, announced.next()]);
-					if (!entry) break;
-
-					this.#announced.mutate((active) => {
-						if (entry.active) {
-							active.add(entry.path);
-						} else {
-							active.delete(entry.path);
-						}
-					});
-				}
-			} catch (err) {
-				this.#announced.set(new Set());
-				throw err;
-			}
+		// Closing the consumer closes the shared state, so stop appending after that.
+		let closed = false;
+		void consumer.closed.then(() => {
+			closed = true;
 		});
+
+		const pump = new Effect();
+		pump.run((effect) => {
+			const conn = effect.get(this.established);
+			if (!conn) return;
+
+			// Without discovery the upstream announce stream never yields, so leave the
+			// consumer empty rather than opening a subscription that can't be answered.
+			if (!conn.discovery) return;
+
+			const upstream = conn.announced(prefix);
+			effect.cleanup(() => upstream.close());
+
+			// Track what this connection announced so we can retract it if the connection drops.
+			const active = new Set<Path.Valid>();
+
+			effect.spawn(async () => {
+				try {
+					for (;;) {
+						const entry = await Promise.race([effect.cancel, upstream.next()]);
+						if (!entry) break;
+						if (entry.active) active.add(entry.path);
+						else active.delete(entry.path);
+						producer.append(entry);
+					}
+				} catch {
+					// A dropped connection resets the announce stream; the retractions below cover it.
+				} finally {
+					// Retract everything from the connection that just went away, so a per-broadcast
+					// watcher tears down instead of clinging to the dead route.
+					if (!closed) {
+						for (const path of active) {
+							producer.append({ path, active: false });
+						}
+					}
+				}
+			});
+		});
+
+		this.#signals.cleanup(() => pump.close());
+		void consumer.closed.then(() => pump.close());
+
+		return consumer;
 	}
 
+	/** Stop reconnecting, close the current connection, and resolve {@link Reload.closed}. */
 	close() {
-		this.signals.close();
+		this.#signals.close();
 		this.#closedResolve();
 	}
 }

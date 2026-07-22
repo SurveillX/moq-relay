@@ -1,3 +1,11 @@
+/**
+ * Reactive, safe signals: observable values, derived computeds, and effects
+ * that track their dependencies and clean up automatically.
+ *
+ * @module
+ */
+
+/** Cancels a subscription, effect, or other registration when called. */
 export type Dispose = () => void;
 
 type Subscriber<T> = (value: T) => void;
@@ -5,25 +13,45 @@ type Subscriber<T> = (value: T) => void;
 // @ts-ignore - Some environments don't recognize import.meta.env
 const DEV = typeof import.meta.env !== "undefined" && import.meta.env?.MODE !== "production";
 
-// Symbol to identify Signal instances across different package versions
+// Symbols to identify our instances across different package versions.
+// SIGNAL_BRAND is Signal only (it implies a write side); GETTER_BRAND is every readable we ship.
 const SIGNAL_BRAND = Symbol.for("@moq/signals");
+const GETTER_BRAND = Symbol.for("@moq/signals.getter");
 
+function branded(value: unknown, brand: symbol): boolean {
+	return typeof value === "object" && value !== null && brand in value;
+}
+
+/** Read side of a signal: peek the current value and subscribe to changes. */
 export interface Getter<T> {
-	// Get the current value.
+	/** Returns the current value without subscribing. */
 	peek(): T;
 
-	// Receive a notification once when the value changes.
+	/** Resolves with the value the next time it changes. */
+	changed(): Promise<T>;
+	/** Calls `fn` once the next time the value changes. Returns a function to cancel. */
 	changed(fn: Subscriber<T>): Dispose;
 
-	// Receive a notification each time the value changes.
+	/** Calls `fn` every time the value changes. */
 	subscribe(fn: Subscriber<T>): Dispose;
 }
 
+/** Write side of a signal: replace or transform the current value. */
 export interface Setter<T> {
-	set(value: T | ((prev: T) => T)): void;
+	/** Replaces the value. A function is stored as-is; use {@link update} to transform. */
+	set(value: T): void;
+	/** Transforms the value via a function of the previous value. */
 	update(fn: (prev: T) => T): void;
 }
 
+/**
+ * The read side of a {@link Once}: observe it reactively ({@link Getter}, `undefined` while
+ * pending) or await it ({@link PromiseLike}, resolves with the settled value, immediately if it
+ * already settled). Expose this to callers so they can peek/observe/await but not settle it.
+ */
+export interface GetPromise<T> extends Getter<T | undefined>, PromiseLike<T> {}
+
+/** A mutable observable value. Writes are coalesced per microtask and only notify subscribers when the value actually changes. */
 export class Signal<T> implements Getter<T>, Setter<T> {
 	#value: T;
 
@@ -36,32 +64,33 @@ export class Signal<T> implements Getter<T>, Setter<T> {
 	#hasCapturedOldValue = false;
 	#forceNotify = false;
 
-	// Brand to identify this as a Signal across package instances
+	// Brands to identify this as a Signal (and a readable) across package instances.
 	readonly [SIGNAL_BRAND] = true;
+	readonly [GETTER_BRAND] = true;
 
 	constructor(value: T) {
 		this.#value = value;
 	}
 
+	/** Returns the value if it's already a Signal, otherwise wraps it in a new Signal. */
 	static from<T>(value: T | Signal<T>): Signal<T> {
 		// Use brand check instead of instanceof to work across package instances
-		if (typeof value === "object" && value !== null && SIGNAL_BRAND in value) {
+		if (branded(value, SIGNAL_BRAND)) {
 			return value as Signal<T>;
 		}
-		return new Signal(value);
+		return new Signal(value as T);
 	}
 
-	get(): T {
-		return this.#value;
-	}
-
-	// TODO rename to `get` once we've ported everything
+	/** Returns the current value without subscribing. */
 	peek(): T {
 		return this.#value;
 	}
 
-	// Set the current value, by default notifying subscribers if the value is different.
-	// If notify is undefined, we'll check if the value has changed after the microtask.
+	/**
+	 * Sets the current value, notifying subscribers if it changed.
+	 * Pass `notify` true to always notify or false to never notify.
+	 * A function is stored as the value; use {@link update} to transform instead.
+	 */
 	set(value: T, notify?: boolean): void {
 		// Capture old value before the first set in this microtask.
 		if (!this.#hasCapturedOldValue) {
@@ -126,21 +155,23 @@ export class Signal<T> implements Getter<T>, Setter<T> {
 		}
 	}
 
-	// Mutate the current value and notify subscribers unless notify is false.
-	// Unlike set, we can't use a dequal check because the function may mutate the value.
+	/** Sets the value to the result of `fn(prev)`, notifying subscribers unless `notify` is false. */
 	update(fn: (prev: T) => T, notify = true): void {
 		const value = fn(this.#value);
 		this.set(value, notify);
 	}
 
-	// Mutate the current value and notify subscribers unless notify is false.
+	/**
+	 * Mutates the current value in place via `fn`, returning `fn`'s result and
+	 * notifying subscribers unless `notify` is false.
+	 */
 	mutate<R>(fn: (value: T) => R, notify = true): R {
 		const r = fn(this.#value);
 		this.set(this.#value, notify);
 		return r;
 	}
 
-	// Receive a notification each time the value changes.
+	/** Calls `fn` every time the value changes. Returns a function to unsubscribe. */
 	subscribe(fn: Subscriber<T>): Dispose {
 		this.#subscribers.add(fn);
 		if (DEV && this.#subscribers.size >= 100 && Number.isInteger(Math.log10(this.#subscribers.size))) {
@@ -149,28 +180,29 @@ export class Signal<T> implements Getter<T>, Setter<T> {
 		return () => this.#subscribers.delete(fn);
 	}
 
-	// Receive a notification when the value changes.
-	changed(fn: (value: T) => void): Dispose {
-		this.#changed.add(fn);
-		return () => this.#changed.delete(fn);
-	}
-
-	// Resolve with the next value, once the signal changes.
-	next(): Promise<T> {
+	/** Resolves with the value the next time it changes, or calls `fn` once on the next change. */
+	changed(): Promise<T>;
+	changed(fn: Subscriber<T>): Dispose;
+	changed(fn?: Subscriber<T>): Promise<T> | Dispose {
+		if (fn) {
+			this.#changed.add(fn);
+			return () => this.#changed.delete(fn);
+		}
 		return new Promise<T>((resolve) => {
-			this.changed(resolve);
+			this.#changed.add(resolve);
 		});
 	}
 
-	// Receive a notification when the value changes AND with the initial value.
+	/** Calls `fn` with the current value now, and again every time it changes. */
 	watch(fn: Subscriber<T>): Dispose {
 		const dispose = this.subscribe(fn);
 		queueMicrotask(() => fn(this.#value));
 		return dispose;
 	}
 
+	/** Resolves with the next value from whichever of the given readables changes first. */
 	static async race<T extends readonly unknown[]>(
-		...sigs: { [K in keyof T]: Signal<T[K]> }
+		...sigs: { [K in keyof T]: Getter<T[K]> }
 	): Promise<Awaited<T[number]>> {
 		const dispose: Dispose[] = [];
 
@@ -185,13 +217,150 @@ export class Signal<T> implements Getter<T>, Setter<T> {
 	}
 }
 
+/**
+ * A value that settles exactly once, then never changes: both **observable** and **awaitable**.
+ *
+ * Read it reactively like a {@link Getter} (`peek()` / `changed()` / `subscribe()` / `effect.get()`;
+ * the value is `undefined` while pending), or await it like a promise (`await once` /
+ * `once.then(...)` resolve with the settled value, immediately if it already settled). This is the
+ * shape of terminal state such as "closed": one handle serves the sync check, the reactive
+ * short-circuit, and the `await`.
+ *
+ * Settle it with {@link set} exactly once; a second call throws. Expose it to callers as
+ * {@link GetPromise} so they can observe/await but not settle it. `T` must not include `undefined`
+ * (that is the pending sentinel).
+ */
+export class Once<T> implements GetPromise<T> {
+	#signal = new Signal<T | undefined>(undefined);
+
+	// Brand to identify this as a readable across package instances.
+	readonly [GETTER_BRAND] = true;
+
+	/** Settle the value. Throws if it has already settled. */
+	set(value: T): void {
+		if (this.#signal.peek() !== undefined) {
+			throw new Error("Once has already settled");
+		}
+		this.#signal.set(value);
+	}
+
+	/** The settled value, or `undefined` while still pending. */
+	peek(): T | undefined {
+		return this.#signal.peek();
+	}
+
+	/** Resolves when it settles, or calls `fn` once when it settles. */
+	changed(): Promise<T | undefined>;
+	changed(fn: (value: T | undefined) => void): Dispose;
+	changed(fn?: (value: T | undefined) => void): Promise<T | undefined> | Dispose {
+		return fn ? this.#signal.changed(fn) : this.#signal.changed();
+	}
+
+	/** Calls `fn` when it settles (fires at most once). Returns a function to unsubscribe. */
+	subscribe(fn: (value: T | undefined) => void): Dispose {
+		return this.#signal.subscribe(fn);
+	}
+
+	/** Resolves with the settled value, immediately if it already settled. Never rejects on its own. */
+	// biome-ignore lint/suspicious/noThenProperty: Once is intentionally awaitable (thenable).
+	then<R1 = T, R2 = never>(
+		onFulfilled?: ((value: T) => R1 | PromiseLike<R1>) | null,
+		onRejected?: ((reason: unknown) => R2 | PromiseLike<R2>) | null,
+	): PromiseLike<R1 | R2> {
+		const current = this.#signal.peek();
+		const settled: Promise<T> =
+			current !== undefined ? Promise.resolve(current) : this.#signal.changed().then((value) => value as T);
+		return settled.then(onFulfilled, onRejected);
+	}
+}
+
 type SetterType<S> = S extends Setter<infer T> ? T : never;
-type GetterType<G> = G extends Getter<infer T> ? T : never;
+
+/** The value type a {@link Getter} yields, e.g. `number` for `Getter<number>`. */
+export type GetterType<G> = G extends Getter<infer T> ? T : never;
+
+/** A record of named signals, used to group a component's `in` or `out` signals. */
+export type SignalMap = Record<string, Getter<unknown>>;
+
+/**
+ * A read-only view over a {@link SignalMap}: every entry collapses to its {@link Getter} and the
+ * record itself is readonly. Consumers can peek/subscribe but can neither call `set()`
+ * nor swap a signal out, so the owning component keeps sole write access.
+ */
+export type Readonlys<T extends SignalMap> = {
+	readonly [K in keyof T]: Getter<GetterType<T[K]>>;
+};
+
+/**
+ * Re-types a record of Signals as read-only {@link Getter}s. This is the identity function at
+ * runtime; it only narrows the static type. Keep the original (writable) reference
+ * private for the component to set, and expose the result as the public `out`.
+ *
+ * ```ts
+ * readonly #out = { status: new Signal("offline") };
+ * readonly out = readonlys(this.#out); // status is now a Getter to callers
+ * ```
+ */
+export function readonlys<T extends SignalMap>(signals: T): Readonlys<T> {
+	return signals as unknown as Readonlys<T>;
+}
+
+/**
+ * A value or an existing readable for it: the argument form accepted by {@link getter}
+ * and, per-field, by {@link Inputs}. Mirrors the `T | Signal<T>` shape of {@link Signal.from}.
+ *
+ * The readable must be a `Signal`, `Computed`, or `Once`; {@link getter} throws on any other
+ * implementation of {@link Getter} because it can't subscribe to one without leaking.
+ */
+export type GetterInit<T> = T | Getter<T>;
+
+/**
+ * Builds a read-only {@link Getter} from a value or an existing readable. The read-only
+ * counterpart to {@link Signal.from}: a `Signal`, `Computed`, or `Once` (including the result
+ * of {@link readonlys}) is reused as-is, so one component's `out` can be wired straight into
+ * another's `in`; any other value is wrapped in a fresh `Signal`.
+ *
+ * Throws on a readable this package didn't create, since wrapping it would silently
+ * freeze it into a constant.
+ */
+export function getter<T>(value: GetterInit<T>): Getter<T> {
+	if (branded(value, GETTER_BRAND) || branded(value, SIGNAL_BRAND)) {
+		return value as Getter<T>;
+	}
+
+	if (getterShaped(value)) {
+		throw new Error("getter() requires a Signal, Computed, or Once; a foreign readable would become a constant");
+	}
+
+	return new Signal(value as T);
+}
+
+// A readable we didn't make: it would be wrapped as a value and never update, so callers get an
+// error instead of a component that silently never sees a change.
+function getterShaped(value: unknown): boolean {
+	if (typeof value !== "object" || value === null) return false;
+	const maybe = value as Partial<Getter<unknown>>;
+	return (
+		typeof maybe.peek === "function" && typeof maybe.subscribe === "function" && typeof maybe.changed === "function"
+	);
+}
+
+/**
+ * Derives a component's constructor argument from its `in` map: every entry becomes
+ * optional and accepts a raw value, a Signal, or another component's `out` Getter
+ * (the {@link getter} contract). Removes the hand-written, drift-prone argument interface.
+ */
+export type Inputs<I extends SignalMap> = { [K in keyof I]?: GetterInit<GetterType<I[K]>> };
 
 // Excludes common falsy values from a type
 type Falsy = false | 0 | "" | null | undefined;
 type Truthy<T> = Exclude<T, Falsy>;
 
+/**
+ * Runs a function that reads signals via `effect.get(...)` and reruns whenever
+ * any of them change. Registers cleanup, timers, and event listeners that are
+ * torn down automatically on each rerun and when the effect is closed.
+ */
 // TODO Make this a single instance of an Effect, so close() can work correctly from async code.
 export class Effect {
 	// Sanity check to make sure roots are being disposed on dev.
@@ -212,7 +381,7 @@ export class Effect {
 
 	#abort: AbortController = new AbortController();
 
-	// If a function is provided, it will be run with the effect as an argument.
+	/** If a function is provided, it runs immediately and reruns whenever a tracked signal changes. */
 	constructor(fn?: (effect: Effect) => void) {
 		if (DEV) {
 			const debug = new Error("created here:").stack ?? "No stack";
@@ -308,7 +477,7 @@ export class Effect {
 		}
 	}
 
-	// Get the current value of a signal, monitoring it for changes (via ===) and rerunning on change.
+	/** Reads a signal and tracks it, rerunning the effect whenever it changes. */
 	get<T>(signal: Getter<T>): T {
 		if (this.#dispose === undefined) {
 			if (DEV) {
@@ -327,9 +496,10 @@ export class Effect {
 		return value;
 	}
 
-	// Temporarily set the value of a signal, unsetting it on cleanup.
-	// The last argument is the cleanup value, set before the effect is rerun.
-	// It's optional only if T can be undefined.
+	/**
+	 * Sets a signal for the duration of this run, restoring `cleanup` on rerun or close.
+	 * The cleanup value is optional only when the signal type includes `undefined`.
+	 */
 	set<S extends Setter<unknown>>(
 		signal: S,
 		value: SetterType<S>,
@@ -348,8 +518,9 @@ export class Effect {
 		this.cleanup(() => signal.set(cleanupValue));
 	}
 
-	// Spawn an async effect that blocks the effect being reloaded until it completes.
-	// Use this.cancel if you need to detect when the effect is reloading to terminate.
+	/**
+	 * Runs an async task. The effect will not rerun until the task's promise settles.
+	 */
 	// TODO: Add effect for another layer of nesting
 	spawn(fn: () => Promise<void>) {
 		const promise = fn().catch((error) => {
@@ -367,7 +538,7 @@ export class Effect {
 		this.#async.push(promise);
 	}
 
-	// Run the function after the given delay in milliseconds UNLESS the effect is cleaned up first.
+	/** Runs `fn` after `ms` milliseconds, unless the effect reruns or closes first. */
 	timer(fn: () => void, ms: DOMHighResTimeStamp) {
 		if (this.#dispose === undefined) {
 			if (DEV) {
@@ -384,7 +555,7 @@ export class Effect {
 		this.cleanup(() => timeout && clearTimeout(timeout));
 	}
 
-	// Run the function, and clean up the nested effect after the given delay.
+	/** Runs `fn` as a nested effect, then closes that effect after `ms` milliseconds. */
 	timeout(fn: (effect: Effect) => void, ms: DOMHighResTimeStamp) {
 		if (this.#dispose === undefined) {
 			if (DEV) {
@@ -408,7 +579,7 @@ export class Effect {
 		});
 	}
 
-	// Run the callback on the next animation frame, unless the effect is cleaned up first.
+	/** Runs `fn` on the next animation frame, unless the effect reruns or closes first. */
 	animate(fn: (now: DOMHighResTimeStamp) => void) {
 		if (this.#dispose === undefined) {
 			if (DEV) {
@@ -426,6 +597,7 @@ export class Effect {
 		});
 	}
 
+	/** Runs `fn` every `ms` milliseconds until the effect reruns or closes. */
 	interval(fn: () => void, ms: DOMHighResTimeStamp) {
 		if (this.#dispose === undefined) {
 			if (DEV) {
@@ -440,33 +612,42 @@ export class Effect {
 		this.cleanup(() => clearInterval(interval));
 	}
 
-	// Create a nested effect that can be rerun independently.
-	run(fn: (effect: Effect) => void) {
+	/**
+	 * Creates a nested effect that reruns independently and is closed with its parent.
+	 *
+	 * Returns a disposer that closes the child early and releases it from the parent, so a long-lived
+	 * effect spawning a child per event (e.g. one per accepted subscription) doesn't accumulate dead
+	 * scopes until it finally reruns or closes.
+	 */
+	run(fn: (effect: Effect) => void): Dispose {
 		if (this.#dispose === undefined) {
 			if (DEV) {
-				console.warn("Effect.nested called when closed, ignoring");
+				console.warn("Effect.run called when closed, ignoring");
 			}
-			return;
+			return () => {};
 		}
 
 		const effect = new Effect(fn);
-		this.#dispose.push(() => effect.close());
+		const dispose = () => effect.close();
+		this.#dispose.push(dispose);
+
+		return () => {
+			effect.close();
+			// Drop our disposer from the parent so repeated run()/dispose() cycles don't pile up.
+			const disposers = this.#dispose;
+			const index = disposers?.indexOf(dispose) ?? -1;
+			if (index !== -1) disposers?.splice(index, 1);
+		};
 	}
 
-	// Backwards compatibility with the old name.
-	effect(fn: (effect: Effect) => void) {
-		return this.run(fn);
-	}
-
-	// Create a derived signal whose lifetime is tied to this effect.
-	// It's closed (unsubscribing from its dependencies) when the effect reruns or closes.
+	/** Creates a derived signal scoped to this effect, closed when the effect reruns or closes. */
 	computed<T>(fn: (effect: Effect) => T): Computed<T> {
 		const computed = new Computed(fn);
 		this.cleanup(() => computed.close());
 		return computed;
 	}
 
-	// Get the values of multiple signals, returning undefined if any are falsy.
+	/** Reads and tracks several signals, returning their values or `undefined` if any is falsy. */
 	getAll<S extends readonly Getter<unknown>[]>(
 		signals: [...S],
 	): { [K in keyof S]: Truthy<GetterType<S[K]>> } | undefined {
@@ -479,7 +660,7 @@ export class Effect {
 		return values as { [K in keyof S]: Truthy<GetterType<S[K]>> };
 	}
 
-	// A helper to call a function when a signal changes.
+	/** Runs `fn` with the signal's value now and again whenever it changes, scoped to this effect. */
 	subscribe<T>(signal: Getter<T>, fn: (value: T) => void) {
 		if (this.#dispose === undefined) {
 			if (DEV) {
@@ -495,7 +676,7 @@ export class Effect {
 		});
 	}
 
-	// Add an event listener that automatically removes on cleanup.
+	/** Adds an event listener that is removed automatically when the effect reruns or closes. */
 	event<K extends keyof HTMLElementEventMap>(
 		target: HTMLElement,
 		type: K,
@@ -580,7 +761,7 @@ export class Effect {
 		target.addEventListener(type, listener, merged);
 	}
 
-	// Register a cleanup function.
+	/** Registers a function to run when the effect reruns or closes. */
 	cleanup(fn: Dispose): void {
 		if (this.#dispose === undefined) {
 			if (DEV) {
@@ -594,6 +775,7 @@ export class Effect {
 		this.#dispose.push(fn);
 	}
 
+	/** Stops the effect permanently, running all cleanup and unsubscribing from every signal. */
 	close(): void {
 		if (this.#dispose === undefined) {
 			return;
@@ -616,57 +798,74 @@ export class Effect {
 		}
 	}
 
+	/** Resolves when the effect is closed. */
 	get closed(): Promise<void> {
 		return this.#closed.promise;
 	}
 
+	/** Resolves when the current run is about to be torn down, by a rerun or close. */
 	get cancel(): Promise<void> {
 		return this.#stopped.promise;
 	}
 
+	/** An AbortSignal that fires when the current run is torn down. */
 	get abort(): AbortSignal {
 		return this.#abort.signal;
 	}
 
+	/** Copies `src` into `dst` and keeps `dst` in sync as `src` changes. */
 	proxy<T>(dst: Setter<T>, src: Getter<T>): void {
 		this.subscribe(src, (value) => dst.update(() => value));
 	}
 }
 
-// A read-only signal derived from other signals.
-//
-// The compute function reads its dependencies with `effect.get(...)`, exactly
-// like an effect, and returns the derived value. It reruns whenever a
-// dependency changes. Keep it pure: derive a value, don't perform side effects.
-//
-// Like every signal, updates are asynchronous: the value is `undefined` until
-// the first run completes (and after close()), and recomputes propagate on a
-// microtask. Read it inside an effect and handle the `undefined` case, the same
-// way you would any other signal that starts empty.
+/**
+ * A read-only signal derived from other signals.
+ *
+ * The compute function reads its dependencies with `effect.get(...)`, exactly
+ * like an effect, and returns the derived value. It reruns whenever a
+ * dependency changes. Keep it pure: derive a value, don't perform side effects.
+ *
+ * Like every signal, updates are asynchronous: the value is `undefined` until
+ * the first run completes (and after close()), and recomputes propagate on a
+ * microtask. Read it inside an effect and handle the `undefined` case, the same
+ * way you would any other signal that starts empty.
+ */
 export class Computed<T> implements Getter<T | undefined> {
 	#signal = new Signal<T | undefined>(undefined);
 	#effect: Effect;
 
+	// Brand to identify this as a readable across package instances.
+	readonly [GETTER_BRAND] = true;
+
+	/** Creates a computed that derives its value from `fn`, rerunning when dependencies change. */
 	constructor(fn: (effect: Effect) => T) {
 		this.#effect = new Effect((effect) => {
 			this.#signal.set(fn(effect));
 		});
 	}
 
+	/** Returns the current derived value without subscribing (`undefined` until the first run). */
 	peek(): T | undefined {
 		return this.#signal.peek();
 	}
 
-	changed(fn: Subscriber<T | undefined>): Dispose {
-		return this.#signal.changed(fn);
+	/** Resolves the next time the derived value changes, or calls `fn` once on the next change. */
+	changed(): Promise<T | undefined>;
+	changed(fn: Subscriber<T | undefined>): Dispose;
+	changed(fn?: Subscriber<T | undefined>): Promise<T | undefined> | Dispose {
+		return fn ? this.#signal.changed(fn) : this.#signal.changed();
 	}
 
+	/** Calls `fn` every time the derived value changes. */
 	subscribe(fn: Subscriber<T | undefined>): Dispose {
 		return this.#signal.subscribe(fn);
 	}
 
-	// Stop recomputing and tracking dependencies. Required for standalone computeds;
-	// an effect.computed() is closed automatically with its parent effect.
+	/**
+	 * Stops recomputing and tracking dependencies. Required for standalone computeds;
+	 * an `effect.computed()` is closed automatically with its parent effect.
+	 */
 	close(): void {
 		this.#effect.close();
 	}

@@ -15,7 +15,7 @@ The reference implementation. Used by every server-side tool and by the FFI core
 
 - [`moq-net`](/lib/rs/crate/moq-net) - Real-time pub/sub
 - [`hang`](/lib/rs/crate/hang) - Media catalog and container
-- [`moq-mux`](/lib/rs/crate/moq-mux) - fMP4/CMAF/HLS import
+- [`moq-mux`](/lib/rs/crate/moq-mux) - fMP4/CMAF, MPEG-TS, and FLV import/export
 - [`moq-native`](/lib/rs/crate/moq-native) - QUIC endpoint helpers
 - [...and more](/lib/rs/)
 
@@ -31,11 +31,11 @@ The browser implementation. Uses [WebTransport](/concept/layer/web-transport), W
 
 ## FFI bindings
 
-These all link against the same [Rust core](https://crates.io/crates/moq-ffi) (via [`libmoq`](/lib/rs/crate/libmoq) + UniFFI) and present an idiomatic API in their host language.
+Python, Kotlin, Swift, and Go are generated from the same [`moq-ffi`](https://crates.io/crates/moq-ffi) UniFFI crate, then wrapped with idiomatic APIs. C uses the separate [`libmoq`](/lib/rs/crate/libmoq) ABI over the same Rust protocol and media crates.
 
 ### [C](/lib/c/)
 
-Raw C bindings via `libmoq`. The lowest-level entry point and the foundation for every other binding listed below.
+Raw C bindings via `libmoq`. It is independent of the UniFFI-generated bindings.
 
 ### [Python](/lib/py/)
 
@@ -47,20 +47,20 @@ Coroutines and `Flow` for Android and the JVM. Published as `dev.moq:moq` on Mav
 
 ### [Swift](/lib/swift/)
 
-Async sequences and structured concurrency for iOS, iPadOS, and macOS. Distributed via Swift Package Manager.
+Async sequences and structured concurrency for iOS, iPadOS, and macOS. Distributed via Swift Package Manager as [`Moq`](https://github.com/moq-dev/moq-swift) (the ergonomic wrapper, versioned independently), atop the raw [`MoqFFI`](https://github.com/moq-dev/moq-swift-ffi) bindings.
 
 ### [Go](/lib/go/)
 
-cgo bindings with prebuilt static libraries per platform. Resolved via `go get github.com/moq-dev/moq-go`.
+cgo bindings with prebuilt static libraries per platform. Published as [`github.com/moq-dev/moq-go`](https://github.com/moq-dev/moq-go) (the ergonomic wrapper, imported as `moq`), atop the raw [`github.com/moq-dev/moq-go-ffi`](https://github.com/moq-dev/moq-go-ffi) bindings.
 
 ## Picking a language
 
-- **Server, CLI, or anything native** &rarr; [Rust](/lib/rs/)
-- **Web browser or Node/Bun/Deno** &rarr; [TypeScript](/lib/js/)
-- **iOS / macOS app** &rarr; [Swift](/lib/swift/)
-- **Android app or JVM service** &rarr; [Kotlin](/lib/kt/)
-- **Scripts, ML pipelines, prototypes** &rarr; [Python](/lib/py/)
-- **Go service or tooling** &rarr; [Go](/lib/go/)
-- **Anything else with a C ABI** &rarr; [C](/lib/c/)
+- **Server, CLI, or anything native** → [Rust](/lib/rs/)
+- **Web browser or Node/Bun/Deno** → [TypeScript](/lib/js/)
+- **iOS / macOS app** → [Swift](/lib/swift/)
+- **Android app or JVM service** → [Kotlin](/lib/kt/)
+- **Scripts, ML pipelines, prototypes** → [Python](/lib/py/)
+- **Go service or tooling** → [Go](/lib/go/)
+- **Anything else with a C ABI** → [C](/lib/c/)
 
-All FFI bindings expose the same protocol surface as the Rust core, so a publisher in Python can be consumed by a Swift subscriber, etc.
+Every binding uses the same wire protocol, so a publisher in Python can be consumed by a Swift subscriber.

@@ -1,9 +1,11 @@
 use std::str::FromStr;
 use std::task::Poll;
 
-use anyhow::Context;
 use base64::Engine;
 use hang::catalog::{AudioCodec, AudioConfig, Container, VideoCodec, VideoConfig};
+
+use crate::Result;
+use crate::catalog::msf::Error;
 
 /// A consumer for the MSF catalog track.
 ///
@@ -12,20 +14,20 @@ use hang::catalog::{AudioCodec, AudioConfig, Container, VideoCodec, VideoConfig}
 /// so the rest of the pipeline only deals with hang types.
 pub struct Consumer {
 	/// Access to the underlying track consumer.
-	pub track: moq_net::TrackConsumer,
-	group: Option<moq_net::GroupConsumer>,
+	pub track: moq_net::track::Subscriber,
+	group: Option<moq_net::group::Consumer>,
 }
 
 impl Consumer {
 	/// Create a new MSF catalog consumer from a MoQ track consumer.
 	///
 	/// The track is expected to carry MSF catalog payloads (track name [`moq_msf::DEFAULT_NAME`]).
-	pub fn new(track: moq_net::TrackConsumer) -> Self {
+	pub fn new(track: moq_net::track::Subscriber) -> Self {
 		Self { track, group: None }
 	}
 
 	/// Poll for the next catalog update, returned as a [`hang::Catalog`].
-	pub fn poll_next(&mut self, waiter: &kio::Waiter) -> Poll<anyhow::Result<Option<hang::Catalog>>> {
+	pub fn poll_next(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<hang::Catalog>>> {
 		// Drain pending groups, keeping only the newest. Remember whether the track is done
 		// so we can distinguish "more groups may arrive" from "no more groups, ever".
 		let track_finished = loop {
@@ -40,8 +42,14 @@ impl Consumer {
 			match group.poll_read_frame(waiter)? {
 				Poll::Ready(Some(frame)) => {
 					self.group = None;
-					let json = std::str::from_utf8(&frame).context("MSF catalog frame is not valid UTF-8")?;
-					let msf = moq_msf::Catalog::from_str(json).context("failed to parse MSF catalog frame")?;
+					let json = std::str::from_utf8(&frame.payload).map_err(|_| Error::InvalidUtf8)?;
+					let msf = match moq_msf::Catalog::from_str(json) {
+						Ok(msf) => msf,
+						Err(err) => {
+							tracing::warn!(error = %err, "failed to parse MSF catalog frame");
+							return Poll::Ready(Err(Error::ParseFrame.into()));
+						}
+					};
 					let catalog = from_msf(&msf)?;
 					return Poll::Ready(Ok(Some(catalog)));
 				}
@@ -61,13 +69,13 @@ impl Consumer {
 	///
 	/// Waits for the next MSF catalog publication and returns it converted to a
 	/// [`hang::Catalog`]. Returns `None` when the track has ended with no further updates.
-	pub async fn next(&mut self) -> anyhow::Result<Option<hang::Catalog>> {
+	pub async fn next(&mut self) -> Result<Option<hang::Catalog>> {
 		kio::wait(|waiter| self.poll_next(waiter)).await
 	}
 }
 
-impl From<moq_net::TrackConsumer> for Consumer {
-	fn from(inner: moq_net::TrackConsumer) -> Self {
+impl From<moq_net::track::Subscriber> for Consumer {
+	fn from(inner: moq_net::track::Subscriber) -> Self {
 		Self::new(inner)
 	}
 }
@@ -84,9 +92,10 @@ impl From<moq_net::TrackConsumer> for Consumer {
 /// [`Container::Legacy`]. [`moq_msf::Packaging::Cmaf`] requires `init_data` to be present
 /// (base64-encoded ftyp+moov); a missing or malformed init segment is an error.
 ///
-/// Fields with no representation in `hang::Catalog` (`is_live`, `render_group`, `alt_group`,
-/// `max_grp_sap_starting_type`, `max_obj_sap_starting_type`) are dropped.
-pub(crate) fn from_msf(msf: &moq_msf::Catalog) -> anyhow::Result<hang::Catalog> {
+/// Fields with no representation in `hang::Catalog` (`generated_at`, `is_complete`, `is_live`,
+/// `render_group`, `alt_group`, `max_grp_sap_starting_type`, `max_obj_sap_starting_type`) are
+/// dropped.
+pub(crate) fn from_msf(msf: &moq_msf::Catalog) -> Result<hang::Catalog> {
 	let mut catalog = hang::Catalog::default();
 
 	for track in &msf.tracks {
@@ -139,19 +148,13 @@ pub(crate) fn from_msf(msf: &moq_msf::Catalog) -> anyhow::Result<hang::Catalog> 
 /// Returns `Err` when a CMAF track is missing or has malformed `init_data`. This is an
 /// intentional hard error: a CMAF rendition is unusable without its `ftyp+moov` init
 /// segment, and silently skipping it would mask a publisher bug.
-fn container_from_msf(track: &moq_msf::Track) -> anyhow::Result<Option<Container>> {
+fn container_from_msf(track: &moq_msf::Track) -> Result<Option<Container>> {
 	match &track.packaging {
 		// Both LOC and Legacy represent raw payloads without ISO-BMFF boxing.
 		moq_msf::Packaging::Loc | moq_msf::Packaging::Legacy => Ok(Some(Container::Legacy)),
 		moq_msf::Packaging::Cmaf => {
-			let init = decode_init_data(track)?
-				.with_context(|| format!("MSF CMAF track {:?} missing init_data", track.name))?;
-			#[allow(deprecated)]
-			Ok(Some(Container::Cmaf {
-				init,
-				timescale: None,
-				track_id: None,
-			}))
+			let init = decode_init_data(track)?.ok_or_else(|| Error::MissingCmafInit(track.name.clone()))?;
+			Ok(Some(Container::Cmaf { init }))
 		}
 		_ => Ok(None),
 	}
@@ -165,7 +168,7 @@ fn container_from_msf(track: &moq_msf::Track) -> anyhow::Result<Option<Container
 /// For Legacy/LOC tracks the bytes are the codec-specific decoder
 /// description (e.g. an AVCC/HVCC config record or AAC AudioSpecificConfig)
 /// that downstream decoders need to configure their bitstream parsers.
-fn decode_init_data(track: &moq_msf::Track) -> anyhow::Result<Option<bytes::Bytes>> {
+fn decode_init_data(track: &moq_msf::Track) -> Result<Option<bytes::Bytes>> {
 	track
 		.init_data
 		.as_ref()
@@ -173,7 +176,7 @@ fn decode_init_data(track: &moq_msf::Track) -> anyhow::Result<Option<bytes::Byte
 			base64::engine::general_purpose::STANDARD
 				.decode(b64)
 				.map(bytes::Bytes::from)
-				.with_context(|| format!("MSF track {:?} has malformed init_data", track.name))
+				.map_err(|_| Error::MalformedInitData(track.name.clone()).into())
 		})
 		.transpose()
 }
@@ -182,14 +185,14 @@ fn decode_init_data(track: &moq_msf::Track) -> anyhow::Result<Option<bytes::Byte
 ///
 /// CMAF tracks carry their config inside `Container::Cmaf::init`, so this
 /// returns `Ok(None)` for them to avoid duplicating the bytes.
-fn legacy_description(track: &moq_msf::Track) -> anyhow::Result<Option<bytes::Bytes>> {
+fn legacy_description(track: &moq_msf::Track) -> Result<Option<bytes::Bytes>> {
 	match track.packaging {
 		moq_msf::Packaging::Loc | moq_msf::Packaging::Legacy => decode_init_data(track),
 		_ => Ok(None),
 	}
 }
 
-fn video_config_from_msf(track: &moq_msf::Track) -> anyhow::Result<Option<VideoConfig>> {
+fn video_config_from_msf(track: &moq_msf::Track) -> Result<Option<VideoConfig>> {
 	// Unsupported packaging (e.g. MediaTimeline) bubbles up as Ok(None) so the caller can
 	// skip the track with a warning rather than fail the whole catalog.
 	let Some(container) = container_from_msf(track)? else {
@@ -199,11 +202,13 @@ fn video_config_from_msf(track: &moq_msf::Track) -> anyhow::Result<Option<VideoC
 	let codec_str = track
 		.codec
 		.as_deref()
-		.with_context(|| format!("MSF video track {:?} missing codec", track.name))?;
+		.ok_or_else(|| Error::MissingVideoCodec(track.name.clone()))?;
 	// VideoCodec::from_str returns Ok(VideoCodec::Unknown(s)) for codecs it doesn't know,
 	// so this only fails for malformed structured codec strings (avc1.xxx, hvc1.xxx, etc.).
-	let codec = VideoCodec::from_str(codec_str)
-		.with_context(|| format!("MSF video track {:?} has invalid codec {codec_str:?}", track.name))?;
+	let codec = VideoCodec::from_str(codec_str).map_err(|_| Error::InvalidVideoCodec {
+		name: track.name.clone(),
+		codec: codec_str.to_string(),
+	})?;
 
 	let mut config = VideoConfig::new(codec);
 	config.description = legacy_description(track)?;
@@ -212,18 +217,11 @@ fn video_config_from_msf(track: &moq_msf::Track) -> anyhow::Result<Option<VideoC
 	config.bitrate = track.bitrate;
 	config.framerate = track.framerate;
 	config.container = container;
-	// Jitter is converted from f64 milliseconds to integer milliseconds.
-	// Fractional milliseconds are truncated (e.g. 15.5ms becomes 15ms).
-	// This is acceptable for the jitter use case where sub-ms precision
-	// is not meaningful.
-	config.jitter = track
-		.jitter
-		.filter(|v| v.is_finite() && *v >= 0.0)
-		.and_then(|v| moq_net::Time::from_millis(v as u64).ok());
+	config.jitter = track.jitter;
 	Ok(Some(config))
 }
 
-fn audio_config_from_msf(track: &moq_msf::Track) -> anyhow::Result<Option<AudioConfig>> {
+fn audio_config_from_msf(track: &moq_msf::Track) -> Result<Option<AudioConfig>> {
 	let Some(container) = container_from_msf(track)? else {
 		return Ok(None);
 	};
@@ -231,9 +229,11 @@ fn audio_config_from_msf(track: &moq_msf::Track) -> anyhow::Result<Option<AudioC
 	let codec_str = track
 		.codec
 		.as_deref()
-		.with_context(|| format!("MSF audio track {:?} missing codec", track.name))?;
-	let codec = AudioCodec::from_str(codec_str)
-		.with_context(|| format!("MSF audio track {:?} has invalid codec {codec_str:?}", track.name))?;
+		.ok_or_else(|| Error::MissingAudioCodec(track.name.clone()))?;
+	let codec = AudioCodec::from_str(codec_str).map_err(|_| Error::InvalidAudioCodec {
+		name: track.name.clone(),
+		codec: codec_str.to_string(),
+	})?;
 
 	// MSF leaves samplerate and channelConfig optional, but hang requires both. Trust the
 	// explicit fields when present; otherwise parse the codec init data (AAC
@@ -256,14 +256,7 @@ fn audio_config_from_msf(track: &moq_msf::Track) -> anyhow::Result<Option<AudioC
 	config.bitrate = track.bitrate;
 	config.description = legacy_description(track)?;
 	config.container = container;
-	// Jitter is converted from f64 milliseconds to integer milliseconds.
-	// Fractional milliseconds are truncated (e.g. 15.5ms becomes 15ms).
-	// This is acceptable for the jitter use case where sub-ms precision
-	// is not meaningful.
-	config.jitter = track
-		.jitter
-		.filter(|v| v.is_finite() && *v >= 0.0)
-		.and_then(|v| moq_net::Time::from_millis(v as u64).ok());
+	config.jitter = track.jitter;
 	Ok(Some(config))
 }
 
@@ -283,85 +276,79 @@ struct DerivedAudio {
 /// Returns an error if `init_data` is absent, malformed, or doesn't carry usable audio
 /// parameters. The caller is expected to surface this as a hard failure rather than
 /// substitute defaults: a wrong sample rate produces silent or distorted playback.
-fn derive_audio_params(track: &moq_msf::Track, codec: &AudioCodec) -> anyhow::Result<DerivedAudio> {
-	let init = decode_init_data(track)?.with_context(|| {
-		format!(
-			"MSF audio track {:?} omits samplerate/channelConfig and has no init_data to derive from",
-			track.name
-		)
-	})?;
+fn derive_audio_params(track: &moq_msf::Track, codec: &AudioCodec) -> Result<DerivedAudio> {
+	let init = decode_init_data(track)?.ok_or_else(|| Error::MissingAudioParams(track.name.clone()))?;
 
 	match track.packaging {
 		moq_msf::Packaging::Loc | moq_msf::Packaging::Legacy => derive_from_codec_config(track, codec, init),
 		moq_msf::Packaging::Cmaf => derive_from_cmaf_moov(track, init),
-		_ => anyhow::bail!(
-			"MSF audio track {:?} packaging {:?} is unsupported for parameter derivation",
-			track.name,
-			track.packaging
-		),
+		_ => Err(Error::UnsupportedDerivationPackaging {
+			name: track.name.clone(),
+			packaging: format!("{:?}", track.packaging),
+		}
+		.into()),
 	}
 }
 
-fn derive_from_codec_config(
-	track: &moq_msf::Track,
-	codec: &AudioCodec,
-	init: bytes::Bytes,
-) -> anyhow::Result<DerivedAudio> {
+fn derive_from_codec_config(track: &moq_msf::Track, codec: &AudioCodec, init: bytes::Bytes) -> Result<DerivedAudio> {
 	use bytes::Buf;
 	let mut buf = init;
 	match codec {
 		AudioCodec::AAC(_) => {
-			let cfg = crate::codec::aac::Config::parse(&mut buf)
-				.with_context(|| format!("MSF audio track {:?} has malformed AudioSpecificConfig", track.name))?;
-			anyhow::ensure!(
-				!buf.has_remaining(),
-				"MSF audio track {:?} AudioSpecificConfig has trailing bytes",
-				track.name,
-			);
+			// AudioSpecificConfig carries valid variable-length extensions (SBR/PS) after
+			// the core fields, so `parse` consumes the whole buffer; bytes past the core
+			// fields are legitimate config, not trailing junk.
+			let cfg =
+				crate::codec::aac::Config::parse(&mut buf).map_err(|_| Error::MalformedAac(track.name.clone()))?;
 			Ok(DerivedAudio {
 				sample_rate: cfg.sample_rate,
 				channel_count: cfg.channel_count,
 			})
 		}
 		AudioCodec::Opus => {
-			let cfg = crate::codec::opus::Config::parse(&mut buf)
-				.with_context(|| format!("MSF audio track {:?} has malformed OpusHead", track.name))?;
-			anyhow::ensure!(
-				!buf.has_remaining(),
-				"MSF audio track {:?} OpusHead has trailing bytes",
-				track.name,
-			);
+			let cfg =
+				crate::codec::opus::Config::parse(&mut buf).map_err(|_| Error::MalformedOpus(track.name.clone()))?;
+			if buf.has_remaining() {
+				return Err(Error::OpusTrailingBytes(track.name.clone()).into());
+			}
 			Ok(DerivedAudio {
 				sample_rate: cfg.sample_rate,
 				channel_count: cfg.channel_count,
 			})
 		}
-		_ => anyhow::bail!(
-			"MSF audio track {:?} omits samplerate/channelConfig; codec {:?} has no init_data parser",
-			track.name,
-			codec,
-		),
+		AudioCodec::Flac => {
+			// The init data is the FLAC header (`fLaC` marker + STREAMINFO). `parse` stops
+			// after STREAMINFO; trailing metadata blocks (Vorbis comments, etc.) are valid
+			// and left unread, so unlike Opus there is no trailing-bytes check.
+			let cfg =
+				crate::codec::flac::Config::parse(&mut buf).map_err(|_| Error::MalformedFlac(track.name.clone()))?;
+			Ok(DerivedAudio {
+				sample_rate: cfg.sample_rate,
+				channel_count: cfg.channel_count,
+			})
+		}
+		_ => Err(Error::UnsupportedDerivationCodec(track.name.clone()).into()),
 	}
 }
 
-fn derive_from_cmaf_moov(track: &moq_msf::Track, init: bytes::Bytes) -> anyhow::Result<DerivedAudio> {
+fn derive_from_cmaf_moov(track: &moq_msf::Track, init: bytes::Bytes) -> Result<DerivedAudio> {
 	use mp4_atom::{Any, DecodeMaybe};
 
 	let mut cursor = std::io::Cursor::new(init.as_ref());
 	let mut moov: Option<mp4_atom::Moov> = None;
-	while let Some(atom) = mp4_atom::Any::decode_maybe(&mut cursor)
-		.with_context(|| format!("MSF audio track {:?} init segment is malformed", track.name))?
+	while let Some(atom) =
+		mp4_atom::Any::decode_maybe(&mut cursor).map_err(|_| Error::MalformedInitSegment(track.name.clone()))?
 	{
 		if let Any::Moov(m) = atom {
 			moov = Some(m);
 			break;
 		}
 	}
-	let moov = moov.with_context(|| format!("MSF audio track {:?} init segment missing moov", track.name))?;
+	let moov = moov.ok_or_else(|| Error::MissingInitMoov(track.name.clone()))?;
 
 	// Walk every trak looking for an audio sample entry. A single-track audio init is
 	// the only thing we expect here, but rather than enforce that we just take the first
-	// audio trak we find — the rest of the catalog identifies tracks by name, not by
+	// audio trak we find. The rest of the catalog identifies tracks by name, not by
 	// position in the moov.
 	for trak in &moov.trak {
 		let stbl = &trak.mdia.minf.stbl;
@@ -383,10 +370,7 @@ fn derive_from_cmaf_moov(track: &moq_msf::Track, init: bytes::Bytes) -> anyhow::
 			}
 		}
 	}
-	anyhow::bail!(
-		"MSF audio track {:?} CMAF init has no audio sample entry to derive samplerate/channelConfig from",
-		track.name,
-	)
+	Err(Error::MissingAudioSampleEntry(track.name.clone()).into())
 }
 
 #[cfg(test)]
@@ -426,10 +410,7 @@ mod test {
 		let init_b64 = "AAAYZ2Z0eXA=";
 		let expected_init = base64::engine::general_purpose::STANDARD.decode(init_b64).unwrap();
 
-		let msf = moq_msf::Catalog {
-			version: 1,
-			tracks: vec![video_track("video0", moq_msf::Packaging::Cmaf, Some(init_b64))],
-		};
+		let msf = moq_msf::Catalog::new(vec![video_track("video0", moq_msf::Packaging::Cmaf, Some(init_b64))]);
 
 		let catalog = from_msf(&msf).expect("CMAF video should convert");
 		let video = catalog.video.renditions.get("video0").expect("video0 rendition");
@@ -446,10 +427,7 @@ mod test {
 
 	#[test]
 	fn loc_audio_yields_legacy_container() {
-		let msf = moq_msf::Catalog {
-			version: 1,
-			tracks: vec![audio_track("audio0", moq_msf::Packaging::Loc)],
-		};
+		let msf = moq_msf::Catalog::new(vec![audio_track("audio0", moq_msf::Packaging::Loc)]);
 
 		let catalog = from_msf(&msf).expect("LOC audio should convert");
 		let audio = catalog.audio.renditions.get("audio0").expect("audio0 rendition");
@@ -475,10 +453,7 @@ mod test {
 		let mut audio = audio_track("audio0", moq_msf::Packaging::Loc);
 		audio.init_data = Some(init_b64);
 
-		let msf = moq_msf::Catalog {
-			version: 1,
-			tracks: vec![video, audio],
-		};
+		let msf = moq_msf::Catalog::new(vec![video, audio]);
 
 		let catalog = from_msf(&msf).expect("legacy tracks should convert");
 		let v = catalog.video.renditions.get("video0").expect("video0 rendition");
@@ -493,22 +468,49 @@ mod test {
 		// CMAF tracks carry their bytes inside Container::Cmaf::init; description
 		// must stay None so downstream code reads the bytes from one place only.
 		let init_b64 = "AAAYZ2Z0eXA=";
-		let msf = moq_msf::Catalog {
-			version: 1,
-			tracks: vec![video_track("video0", moq_msf::Packaging::Cmaf, Some(init_b64))],
-		};
+		let msf = moq_msf::Catalog::new(vec![video_track("video0", moq_msf::Packaging::Cmaf, Some(init_b64))]);
 		let catalog = from_msf(&msf).unwrap();
 		assert!(catalog.video.renditions["video0"].description.is_none());
+	}
+
+	#[test]
+	fn flac_params_derived_from_streaminfo() {
+		// MSF omits samplerate/channelConfig, so they must be derived from the FLAC
+		// header (`fLaC` marker + STREAMINFO) carried in init_data.
+		let description = crate::codec::flac::Config {
+			min_block_size: 4096,
+			max_block_size: 4096,
+			min_frame_size: 0,
+			max_frame_size: 0,
+			sample_rate: 96_000,
+			channel_count: 2,
+			bits_per_sample: 24,
+			total_samples: 0,
+			md5: [0; 16],
+		}
+		.description();
+		let init_b64 = base64::engine::general_purpose::STANDARD.encode(&description);
+
+		let mut audio = audio_track("audio0", moq_msf::Packaging::Loc);
+		audio.codec = Some("flac".to_string());
+		audio.samplerate = None;
+		audio.channel_config = None;
+		audio.init_data = Some(init_b64);
+
+		let msf = moq_msf::Catalog::new(vec![audio]);
+
+		let catalog = from_msf(&msf).expect("flac track should convert");
+		let a = catalog.audio.renditions.get("audio0").expect("audio0 rendition");
+		assert_eq!(a.codec, AudioCodec::Flac);
+		assert_eq!(a.sample_rate, 96_000);
+		assert_eq!(a.channel_count, 2);
 	}
 
 	#[test]
 	fn legacy_malformed_init_data_is_error() {
 		let mut track = video_track("video0", moq_msf::Packaging::Legacy, Some("!!!not-base64!!!"));
 		track.codec = Some("avc1.42c01e".to_string());
-		let msf = moq_msf::Catalog {
-			version: 1,
-			tracks: vec![track],
-		};
+		let msf = moq_msf::Catalog::new(vec![track]);
 		let err = from_msf(&msf).expect_err("malformed base64 should error");
 		assert!(
 			err.to_string().contains("malformed init_data"),
@@ -521,10 +523,7 @@ mod test {
 	fn unknown_codec_yields_unknown_variant() {
 		let mut track = video_track("video0", moq_msf::Packaging::Legacy, None);
 		track.codec = Some("weirdcodec".to_string());
-		let msf = moq_msf::Catalog {
-			version: 1,
-			tracks: vec![track],
-		};
+		let msf = moq_msf::Catalog::new(vec![track]);
 
 		let catalog = from_msf(&msf).expect("unknown codec is not an error");
 		let video = catalog.video.renditions.get("video0").expect("video0 rendition");
@@ -533,10 +532,7 @@ mod test {
 
 	#[test]
 	fn cmaf_without_init_data_is_error() {
-		let msf = moq_msf::Catalog {
-			version: 1,
-			tracks: vec![video_track("video0", moq_msf::Packaging::Cmaf, None)],
-		};
+		let msf = moq_msf::Catalog::new(vec![video_track("video0", moq_msf::Packaging::Cmaf, None)]);
 
 		let err = from_msf(&msf).expect_err("CMAF without init_data must error");
 		let msg = format!("{err:#}");
@@ -545,10 +541,7 @@ mod test {
 
 	#[test]
 	fn empty_catalog_is_empty_hang_catalog() {
-		let msf = moq_msf::Catalog {
-			version: 1,
-			tracks: vec![],
-		};
+		let msf = moq_msf::Catalog::new(vec![]);
 
 		let catalog = from_msf(&msf).expect("empty catalog should convert");
 		assert!(catalog.video.renditions.is_empty());
@@ -559,10 +552,7 @@ mod test {
 	fn track_without_role_is_skipped() {
 		let mut track = video_track("video0", moq_msf::Packaging::Legacy, None);
 		track.role = None;
-		let msf = moq_msf::Catalog {
-			version: 1,
-			tracks: vec![track],
-		};
+		let msf = moq_msf::Catalog::new(vec![track]);
 
 		let catalog = from_msf(&msf).expect("no-role track should be skipped, not error");
 		assert!(catalog.video.renditions.is_empty());
@@ -573,10 +563,7 @@ mod test {
 	fn unsupported_role_is_skipped() {
 		let mut track = audio_track("caption0", moq_msf::Packaging::Legacy);
 		track.role = Some(moq_msf::Role::Caption);
-		let msf = moq_msf::Catalog {
-			version: 1,
-			tracks: vec![track],
-		};
+		let msf = moq_msf::Catalog::new(vec![track]);
 
 		let catalog = from_msf(&msf).expect("unsupported role should be skipped, not error");
 		assert!(catalog.audio.renditions.is_empty());
@@ -591,10 +578,7 @@ mod test {
 		track.samplerate = None;
 		track.channel_config = None;
 		track.init_data = None;
-		let msf = moq_msf::Catalog {
-			version: 1,
-			tracks: vec![track],
-		};
+		let msf = moq_msf::Catalog::new(vec![track]);
 
 		let err = from_msf(&msf).expect_err("missing fields with no init_data should error");
 		assert!(err.to_string().contains("no init_data"), "unexpected error: {}", err);
@@ -618,10 +602,7 @@ mod test {
 		track.samplerate = None;
 		track.channel_config = None;
 		track.init_data = Some(init_b64);
-		let msf = moq_msf::Catalog {
-			version: 1,
-			tracks: vec![track],
-		};
+		let msf = moq_msf::Catalog::new(vec![track]);
 
 		let catalog = from_msf(&msf).expect("Opus OpusHead should parse");
 		let audio = catalog.audio.renditions.get("audio0").expect("audio0 rendition");
@@ -645,10 +626,7 @@ mod test {
 		track.samplerate = None;
 		track.channel_config = None;
 		track.init_data = Some(init_b64);
-		let msf = moq_msf::Catalog {
-			version: 1,
-			tracks: vec![track],
-		};
+		let msf = moq_msf::Catalog::new(vec![track]);
 
 		let catalog = from_msf(&msf).expect("AAC AudioSpecificConfig should parse");
 		let audio = catalog.audio.renditions.get("audio0").expect("audio0 rendition");
@@ -673,10 +651,7 @@ mod test {
 		track.samplerate = Some(24_000); // explicit, must be preserved
 		track.channel_config = None; // missing, derive from init_data
 		track.init_data = Some(init_b64);
-		let msf = moq_msf::Catalog {
-			version: 1,
-			tracks: vec![track],
-		};
+		let msf = moq_msf::Catalog::new(vec![track]);
 
 		let catalog = from_msf(&msf).expect("partial derivation should succeed");
 		let audio = catalog.audio.renditions.get("audio0").expect("audio0 rendition");
@@ -689,10 +664,7 @@ mod test {
 		// MediaTimeline isn't a media payload, so the track must be skipped (not error).
 		let bad = video_track("timeline0", moq_msf::Packaging::MediaTimeline, None);
 		let good = video_track("video0", moq_msf::Packaging::Legacy, None);
-		let msf = moq_msf::Catalog {
-			version: 1,
-			tracks: vec![bad, good],
-		};
+		let msf = moq_msf::Catalog::new(vec![bad, good]);
 
 		let catalog = from_msf(&msf).expect("unsupported packaging should be skipped, not error");
 		assert!(
@@ -711,10 +683,7 @@ mod test {
 		// Drop the codec so we'd see a hard error if the skip path didn't short-circuit.
 		bad.codec = None;
 		let good = audio_track("audio0", moq_msf::Packaging::Loc);
-		let msf = moq_msf::Catalog {
-			version: 1,
-			tracks: vec![bad, good],
-		};
+		let msf = moq_msf::Catalog::new(vec![bad, good]);
 
 		let catalog = from_msf(&msf).expect("unsupported packaging should be skipped, not error");
 		assert!(!catalog.audio.renditions.contains_key("event0"));
@@ -724,10 +693,7 @@ mod test {
 	#[test]
 	fn unknown_packaging_variant_is_skipped() {
 		let track = video_track("video0", moq_msf::Packaging::Unknown("custom".to_string()), None);
-		let msf = moq_msf::Catalog {
-			version: 1,
-			tracks: vec![track],
-		};
+		let msf = moq_msf::Catalog::new(vec![track]);
 
 		let catalog = from_msf(&msf).expect("unknown packaging should be skipped, not error");
 		assert!(catalog.video.renditions.is_empty());
@@ -737,10 +703,7 @@ mod test {
 	fn missing_video_codec_is_error() {
 		let mut track = video_track("video0", moq_msf::Packaging::Legacy, None);
 		track.codec = None;
-		let msf = moq_msf::Catalog {
-			version: 1,
-			tracks: vec![track],
-		};
+		let msf = moq_msf::Catalog::new(vec![track]);
 
 		let err = from_msf(&msf).expect_err("missing video codec must error");
 		let msg = format!("{err:#}");
@@ -754,10 +717,7 @@ mod test {
 	fn missing_audio_codec_is_error() {
 		let mut track = audio_track("audio0", moq_msf::Packaging::Legacy);
 		track.codec = None;
-		let msf = moq_msf::Catalog {
-			version: 1,
-			tracks: vec![track],
-		};
+		let msf = moq_msf::Catalog::new(vec![track]);
 
 		let err = from_msf(&msf).expect_err("missing audio codec must error");
 		let msg = format!("{err:#}");
@@ -772,10 +732,7 @@ mod test {
 		// avc1 with a too-short profile string is a malformed structured codec.
 		let mut track = video_track("video0", moq_msf::Packaging::Legacy, None);
 		track.codec = Some("avc1.0".to_string());
-		let msf = moq_msf::Catalog {
-			version: 1,
-			tracks: vec![track],
-		};
+		let msf = moq_msf::Catalog::new(vec![track]);
 
 		let err = from_msf(&msf).expect_err("malformed avc1 codec must error");
 		let msg = format!("{err:#}");

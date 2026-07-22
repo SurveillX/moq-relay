@@ -1,7 +1,7 @@
 import * as Moq from "@moq/net";
 import { render } from "solid-js/web";
-import type { GameConfig } from "./index.ts";
-import { Game } from "./index.ts";
+import type { GameConfig } from "./game.ts";
+import { Game } from "./game.ts";
 import { BoyUI } from "./ui/element.tsx";
 
 const OBSERVED = ["url", "prefix", "prefix-game", "prefix-viewer"] as const;
@@ -129,8 +129,8 @@ export default class MoqBoy extends HTMLElement {
 				const entry = await Promise.race([effect.cancel, announced.next()]);
 				if (!entry) break;
 
-				// Strip prefix, skip nested paths (e.g. "viewer/..." sub-broadcasts).
-				const suffix = Moq.Path.stripPrefix(prefix, entry.path);
+				// Skip nested paths (e.g. "viewer/..." sub-broadcasts).
+				const suffix = entry.path;
 				if (!suffix || suffix.includes("/")) continue;
 
 				const id = suffix;

@@ -23,7 +23,7 @@ struct TaskEntry {
 #[derive(Default)]
 pub struct Origin {
 	/// Active origin producers for publishing and consuming broadcasts.
-	active: NonZeroSlab<moq_net::OriginProducer>,
+	active: NonZeroSlab<moq_net::origin::Producer>,
 
 	/// Broadcast announcement information (path, active status).
 	announced: NonZeroSlab<(String, bool)>,
@@ -40,13 +40,13 @@ impl Origin {
 		self.active.insert(moq_net::Origin::random().produce())
 	}
 
-	pub fn get(&self, id: Id) -> Result<&moq_net::OriginProducer, Error> {
+	pub fn get(&self, id: Id) -> Result<&moq_net::origin::Producer, Error> {
 		self.active.get(id).ok_or(Error::OriginNotFound)
 	}
 
 	pub fn announced(&mut self, origin: Id, on_announce: OnStatus) -> Result<Id, Error> {
 		let origin = self.active.get_mut(origin).ok_or(Error::OriginNotFound)?;
-		let consumer = origin.consume();
+		let consumer = origin.consume().announced();
 		let channel = oneshot::channel();
 
 		let entry = TaskEntry {
@@ -71,21 +71,22 @@ impl Origin {
 
 	async fn run_announced(
 		callback: OnStatus,
-		mut consumer: moq_net::OriginConsumer,
+		mut consumer: moq_net::announce::Consumer,
 		mut close: oneshot::Receiver<()>,
 	) -> Result<(), Error> {
 		loop {
 			// `biased` so a pending close always wins over a ready announcement.
-			let (path, broadcast) = tokio::select! {
+			let moq_net::announce::Update { path, broadcast } = tokio::select! {
 				biased;
 				_ = &mut close => return Ok(()),
-				next = consumer.announced() => match next {
+				next = consumer.next() => match next {
 					Some(announced) => announced,
 					None => return Ok(()),
 				},
 			};
 
 			// Hold the lock only to buffer the announcement; release it before the callback.
+			// Only Active carries a broadcast; Ended does not.
 			let announced_id = State::lock()
 				.origin
 				.announced
@@ -104,6 +105,18 @@ impl Origin {
 		Ok(())
 	}
 
+	/// Free a single announcement record delivered to an `on_announce` callback.
+	///
+	/// Each announce/unannounce event allocates a record (read via [`Self::announced_info`]);
+	/// the caller releases it here once done. This is per-record, distinct from
+	/// [`Self::announced_close`], which stops the whole listener. Records are freed explicitly
+	/// rather than on unannounce: an unannounce is its own delivered record, and auto-freeing
+	/// the prior one would race a caller still reading it.
+	pub fn announced_free(&mut self, announced: Id) -> Result<(), Error> {
+		self.announced.remove(announced).ok_or(Error::AnnouncementNotFound)?;
+		Ok(())
+	}
+
 	pub fn announced_close(&mut self, announced: Id) -> Result<(), Error> {
 		// Signal shutdown; the task delivers a final callback and removes itself.
 		self.announced_task
@@ -114,14 +127,6 @@ impl Origin {
 			.take()
 			.ok_or(Error::AnnouncementNotFound)?;
 		Ok(())
-	}
-
-	pub fn consume<P: moq_net::AsPath>(&mut self, origin: Id, path: P) -> Result<moq_net::BroadcastConsumer, Error> {
-		let origin = self.active.get_mut(origin).ok_or(Error::OriginNotFound)?;
-		// Synchronous lookup races announcement gossip. Use `consume_announced` to wait instead.
-		// Uses the deprecated direct lookup to avoid the per-call cost of OriginProducer::consume().
-		#[allow(deprecated)]
-		origin.get_broadcast(path).ok_or(Error::BroadcastNotFound)
 	}
 
 	/// Wait until the broadcast at `path` is announced, then deliver its handle via the callback.
@@ -156,7 +161,7 @@ impl Origin {
 
 	async fn run_consume_announced(
 		callback: OnStatus,
-		consumer: moq_net::OriginConsumer,
+		consumer: moq_net::origin::Consumer,
 		path: String,
 		mut close: oneshot::Receiver<()>,
 	) -> Result<(), Error> {
@@ -165,6 +170,61 @@ impl Origin {
 			biased;
 			_ = &mut close => return Ok(()),
 			found = consumer.announced_broadcast(path.as_str()) => found.ok_or(Error::BroadcastNotFound)?,
+		};
+
+		// Hold the lock only to buffer the broadcast; release it before the callback.
+		let broadcast_id = State::lock().consume.start(broadcast)?;
+		callback.call(broadcast_id);
+		Ok(())
+	}
+
+	/// Request the broadcast at `path`, delivering its handle once it can be served.
+	///
+	/// Unlike [`Self::consume`] (announced-only, fails fast) and [`Self::consume_announced`]
+	/// (waits indefinitely for a future announcement), this resolves against what is announced
+	/// now plus any dynamic fallback handler on the origin: the callback fires the broadcast
+	/// handle (> 0) once served, then a terminal `0`; or a single terminal code (`0` on close,
+	/// negative on error) if it can't be served. Returns a task handle for cancellation.
+	pub fn request(&mut self, origin: Id, path: String, on_broadcast: OnStatus) -> Result<Id, Error> {
+		let origin = self.active.get_mut(origin).ok_or(Error::OriginNotFound)?;
+		let consumer = origin.consume();
+		let channel = oneshot::channel();
+
+		let entry = TaskEntry {
+			close: Some(channel.0),
+			callback: on_broadcast,
+		};
+		let id = self.consume_task.insert(Some(entry))?;
+
+		tokio::spawn(async move {
+			let res = Self::run_request(on_broadcast, consumer, path, channel.1).await;
+
+			// Deliver one final terminal callback (code <= 0), then drop the entry.
+			// Pull it out from under the lock so the callback never runs while held.
+			let entry = State::lock().origin.consume_task.remove(id).flatten();
+			if let Some(entry) = entry {
+				entry.callback.call(res);
+			}
+		});
+
+		Ok(id)
+	}
+
+	async fn run_request(
+		callback: OnStatus,
+		consumer: moq_net::origin::Consumer,
+		path: String,
+		mut close: oneshot::Receiver<()>,
+	) -> Result<(), Error> {
+		// Resolves to an error if the path can never be served (not announced and no dynamic
+		// handler), otherwise once a handler serves it.
+		let pending = consumer.request_broadcast(path.as_str());
+
+		// `biased` so a pending close always wins over a ready broadcast.
+		let broadcast = tokio::select! {
+			biased;
+			_ = &mut close => return Ok(()),
+			res = pending => res?,
 		};
 
 		// Hold the lock only to buffer the broadcast; release it before the callback.
@@ -185,15 +245,12 @@ impl Origin {
 		Ok(())
 	}
 
-	pub fn publish<P: moq_net::AsPath>(
-		&mut self,
-		origin: Id,
-		path: P,
-		broadcast: moq_net::BroadcastConsumer,
-	) -> Result<(), Error> {
-		let origin = self.active.get_mut(origin).ok_or(Error::OriginNotFound)?;
-		origin.publish_broadcast(path, broadcast);
-		Ok(())
+	/// Create a live broadcast at `path` on an origin, returning its producer.
+	///
+	/// Errors with [`Error::Moq`] if the path is outside the origin's scope.
+	pub fn publish<P: moq_net::AsPath>(&self, origin: Id, path: P) -> Result<moq_net::broadcast::Producer, Error> {
+		let origin = self.active.get(origin).ok_or(Error::OriginNotFound)?;
+		Ok(origin.create_broadcast(path, moq_net::broadcast::Route::new().with_announce(true))?)
 	}
 
 	pub fn close(&mut self, origin: Id) -> Result<(), Error> {

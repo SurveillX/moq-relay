@@ -90,8 +90,8 @@ pub struct Config {
 /// track monitors, and async tasks.
 struct Session {
 	video_encoder: video::VideoEncoder,
-	video_track: moq_net::TrackProducer,
-	audio_track: moq_net::TrackProducer,
+	video_track: moq_net::track::Demand,
+	audio_track: moq_net::track::Demand,
 
 	/// Whether anyone is subscribed to the video/audio tracks.
 	video_active: AtomicBool,
@@ -109,7 +109,7 @@ struct Session {
 impl Session {
 	/// Monitor a single track's subscription state.
 	/// Sets the flag when a viewer subscribes, clears it when all unsubscribe.
-	async fn run_track_monitor(&self, name: &str, track: &moq_net::TrackProducer, flag: &AtomicBool) {
+	async fn run_track_monitor(&self, name: &str, track: &moq_net::track::Demand, flag: &AtomicBool) {
 		loop {
 			if track.used().await.is_err() {
 				break;
@@ -208,9 +208,6 @@ async fn run(config: &Config) -> Result<()> {
 	let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<input::Command>(64);
 	let client = config.client.clone().init()?;
 
-	// Create the broadcast producer.
-	let mut broadcast = moq_net::Broadcast::new().produce();
-
 	// Publish origin: the game session broadcast.
 	let publish_origin = moq_net::Origin::random().produce();
 	let default_game_prefix = format!("{}/game", config.prefix);
@@ -218,8 +215,11 @@ async fn run(config: &Config) -> Result<()> {
 	let game_prefix = config.prefix_game.as_deref().unwrap_or(&default_game_prefix);
 	let viewer_prefix = config.prefix_viewer.as_deref().unwrap_or(&default_viewer_prefix);
 
+	// Create the broadcast on the publish origin; the live route announces it.
 	let broadcast_path = format!("{game_prefix}/{name}");
-	publish_origin.publish_broadcast(&broadcast_path, broadcast.consume());
+	let mut broadcast = publish_origin
+		.create_broadcast(&broadcast_path, moq_net::broadcast::Route::new().with_announce(true))
+		.context("failed to create broadcast")?;
 
 	// Consume origin: viewer broadcasts under the viewer prefix.
 	// JS publishes viewer feedback at "{viewer_prefix}/{name}/{viewerId}"
@@ -228,13 +228,14 @@ async fn run(config: &Config) -> Result<()> {
 	let mut viewer_consumer = consume_origin
 		.with_root(&viewer_path)
 		.expect("viewer prefix should be valid")
-		.consume();
+		.consume()
+		.announced();
 
 	tracing::info!(url = %config.url, %name, broadcast = %broadcast_path, "connecting to relay");
 
 	let reconnect = client
-		.with_publish(publish_origin.consume())
-		.with_consume(consume_origin)
+		.with_publisher(&publish_origin)
+		.with_subscriber(consume_origin)
 		.reconnect(config.url.clone());
 
 	// Set up catalog and encoders.
@@ -243,8 +244,8 @@ async fn run(config: &Config) -> Result<()> {
 
 	let audio_encoder = audio::AudioEncoder::new(broadcast.clone(), catalog.clone(), 44100)?;
 
-	let video_track = video_encoder.track.clone();
-	let audio_track = audio_encoder.track().clone();
+	let video_track = video_encoder.demand.clone();
+	let audio_track = audio_encoder.track().demand();
 
 	let status_publisher = status::StatusPublisher::new(&mut broadcast)?;
 
@@ -275,11 +276,21 @@ async fn run(config: &Config) -> Result<()> {
 		move || run_emulator(session, &rom_path, audio_encoder, status_publisher, cmd_rx)
 	});
 
-	tokio::select! {
-		res = emulator_handle => res?.context("emulator error"),
-		res = reconnect.closed() => Ok(res?),
+	// Keep the result out of the `select!` arms (a `?` there would return before
+	// the close below runs), so the broadcast is always closed on shutdown.
+	let result = tokio::select! {
+		res = emulator_handle => match res {
+			Ok(inner) => inner.context("emulator error"),
+			Err(join) => Err(join.into()),
+		},
+		res = reconnect.closed() => res.map_err(Into::into),
 		res = input::handle_viewers(&mut viewer_consumer, &cmd_tx) => res,
-	}
+	};
+
+	// Cleanly close the broadcast so subscribers see a normal end rather than
+	// Error::Dropped.
+	broadcast.finish();
+	result
 }
 
 /// The main emulator loop, running on a blocking thread.
